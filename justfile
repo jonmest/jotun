@@ -8,10 +8,11 @@ check:
     cargo check --all-targets
 
 test:
-    cargo test --lib
+    cargo nextest run --lib
 
 test-all:
-    cargo test
+    cargo nextest run
+    cargo test --doc
 
 fmt:
     cargo fmt
@@ -37,7 +38,15 @@ unused-deps:
 typos:
     typos
 
-ci: fmt-check clippy test deny audit unused-deps typos
+# Static analysis on GitHub Actions workflow files.
+zizmor:
+    zizmor .github/workflows
+
+# Generate a CycloneDX SBOM for all workspace crates.
+sbom:
+    cargo cyclonedx --format json
+
+ci: fmt-check clippy test deny audit unused-deps typos zizmor
 
 # Run the GitHub Actions workflow locally via nektos/act. Requires docker.
 act *args:

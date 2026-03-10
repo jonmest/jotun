@@ -13,6 +13,10 @@ ignore = []
 version = 2
 confidence-threshold = 0.9
 unused-allowed-license = "allow"
+
+# Our own crate is BSL-1.1, which is not an SPDX identifier. Tell cargo-deny
+# not to complain about workspace crates with a non-standard license.
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",
