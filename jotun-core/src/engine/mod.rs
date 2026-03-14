@@ -5,3 +5,4 @@ pub mod event;
 pub mod incoming;
 pub mod log;
 pub mod role_state;
+pub mod telemetry;

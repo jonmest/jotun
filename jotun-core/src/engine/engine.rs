@@ -5,6 +5,7 @@
     clippy::needless_pass_by_value
 )]
 use crate::engine::log::Log;
+use crate::engine::telemetry;
 use crate::records::message::Message::*;
 use crate::records::vote::{RequestVote, VoteResponse, VoteResult};
 use crate::{
@@ -16,6 +17,7 @@ use crate::{
     },
     types::{index::LogIndex, node::NodeId, term::Term},
 };
+use tracing::instrument;
 
 #[derive(Debug)]
 pub struct RaftState<C> {
@@ -34,6 +36,14 @@ pub struct Engine<C> {
 }
 
 impl<C> Engine<C> {
+    #[instrument(
+        target = "jotun::engine",
+        skip_all,
+        fields(
+            node_id = %self.id,
+            term = self.state.current_term.get(),
+        ),
+    )]
     pub fn step(&mut self, event: Event<C>) -> Vec<Action<C>> {
         match event {
             Event::Tick => self.on_tick(),
@@ -42,10 +52,12 @@ impl<C> Engine<C> {
         }
     }
 
+    #[instrument(target = "jotun::engine", skip_all)]
     fn on_tick(&mut self) -> Vec<Action<C>> {
         todo!()
     }
 
+    #[instrument(target = "jotun::engine", skip_all)]
     fn on_incoming(&mut self, incoming: Incoming<C>) -> Vec<Action<C>> {
         match incoming.message {
             VoteRequest(request_vote) => vec![self.on_vote_request(request_vote)],
@@ -55,15 +67,26 @@ impl<C> Engine<C> {
         }
     }
 
+    #[instrument(target = "jotun::engine", skip_all)]
     fn on_client_proposal(&mut self, command: C) -> Vec<Action<C>> {
         todo!()
     }
 
+    #[instrument(target = "jotun::engine", skip_all)]
     fn on_vote_response(&mut self, request: VoteResponse) -> Action<C> {
         todo!()
     }
-    
-    fn on_vote_request(&mut self, request: RequestVote) -> Action<C> {        
+
+    #[instrument(
+        target = "jotun::engine",
+        skip_all,
+        fields(
+            candidate = %request.candidate_id,
+            request_term = request.term.get(),
+            decision = tracing::field::Empty,
+        ),
+    )]
+    fn on_vote_request(&mut self, request: RequestVote) -> Action<C> {
         if request.term > self.state.current_term {
             self.become_follower(request.term);
         }
@@ -71,29 +94,48 @@ impl<C> Engine<C> {
         let is_valid_term = request.term >= self.state.current_term;
         let is_vote_available = self.state.voted_for.is_none_or(|v| v == request.candidate_id);
         let candidate_log_valid = request.last_log_id.is_some_and(|log| {
-            log.term >= self.state.current_term && 
-            log.index >= self.state.commit_index 
+            log.term >= self.state.current_term && log.index >= self.state.commit_index
         });
-        
-        let msg = if is_valid_term && is_vote_available && candidate_log_valid {
-            VoteResponse { term: self.state.current_term, result: VoteResult::Granted }
-        } else {
-            VoteResponse { term: self.state.current_term, result: VoteResult::Rejected }
+
+        let granted = is_valid_term && is_vote_available && candidate_log_valid;
+        tracing::Span::current().record(
+            telemetry::fields::DECISION,
+            if granted { "granted" } else { "rejected" },
+        );
+
+        let msg = VoteResponse {
+            term: self.state.current_term,
+            result: if granted {
+                VoteResult::Granted
+            } else {
+                VoteResult::Rejected
+            },
         };
 
-        Action::Send { to: request.candidate_id, message: VoteResponse(msg) }
+        Action::Send {
+            to: request.candidate_id,
+            message: VoteResponse(msg),
+        }
     }
 
     fn become_follower(&mut self, term: Term) {
+        let from_term = self.state.current_term;
         self.state.current_term = term;
         self.state.voted_for = None;
         self.state.role = RoleState::Follower(FollowerState::default());
+        if from_term != term {
+            telemetry::term_advanced(self.id, from_term, term);
+        }
+        telemetry::became_follower(self.id, term);
     }
 
     fn become_candidate(&mut self) {
+        let from_term = self.state.current_term;
         self.state.current_term = self.state.current_term.next();
         self.state.voted_for = Some(self.id);
         self.state.role = RoleState::Candidate(CandidateState { votes_granted: 1 });
+        telemetry::term_advanced(self.id, from_term, self.state.current_term);
+        telemetry::became_candidate(self.id, self.state.current_term);
     }
 
     fn become_leader(&mut self) {
@@ -104,5 +146,6 @@ impl<C> Engine<C> {
             next_index,
             match_index,
         });
+        telemetry::became_leader(self.id, self.state.current_term);
     }
 }
