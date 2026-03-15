@@ -3,3 +3,12 @@
 *.swp
 .actrc.local
 *.cdx.json
+
+# cargo-mutants
+mutants.out/
+mutants.out.old/
+
+# cargo-llvm-cov
+*.profraw
+*.profdata
+/lcov.info

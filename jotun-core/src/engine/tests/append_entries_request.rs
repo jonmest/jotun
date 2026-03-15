@@ -52,6 +52,44 @@ fn higher_term_triggers_catch_up_before_deciding() {
     assert_eq!(engine.current_term(), term(3), "term caught up");
 }
 
+#[test]
+fn candidate_steps_down_when_current_term_leader_appears() {
+    // §5.2: "If AppendEntries RPC received from new leader: convert to follower."
+    // A candidate who discovers a legitimate leader at its own term must
+    // abandon the campaign and accept the leader.
+    use crate::engine::role_state::RoleState;
+
+    let mut engine = follower(1);
+    // Become a candidate in term 1 (self-vote, role = Candidate).
+    engine.step(super::fixtures::vote_request_from(
+        2,
+        super::fixtures::vote_request(2, 1, None),
+    ));
+    // Simulate transitioning to Candidate by bumping term via another vote
+    // path is awkward; use state_mut to set the role directly, matching what
+    // `become_candidate` would do at term 1.
+    {
+        let state = engine.state_mut();
+        state.current_term = term(1);
+        state.voted_for = Some(super::fixtures::node(1));
+        state.role = RoleState::Candidate(
+            crate::engine::role_state::CandidateState { votes_granted: 1 },
+        );
+    }
+
+    // A legitimate leader for term 1 sends an AppendEntries.
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, None, vec![], 0),
+    ));
+
+    assert!(
+        matches!(engine.role(), RoleState::Follower(_)),
+        "candidate must convert to follower on seeing a current-term leader",
+    );
+    assert_eq!(engine.current_term(), term(1), "term unchanged");
+}
+
 // ---------------------------------------------------------------------------
 // Previous-log matching — §5.3 rule 2
 // ---------------------------------------------------------------------------

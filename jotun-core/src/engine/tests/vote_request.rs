@@ -133,6 +133,23 @@ fn follower_with_log_rejects_candidate_whose_log_is_behind() {
 }
 
 #[test]
+fn follower_grants_when_candidate_log_at_same_term_is_at_least_as_long() {
+    // §5.4.1: at equal last-entry terms, the longer log wins (or ties).
+    let mut engine = follower(1);
+    // Seed log ending at (index=3, term=2).
+    seed_log(&mut engine, &[1, 2, 2]);
+
+    // Candidate at same term 2 with equal index.
+    let actions = engine.step(vote_request_from(2, vote_request(2, 3, Some(log_id(3, 2)))));
+    let response = expect_vote_response(&actions);
+    assert_eq!(
+        response.result,
+        VoteResult::Granted,
+        "equal (term, index) must be considered at-least-as-up-to-date",
+    );
+}
+
+#[test]
 fn follower_grants_when_candidate_log_term_is_strictly_greater() {
     let mut engine = follower(1);
     // Seed log ending at (index=5, term=2).

@@ -41,6 +41,11 @@ typos:
 mutants *args:
     cargo mutants {{args}}
 
+# Code coverage (via cargo-llvm-cov). Opens an HTML report by default;
+# pass `--summary-only` for a quick terminal view, or `--lcov` for CI.
+coverage *args:
+    cargo llvm-cov --lib {{args}}
+
 # Static analysis on GitHub Actions workflow files.
 zizmor:
     zizmor .github/workflows

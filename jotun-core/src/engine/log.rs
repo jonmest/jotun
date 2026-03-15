@@ -96,4 +96,35 @@ impl<C> Log<C> {
             }
         }
     }
+
+    /// Check structural invariants. Panics in debug builds when violated,
+    /// no-op in release. Intended to run at the end of every state transition.
+    ///
+    /// §5.3 Log Matching Property requires:
+    ///  - entries have contiguous, 1-based indices,
+    ///  - entry terms are non-decreasing across the log (a leader only appends
+    ///    at its current term, which is monotonic across leadership).
+    #[cfg(debug_assertions)]
+    pub fn check_invariants(&self) {
+        let mut prev_term: Option<Term> = None;
+        for (i, entry) in self.entries.iter().enumerate() {
+            let expected = LogIndex::new((i as u64) + 1);
+            debug_assert_eq!(
+                entry.id.index, expected,
+                "log entry at position {i} has non-contiguous index {:?} (expected {expected:?})",
+                entry.id.index,
+            );
+            if let Some(pt) = prev_term {
+                debug_assert!(
+                    entry.id.term >= pt,
+                    "log terms must be non-decreasing (§5.3): {pt:?} -> {:?}",
+                    entry.id.term,
+                );
+            }
+            prev_term = Some(entry.id.term);
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn check_invariants(&self) {}
 }

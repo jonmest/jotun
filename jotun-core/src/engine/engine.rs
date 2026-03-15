@@ -90,6 +90,47 @@ impl<C> Engine<C> {
         &mut self.state
     }
 
+    /// Structural invariants the engine must never violate.
+    /// Panics in debug builds when a transition breaks one; no-op in release.
+    ///
+    /// Derived from Figure 2 and §5 of the Raft paper:
+    ///  - `commit_index <= last log index` (§5.3 rule 5 — can't commit what isn't there).
+    ///  - `last_applied <= commit_index` (Figure 2 — can't apply what isn't committed).
+    ///  - if role is Candidate, `voted_for == Some(self.id)` (§5.2 — candidates
+    ///    always vote for themselves).
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        let last_log_index = self
+            .state
+            .log
+            .last_log_id()
+            .map_or(LogIndex::ZERO, |l| l.index);
+
+        debug_assert!(
+            self.state.commit_index <= last_log_index,
+            "commit_index {:?} exceeds last log index {last_log_index:?} (§5.3)",
+            self.state.commit_index,
+        );
+        debug_assert!(
+            self.state.last_applied <= self.state.commit_index,
+            "last_applied {:?} exceeds commit_index {:?}",
+            self.state.last_applied,
+            self.state.commit_index,
+        );
+        if matches!(self.state.role, RoleState::Candidate(_)) {
+            debug_assert_eq!(
+                self.state.voted_for,
+                Some(self.id),
+                "Candidate must have voted for itself (§5.2)",
+            );
+        }
+
+        self.state.log.check_invariants();
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn check_invariants(&self) {}
+
     #[instrument(
         target = "jotun::engine",
         skip_all,
@@ -99,11 +140,27 @@ impl<C> Engine<C> {
         ),
     )]
     pub fn step(&mut self, event: Event<C>) -> Vec<Action<C>> {
-        match event {
+        #[cfg(debug_assertions)]
+        let prev_term = self.state.current_term;
+
+        let actions = match event {
             Event::Tick => self.on_tick(),
             Event::Incoming(incoming) => self.on_incoming(incoming),
             Event::ClientProposal(command) => self.on_client_proposal(command),
+        };
+
+        #[cfg(debug_assertions)]
+        {
+            // §5.1: a server's current term only ever increases.
+            debug_assert!(
+                self.state.current_term >= prev_term,
+                "current_term went backward: {prev_term:?} -> {:?}",
+                self.state.current_term,
+            );
+            self.check_invariants();
         }
+
+        actions
     }
 
     #[instrument(target = "jotun::engine", skip_all)]
