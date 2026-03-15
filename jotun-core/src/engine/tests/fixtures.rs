@@ -92,7 +92,10 @@ pub(super) fn append_entries_request(
 }
 
 /// Wrap a `RequestAppendEntries` into the Event envelope the engine accepts.
-pub(super) fn append_entries_from(from: u64, request: RequestAppendEntries<Vec<u8>>) -> Event<Vec<u8>> {
+pub(super) fn append_entries_from(
+    from: u64,
+    request: RequestAppendEntries<Vec<u8>>,
+) -> Event<Vec<u8>> {
     Event::Incoming(Incoming {
         from: node(from),
         message: Message::AppendEntriesRequest(request),

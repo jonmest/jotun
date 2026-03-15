@@ -72,9 +72,8 @@ fn candidate_steps_down_when_current_term_leader_appears() {
         let state = engine.state_mut();
         state.current_term = term(1);
         state.voted_for = Some(super::fixtures::node(1));
-        state.role = RoleState::Candidate(
-            crate::engine::role_state::CandidateState { votes_granted: 1 },
-        );
+        state.role =
+            RoleState::Candidate(crate::engine::role_state::CandidateState { votes_granted: 1 });
     }
 
     // A legitimate leader for term 1 sends an AppendEntries.
