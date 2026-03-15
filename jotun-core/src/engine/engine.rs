@@ -6,7 +6,10 @@
 )]
 use crate::engine::log::Log;
 use crate::engine::telemetry;
-use crate::records::message::Message::*;
+use crate::records::append_entries::{
+    AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries,
+};
+use crate::records::message::Message::{self, *};
 use crate::records::vote::{RequestVote, VoteResponse, VoteResult};
 use crate::{
     engine::{
@@ -67,6 +70,14 @@ impl<C> Engine<C> {
         &self.state.role
     }
 
+    pub fn commit_index(&self) -> LogIndex {
+        self.state.commit_index
+    }
+
+    pub fn log(&self) -> &Log<C> {
+        &self.state.log
+    }
+
     #[cfg(test)]
     pub(crate) fn state_mut(&mut self) -> &mut RaftState<C> {
         &mut self.state
@@ -98,7 +109,9 @@ impl<C> Engine<C> {
         match incoming.message {
             VoteRequest(request_vote) => vec![self.on_vote_request(request_vote)],
             VoteResponse(vote_response) => vec![self.on_vote_response(vote_response)],
-            AppendEntriesRequest(request_append_entries) => todo!(),
+            AppendEntriesRequest(request_append_entries) => {
+                vec![self.on_append_entries_request(request_append_entries)]
+            }
             AppendEntriesResponse(append_entries_response) => todo!(),
         }
     }
@@ -117,6 +130,98 @@ impl<C> Engine<C> {
         target = "jotun::engine",
         skip_all,
         fields(
+            leader = %request.leader_id,
+            term = %request.term
+        )
+    )]
+    fn on_append_entries_request(&mut self, request: RequestAppendEntries<C>) -> Action<C> {
+        if request.term > self.state.current_term
+            || (request.term == self.state.current_term
+                && matches!(self.state.role, RoleState::Candidate(_)))
+        {
+            self.become_follower(request.term);
+        }
+        if request.term < self.state.current_term {
+            return self.conflict(request.leader_id, LogIndex::ZERO);
+        }
+
+        if request.prev_log_id.is_some_and(|id| {
+            self.state
+                .log
+                .entry_at(id.index)
+                .is_none_or(|e| e.id.term != id.term)
+        }) {
+            return self.conflict(
+                request.leader_id,
+                match self.state.log.last_log_id() {
+                    None => LogIndex::ZERO,
+                    Some(i) => i.index.next(),
+                },
+            );
+        }
+
+        for entry in request.entries {
+            match self.state.log.entry_at(entry.id.index) {
+                None => self.state.log.append(entry),
+                Some(existing) => {
+                    if existing.id.term != entry.id.term {
+                        // §5.4.1 guarantees a correct leader never asks us to
+                        // overwrite a committed entry. Defend against malformed
+                        // or buggy senders rather than corrupt committed state.
+                        if entry.id.index <= self.state.commit_index {
+                            let hint = self
+                                .state
+                                .log
+                                .last_log_id()
+                                .map(|l| l.index.next())
+                                .unwrap_or(LogIndex::new(1));
+                            return self.conflict(request.leader_id, hint);
+                        }
+                        self.state.log.truncate_from(entry.id.index);
+                        self.state.log.append(entry);
+                    }
+                }
+            }
+        }
+
+        let last_appended = self
+            .state
+            .log
+            .last_log_id()
+            .map(|l| l.index)
+            .unwrap_or(LogIndex::ZERO);
+
+        if request.leader_commit > self.state.commit_index {
+            self.state.commit_index = request.leader_commit.min(last_appended);
+        }
+
+        Action::Send {
+            to: request.leader_id,
+            message: AppendEntriesResponse(AppendEntriesResponse {
+                term: self.current_term(),
+                result: AppendEntriesResult::Success {
+                    last_appended: Some(last_appended),
+                },
+            }),
+        }
+    }
+
+    fn conflict(&self, leader_id: NodeId, hint: LogIndex) -> Action<C> {
+        Action::Send {
+            to: leader_id,
+            message: AppendEntriesResponse(AppendEntriesResponse {
+                term: self.current_term(),
+                result: AppendEntriesResult::Conflict {
+                    next_index_hint: hint,
+                },
+            }),
+        }
+    }
+
+    #[instrument(
+        target = "jotun::engine",
+        skip_all,
+        fields(
             candidate = %request.candidate_id,
             request_term = request.term.get(),
             decision = tracing::field::Empty,
@@ -128,7 +233,10 @@ impl<C> Engine<C> {
         }
 
         let is_valid_term = request.term == self.state.current_term;
-        let is_vote_available = self.state.voted_for.is_none_or(|v| v == request.candidate_id);
+        let is_vote_available = self
+            .state
+            .voted_for
+            .is_none_or(|v| v == request.candidate_id);
         let candidate_log_valid = self.state.log.is_superseded_by(request.last_log_id);
 
         let granted = is_valid_term && is_vote_available && candidate_log_valid;

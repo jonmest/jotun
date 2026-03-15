@@ -5,6 +5,7 @@ use crate::engine::action::Action;
 use crate::engine::engine::Engine;
 use crate::engine::event::Event;
 use crate::engine::incoming::Incoming;
+use crate::records::append_entries::{AppendEntriesResponse, RequestAppendEntries};
 use crate::records::log_entry::LogEntry;
 use crate::records::message::Message;
 use crate::records::vote::{RequestVote, VoteResponse};
@@ -60,10 +61,68 @@ pub fn seed_log(engine: &mut Engine<Vec<u8>>, terms: &[u64]) {
     }
 }
 
+/// Build a log entry with an empty command payload.
+pub fn log_entry(index: u64, term_n: u64) -> LogEntry<Vec<u8>> {
+    LogEntry {
+        id: log_id(index, term_n),
+        command: Vec::new(),
+    }
+}
+
+/// Build a vector of log entries from `[(index, term)]` pairs.
+pub fn log_entries(spec: &[(u64, u64)]) -> Vec<LogEntry<Vec<u8>>> {
+    spec.iter().map(|&(i, t)| log_entry(i, t)).collect()
+}
+
+/// Build a RequestAppendEntries.
+pub fn append_entries_request(
+    term_n: u64,
+    leader: u64,
+    prev_log: Option<LogId>,
+    entries: Vec<LogEntry<Vec<u8>>>,
+    leader_commit: u64,
+) -> RequestAppendEntries<Vec<u8>> {
+    RequestAppendEntries {
+        term: term(term_n),
+        leader_id: node(leader),
+        prev_log_id: prev_log,
+        entries,
+        leader_commit: LogIndex::new(leader_commit),
+    }
+}
+
+/// Wrap a RequestAppendEntries into the Event envelope the engine accepts.
+pub fn append_entries_from(from: u64, request: RequestAppendEntries<Vec<u8>>) -> Event<Vec<u8>> {
+    Event::Incoming(Incoming {
+        from: node(from),
+        message: Message::AppendEntriesRequest(request),
+    })
+}
+
+/// Assert the actions contain exactly one Send of an AppendEntriesResponse.
+pub fn expect_append_entries_response(actions: &[Action<Vec<u8>>]) -> AppendEntriesResponse {
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected exactly one action, got {actions:?}"
+    );
+    match &actions[0] {
+        Action::Send {
+            message: Message::AppendEntriesResponse(response),
+            ..
+        } => *response,
+        other => panic!("expected Send(AppendEntriesResponse), got {other:?}"),
+    }
+}
+
 /// Assert that the actions contain exactly one `Send` of a VoteResponse, and
 /// return that response. Tests call this and then assert on the result.
 pub fn expect_vote_response(actions: &[Action<Vec<u8>>]) -> VoteResponse {
-    assert_eq!(actions.len(), 1, "expected exactly one action, got {actions:?}");
+    assert_eq!(
+        actions.len(),
+        1,
+        "expected exactly one action, got {actions:?}"
+    );
     match &actions[0] {
         Action::Send {
             message: Message::VoteResponse(response),

@@ -17,7 +17,9 @@ impl<C> Default for Log<C> {
 impl<C> Log<C> {
     #[must_use]
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     #[must_use]

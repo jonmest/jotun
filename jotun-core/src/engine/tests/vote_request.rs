@@ -44,7 +44,11 @@ fn follower_rejects_a_stale_term_without_changing_state() {
 
     let response = expect_vote_response(&actions);
     assert_eq!(response.result, VoteResult::Rejected);
-    assert_eq!(response.term, term(5), "response carries the responder's term");
+    assert_eq!(
+        response.term,
+        term(5),
+        "response carries the responder's term"
+    );
     assert_eq!(engine.current_term(), term(5));
     assert_eq!(engine.voted_for(), Some(node(2)));
 }
@@ -108,10 +112,7 @@ fn follower_with_log_rejects_candidate_whose_log_is_behind() {
 
     // Candidate in a newer election claims a strictly shorter log at the
     // same term as ours. Not up to date.
-    let actions = engine.step(vote_request_from(
-        3,
-        vote_request(3, 4, Some(log_id(4, 2))),
-    ));
+    let actions = engine.step(vote_request_from(3, vote_request(3, 4, Some(log_id(4, 2)))));
 
     let response = expect_vote_response(&actions);
     assert_eq!(
@@ -119,7 +120,11 @@ fn follower_with_log_rejects_candidate_whose_log_is_behind() {
         VoteResult::Rejected,
         "candidate log with lower index at same term must be rejected",
     );
-    assert_eq!(engine.current_term(), term(4), "term caught up to the request");
+    assert_eq!(
+        engine.current_term(),
+        term(4),
+        "term caught up to the request"
+    );
     assert_eq!(
         engine.voted_for(),
         None,
@@ -135,10 +140,7 @@ fn follower_grants_when_candidate_log_term_is_strictly_greater() {
 
     // Candidate has a shorter log but at a newer term. Per §5.4.1, higher
     // term wins regardless of index.
-    let actions = engine.step(vote_request_from(
-        3,
-        vote_request(3, 4, Some(log_id(1, 3))),
-    ));
+    let actions = engine.step(vote_request_from(3, vote_request(3, 4, Some(log_id(1, 3)))));
 
     let response = expect_vote_response(&actions);
     assert_eq!(response.result, VoteResult::Granted);
