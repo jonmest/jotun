@@ -35,4 +35,4 @@ The mapping layer is covered by property tests. They round-trip every message ty
 
 ## License
 
-Business Source License 1.1
+MIT
