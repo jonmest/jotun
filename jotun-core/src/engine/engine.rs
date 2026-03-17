@@ -84,6 +84,11 @@ impl<C> Engine<C> {
         }
     }
 
+    fn reset_election_timer(&mut self) {
+        self.state.election_elapsed = 0;
+        self.state.election_timeout_ticks = self.env.next_election_timeout();
+    }
+
     #[must_use]
     pub fn id(&self) -> NodeId {
         self.id
@@ -110,6 +115,16 @@ impl<C> Engine<C> {
 
     pub fn commit_index(&self) -> LogIndex {
         self.state.commit_index
+    }
+
+    #[must_use]
+    pub fn election_elapsed(&self) -> u64 {
+        self.state.election_elapsed
+    }
+
+    #[must_use]
+    pub fn election_timeout_ticks(&self) -> u64 {
+        self.state.election_timeout_ticks
     }
 
     #[must_use]
@@ -241,6 +256,8 @@ impl<C> Engine<C> {
             return self.conflict(request.leader_id, LogIndex::ZERO);
         }
 
+        self.reset_election_timer();
+
         if request.prev_log_id.is_some_and(|id| {
             self.state
                 .log
@@ -335,7 +352,9 @@ impl<C> Engine<C> {
         let granted = is_valid_term && is_vote_available && candidate_log_valid;
         if granted {
             self.state.voted_for = Some(request.candidate_id);
+            self.reset_election_timer();
         }
+
         tracing::Span::current().record(
             telemetry::fields::DECISION,
             if granted { "granted" } else { "rejected" },
@@ -356,11 +375,16 @@ impl<C> Engine<C> {
         }
     }
 
+    /// Transition to follower. Does NOT reset the election timer — per §5.2,
+    /// the timer resets only on accepting `AppendEntries` from the current
+    /// leader or granting a vote. Callers that need both should do so
+    /// explicitly after this returns.
     fn become_follower(&mut self, term: Term) {
         let from_term = self.state.current_term;
         self.state.current_term = term;
         self.state.voted_for = None;
         self.state.role = RoleState::Follower(FollowerState::default());
+
         if from_term != term {
             telemetry::term_advanced(self.id, from_term, term);
         }
@@ -372,6 +396,8 @@ impl<C> Engine<C> {
         self.state.current_term = self.state.current_term.next();
         self.state.voted_for = Some(self.id);
         self.state.role = RoleState::Candidate(CandidateState { votes_granted: 1 });
+        self.reset_election_timer();
+
         telemetry::term_advanced(self.id, from_term, self.state.current_term);
         telemetry::became_candidate(self.id, self.state.current_term);
     }

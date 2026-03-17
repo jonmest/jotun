@@ -101,6 +101,67 @@ fn advancing_to_a_higher_term_clears_the_prior_vote() {
 }
 
 // ---------------------------------------------------------------------------
+// Election-timer reset — §5.2.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn granting_a_vote_resets_the_election_timer() {
+    let mut engine = follower(1);
+    // Simulate some ticks elapsing.
+    engine.state_mut().election_elapsed = 5;
+
+    engine.step(vote_request_from(2, vote_request(2, 1, None)));
+
+    assert_eq!(
+        engine.election_elapsed(),
+        0,
+        "granting a vote must reset the election timer (§5.2)",
+    );
+}
+
+#[test]
+fn rejecting_a_vote_does_not_reset_the_election_timer() {
+    let mut engine = follower(1);
+    // Already voted for candidate 2 in term 1.
+    engine.step(vote_request_from(2, vote_request(2, 1, None)));
+    // Some ticks elapse.
+    engine.state_mut().election_elapsed = 7;
+
+    // Candidate 3 is rejected.
+    engine.step(vote_request_from(3, vote_request(3, 1, None)));
+
+    assert_eq!(
+        engine.election_elapsed(),
+        7,
+        "rejected vote requests must not reset the election timer",
+    );
+}
+
+#[test]
+fn granting_a_vote_draws_a_new_timeout_from_env() {
+    use crate::engine::env::ScriptedEnv;
+    // Construction consumes the first value; the grant reset draws the next.
+    let env = ScriptedEnv::new(vec![10, 42]);
+    let mut engine = super::fixtures::follower_with_env(1, &[], Box::new(env));
+    assert_eq!(engine.election_timeout_ticks(), 10);
+
+    // Fresh follower grants a higher-term vote. Term catch-up on its own does
+    // not reset (§5.2); only the grant does.
+    engine.step(vote_request_from(2, vote_request(2, 5, None)));
+
+    assert_eq!(
+        engine.voted_for(),
+        Some(node(2)),
+        "precondition: test scenario must grant the vote",
+    );
+    assert_eq!(
+        engine.election_timeout_ticks(),
+        42,
+        "granting a vote must draw a new timeout from env",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Log-up-to-date rule — §5.4.1.
 // ---------------------------------------------------------------------------
 

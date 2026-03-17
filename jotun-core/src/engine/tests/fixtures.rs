@@ -32,17 +32,6 @@ pub(super) fn follower(id: u64) -> Engine<Vec<u8>> {
     )
 }
 
-/// A fresh follower in a cluster of the given peer ids. Self is excluded
-/// automatically by the constructor.
-pub(super) fn follower_in_cluster(id: u64, peers: &[u64]) -> Engine<Vec<u8>> {
-    Engine::new(
-        node(id),
-        peers.iter().map(|&p| node(p)),
-        Box::new(StaticEnv(DEFAULT_ELECTION_TIMEOUT)),
-        DEFAULT_HEARTBEAT_INTERVAL,
-    )
-}
-
 /// A follower that uses a caller-supplied `Env`. For tests that need to
 /// script a specific sequence of election timeouts.
 pub(super) fn follower_with_env(id: u64, peers: &[u64], env: Box<dyn Env>) -> Engine<Vec<u8>> {

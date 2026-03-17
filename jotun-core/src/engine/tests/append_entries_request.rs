@@ -281,6 +281,72 @@ fn leader_commit_is_capped_at_last_log_index() {
 }
 
 // ---------------------------------------------------------------------------
+// Election-timer reset — §5.2.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn successful_append_entries_resets_the_election_timer() {
+    let mut engine = follower(1);
+    engine.state_mut().election_elapsed = 5;
+
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, None, vec![], 0),
+    ));
+
+    assert_eq!(
+        engine.election_elapsed(),
+        0,
+        "an accepted AppendEntries must reset the election timer (§5.2)",
+    );
+}
+
+#[test]
+fn stale_term_append_entries_does_not_reset_the_election_timer() {
+    let mut engine = follower(1);
+    // Advance to term 5.
+    engine.step(super::fixtures::vote_request_from(
+        2,
+        super::fixtures::vote_request(2, 5, None),
+    ));
+    engine.state_mut().election_elapsed = 7;
+
+    // A stale leader (term 3) sends AppendEntries.
+    engine.step(append_entries_from(
+        3,
+        append_entries_request(3, 3, None, vec![], 0),
+    ));
+
+    assert_eq!(
+        engine.election_elapsed(),
+        7,
+        "a stale leader's AppendEntries must not reset our timer",
+    );
+}
+
+#[test]
+#[ignore = "engine currently only resets on Success; see review discussion"]
+fn append_entries_with_prev_log_mismatch_still_resets_timer() {
+    // If the engine is updated to reset on any valid-term AppendEntries (the
+    // tighter interpretation of §5.2), flip this to non-ignored.
+    let mut engine = follower(1);
+    seed_log(&mut engine, &[1, 1]);
+    engine.state_mut().election_elapsed = 5;
+
+    // Valid term, but prev_log refers to an index we don't have.
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, Some(log_id(5, 1)), vec![], 0),
+    ));
+
+    assert_eq!(
+        engine.election_elapsed(),
+        0,
+        "any AppendEntries from a valid-term leader should reset the timer (§5.2)",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Invariants (property tests)
 // ---------------------------------------------------------------------------
 
