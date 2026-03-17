@@ -11,10 +11,17 @@ use crate::records::message::Message;
 use crate::records::vote::{RequestVote, VoteResponse};
 use crate::types::{index::LogIndex, log::LogId, node::NodeId, term::Term};
 
-/// A fresh follower: term 0, empty log, no prior vote. Commands are `Vec<u8>`
-/// so tests don't have to juggle a command type parameter.
+/// A fresh follower with no peers: term 0, empty log, no prior vote.
+/// Suitable for receive-side tests that don't need peer broadcast.
+/// Commands are `Vec<u8>` so tests don't have to juggle a command type.
 pub(super) fn follower(id: u64) -> Engine<Vec<u8>> {
-    Engine::new(node(id))
+    Engine::new(node(id), std::iter::empty())
+}
+
+/// A fresh follower in a cluster of the given peer ids. Self is excluded
+/// automatically by the constructor.
+pub(super) fn follower_in_cluster(id: u64, peers: &[u64]) -> Engine<Vec<u8>> {
+    Engine::new(node(id), peers.iter().map(|&p| node(p)))
 }
 
 pub(super) fn node(id: u64) -> NodeId {

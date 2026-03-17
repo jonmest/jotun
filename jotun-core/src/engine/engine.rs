@@ -5,6 +5,8 @@
     clippy::needless_pass_by_value,
     clippy::unused_self
 )]
+use std::collections::BTreeSet;
+
 use crate::engine::log::Log;
 use crate::engine::telemetry;
 use crate::records::append_entries::{
@@ -37,15 +39,22 @@ pub struct RaftState<C> {
 #[derive(Debug)]
 pub struct Engine<C> {
     id: NodeId,
+    peers: BTreeSet<NodeId>,
     state: RaftState<C>,
 }
 
 impl<C> Engine<C> {
     /// Create a fresh follower in term 0 with an empty log and no recorded vote.
+    ///
+    /// `peers` is any iterable of peer node ids. Self is automatically
+    /// excluded, so the caller can pass the full cluster membership without
+    /// filtering.
     #[must_use]
-    pub fn new(id: NodeId) -> Self {
+    pub fn new(id: NodeId, peers: impl IntoIterator<Item = NodeId>) -> Self {
+        let peers = peers.into_iter().filter(|p| *p != id).collect();
         Self {
             id,
+            peers,
             state: RaftState {
                 current_term: Term::ZERO,
                 voted_for: None,
@@ -60,6 +69,11 @@ impl<C> Engine<C> {
     #[must_use]
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    #[must_use]
+    pub fn peers(&self) -> &BTreeSet<NodeId> {
+        &self.peers
     }
 
     pub fn current_term(&self) -> Term {
