@@ -5,6 +5,7 @@ pub mod env;
 pub mod event;
 pub mod incoming;
 pub mod log;
+pub mod peer_progress;
 pub mod role_state;
 pub mod telemetry;
 

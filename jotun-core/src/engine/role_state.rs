@@ -1,5 +1,4 @@
-use crate::types::{index::LogIndex, node::NodeId};
-use std::collections::HashMap;
+use crate::engine::peer_progress::PeerProgress;
 
 #[derive(Default, Copy, Clone, Debug)]
 pub struct FollowerState {}
@@ -11,8 +10,7 @@ pub struct CandidateState {
 
 #[derive(Default, Clone, Debug)]
 pub struct LeaderState {
-    pub next_index: HashMap<NodeId, LogIndex>,
-    pub match_index: HashMap<NodeId, LogIndex>,
+    pub progress: PeerProgress,
 }
 
 #[derive(Debug, Clone)]

@@ -454,13 +454,9 @@ impl<C> Engine<C> {
     }
 
     fn become_leader(&mut self) {
-        let next_index = todo!();
-        let match_index = todo!();
+        let progress = todo!();
 
-        self.state.role = RoleState::Leader(LeaderState {
-            next_index,
-            match_index,
-        });
+        self.state.role = RoleState::Leader(LeaderState { progress });
         telemetry::became_leader(self.id, self.state.current_term);
     }
 }
