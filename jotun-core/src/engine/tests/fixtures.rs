@@ -160,3 +160,18 @@ pub(super) fn expect_vote_response(actions: &[Action<Vec<u8>>]) -> VoteResponse 
         other => panic!("expected Send(VoteResponse), got {other:?}"),
     }
 }
+
+/// Extract every `Send(RequestVote)` action, paired with its destination.
+/// Order is not guaranteed; callers that care sort by peer id.
+pub(super) fn collect_vote_requests(actions: &[Action<Vec<u8>>]) -> Vec<(NodeId, RequestVote)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                to,
+                message: Message::VoteRequest(req),
+            } => Some((*to, *req)),
+            _ => None,
+        })
+        .collect()
+}

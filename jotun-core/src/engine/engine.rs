@@ -128,6 +128,16 @@ impl<C> Engine<C> {
     }
 
     #[must_use]
+    pub fn heartbeat_elapsed(&self) -> u64 {
+        self.state.heartbeat_elapsed
+    }
+
+    #[must_use]
+    pub fn heartbeat_interval_ticks(&self) -> u64 {
+        self.heartbeat_interval_ticks
+    }
+
+    #[must_use]
     pub fn log(&self) -> &Log<C> {
         &self.state.log
     }
@@ -212,7 +222,48 @@ impl<C> Engine<C> {
 
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_tick(&mut self) -> Vec<Action<C>> {
-        todo!()
+        match &self.state.role {
+            RoleState::Follower(_) | RoleState::Candidate(_) => {
+                self.state.election_elapsed += 1;
+                if self.state.election_elapsed >= self.state.election_timeout_ticks {
+                    return self.start_election();
+                }
+                vec![]
+            }
+            RoleState::Leader(_) => {
+                self.state.heartbeat_elapsed += 1;
+                if self.state.heartbeat_elapsed >= self.heartbeat_interval_ticks {
+                    self.state.heartbeat_elapsed = 0;
+                    return self.send_heartbeats();
+                }
+                vec![]
+            }
+        }
+    }
+
+    fn start_election(&mut self) -> Vec<Action<C>> {
+        self.become_candidate();
+
+        let request = RequestVote {
+            term: self.state.current_term,
+            candidate_id: self.id(),
+            last_log_id: self.state.log.last_log_id(),
+        };
+
+        self.peers
+            .iter()
+            .map(|&peer| Action::Send {
+                to: peer,
+                message: VoteRequest(request),
+            })
+            .collect()
+    }
+
+    fn send_heartbeats(&mut self) -> Vec<Action<C>> {
+        // TODO: actually build and send AppendEntries heartbeats to every peer.
+        // Leader-side work is pending (§5.2). Returning empty keeps on_tick's
+        // leader branch reachable and harmless until then.
+        vec![]
     }
 
     #[instrument(target = "jotun::engine", skip_all)]
