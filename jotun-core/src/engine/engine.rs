@@ -28,29 +28,79 @@ use crate::{
 };
 use tracing::instrument;
 
+/// All mutable state of a single Raft node (Figure 2).
+///
+/// Split out from [`Engine`] so the surrounding configuration
+/// (`id`, `peers`, `env`, `heartbeat_interval_ticks`) — which never
+/// changes after construction — stays clearly distinct from the
+/// per-step running state.
+///
+/// Persistent vs volatile (per Figure 2):
+///  - `current_term` and `voted_for` are *persistent* — must survive a
+///    crash for safety. The host is responsible for writing them
+///    durably before responding to any RPC that mutated them.
+///  - `log` is also persistent.
+///  - Everything else (`commit_index`, `last_applied`, `role`, the
+///    election/heartbeat counters) is volatile and reconstructed on
+///    restart.
 #[derive(Debug)]
 pub struct RaftState<C> {
+    /// Highest term we've ever seen. Monotonically non-decreasing (§5.1).
     pub current_term: Term,
+    /// Candidate this node voted for in `current_term`, if any.
     pub voted_for: Option<NodeId>,
+    /// The replicated log itself.
     pub log: Log<C>,
+    /// Highest log index known to be committed cluster-wide.
     pub commit_index: LogIndex,
+    /// Highest log index applied to the local state machine. Always
+    /// `<= commit_index`.
     pub last_applied: LogIndex,
+    /// Current role (Follower / Candidate / Leader) and its per-role
+    /// bookkeeping.
     pub role: RoleState,
+    /// Threshold at which the election timer fires, in ticks. Re-rolled
+    /// from [`crate::engine::env::Env`] on every reset (§5.2 randomization).
     pub election_timeout_ticks: u64,
+    /// Ticks elapsed since the last election-timer reset.
     pub election_elapsed: u64,
+    /// Ticks elapsed since the leader last broadcast `AppendEntries`.
     pub heartbeat_elapsed: u64,
 }
 
+/// The Raft state machine — a single node's complete consensus engine.
+///
+/// Pure: no I/O, no async, no clock of its own. Driven by
+/// [`Engine::step`] with [`crate::engine::event::Event`]s and emits
+/// [`crate::engine::action::Action`]s describing what the host should
+/// do (send messages, persist state, apply committed entries). The
+/// host owns sockets, disk, and time; the engine owns correctness.
+///
+/// `C` is the application command type. Must be `Clone` because leaders
+/// hand copies of log entries to peers while keeping the originals.
 #[derive(Debug)]
 pub struct Engine<C> {
+    /// This node's id. Stable for the lifetime of the engine.
     id: NodeId,
+    /// Other nodes in the cluster. Self is excluded by the constructor.
+    /// Iteration order is deterministic (`BTreeSet`) for reproducible tests.
     peers: BTreeSet<NodeId>,
+    /// Source of nondeterministic inputs — currently just election
+    /// timeout randomization. Boxed for object safety; Send so the
+    /// engine can be moved between threads.
     env: Box<dyn Env>,
+    /// How often the leader emits heartbeats, in ticks. Must be smaller
+    /// than the election timeout (§5.2).
     heartbeat_interval_ticks: u64,
+    /// All mutable per-node state.
     state: RaftState<C>,
 }
 
 impl<C: Clone> Engine<C> {
+    // =========================================================================
+    // Construction
+    // =========================================================================
+
     /// Create a fresh follower in term 0 with an empty log and no recorded vote.
     ///
     /// `peers` is any iterable of peer node ids. Self is automatically
@@ -85,10 +135,9 @@ impl<C: Clone> Engine<C> {
         }
     }
 
-    fn reset_election_timer(&mut self) {
-        self.state.election_elapsed = 0;
-        self.state.election_timeout_ticks = self.env.next_election_timeout();
-    }
+    // =========================================================================
+    // Accessors — read-only views of state and config
+    // =========================================================================
 
     #[must_use]
     pub fn id(&self) -> NodeId {
@@ -119,6 +168,11 @@ impl<C: Clone> Engine<C> {
     }
 
     #[must_use]
+    pub fn log(&self) -> &Log<C> {
+        &self.state.log
+    }
+
+    #[must_use]
     pub fn election_elapsed(&self) -> u64 {
         self.state.election_elapsed
     }
@@ -138,11 +192,6 @@ impl<C: Clone> Engine<C> {
         self.heartbeat_interval_ticks
     }
 
-    #[must_use]
-    pub fn log(&self) -> &Log<C> {
-        &self.state.log
-    }
-
     /// Number of votes required to win an election in this cluster.
     /// `cluster_size = peers + self`; majority = `cluster_size / 2 + 1`.
     #[must_use]
@@ -150,10 +199,18 @@ impl<C: Clone> Engine<C> {
         self.peers.len().div_ceil(2) + 1
     }
 
+    // =========================================================================
+    // Test-only mutators
+    // =========================================================================
+
     #[cfg(test)]
     pub(crate) fn state_mut(&mut self) -> &mut RaftState<C> {
         &mut self.state
     }
+
+    // =========================================================================
+    // Invariants — debug-only correctness checks called after every step()
+    // =========================================================================
 
     /// Structural invariants the engine must never violate.
     /// Panics in debug builds when a transition breaks one; no-op in release.
@@ -196,6 +253,11 @@ impl<C: Clone> Engine<C> {
     #[cfg(not(debug_assertions))]
     fn check_invariants(&self) {}
 
+    // =========================================================================
+    // Step — the public entry point. The host calls this exactly once per
+    // event; everything else in the file is reachable from here.
+    // =========================================================================
+
     #[instrument(
         target = "jotun::engine",
         skip_all,
@@ -228,6 +290,12 @@ impl<C: Clone> Engine<C> {
         actions
     }
 
+    // =========================================================================
+    // Top-level dispatch — one handler per Event variant.
+    // =========================================================================
+
+    /// Time has passed. Drives the election timer (followers/candidates) and
+    /// the heartbeat interval (leaders).
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_tick(&mut self) -> Vec<Action<C>> {
         match &self.state.role {
@@ -249,77 +317,75 @@ impl<C: Clone> Engine<C> {
         }
     }
 
-    fn start_election(&mut self) -> Vec<Action<C>> {
-        self.become_candidate();
-        if self.has_majority_votes() {
-            return self.become_leader();
-        }
-
-        let request = RequestVote {
-            term: self.state.current_term,
-            candidate_id: self.id(),
-            last_log_id: self.state.log.last_log_id(),
-        };
-
-        self.peers
-            .iter()
-            .map(|&peer| Action::Send {
-                to: peer,
-                message: VoteRequest(request),
-            })
-            .collect()
-    }
-
-    fn broadcast_append_entries(&self) -> Vec<Action<C>> {
-        let RoleState::Leader(leader) = &self.state.role else {
-            return vec![];
-        };
-
-        self.peers
-            .iter()
-            .copied()
-            .map(|peer| {
-                let next = leader.progress.next_for(peer).unwrap_or(LogIndex::new(1));
-                debug_assert!(next.get() >= 1, "nextIndex floor is 1");
-                let prev_log_index = LogIndex::new(next.get() - 1);
-                let prev_log_id = self.state.log.entry_at(prev_log_index).map(|e| e.id);
-                let entries = self.state.log.entries_from(next).to_vec();
-
-                Action::Send {
-                    to: peer,
-                    message: AppendEntriesRequest(RequestAppendEntries {
-                        term: self.state.current_term,
-                        leader_id: self.id,
-                        prev_log_id,
-                        entries,
-                        leader_commit: self.state.commit_index,
-                    }),
-                }
-            })
-            .collect()
-    }
-
+    /// A peer's RPC arrived. Demultiplex by message type.
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_incoming(&mut self, incoming: Incoming<C>) -> Vec<Action<C>> {
         match incoming.message {
-            VoteRequest(request_vote) => vec![self.on_vote_request(request_vote)],
-            VoteResponse(vote_response) => self.on_vote_response(incoming.from, vote_response),
-            AppendEntriesRequest(request_append_entries) => {
-                vec![self.on_append_entries_request(request_append_entries)]
+            VoteRequest(request) => vec![self.on_vote_request(request)],
+            VoteResponse(response) => self.on_vote_response(incoming.from, response),
+            AppendEntriesRequest(request) => vec![self.on_append_entries_request(request)],
+            AppendEntriesResponse(response) => {
+                self.on_append_entries_response(incoming.from, response)
             }
-            AppendEntriesResponse(append_entries_response) => todo!(),
         }
     }
 
+    /// The application is asking the leader to replicate a command.
+    /// On non-leaders this is where the host would redirect to the current
+    /// leader (engine currently no-ops).
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_client_proposal(&mut self, command: C) -> Vec<Action<C>> {
         todo!()
     }
 
-    fn has_majority_votes(&self) -> bool {
-        match self.role() {
-            RoleState::Candidate(state) => state.votes_granted.len() >= self.cluster_majority(),
-            _ => false,
+    // =========================================================================
+    // Election — RequestVote + VoteResponse + the candidate machinery (§5.2)
+    // =========================================================================
+
+    #[instrument(
+        target = "jotun::engine",
+        skip_all,
+        fields(
+            candidate = %request.candidate_id,
+            request_term = request.term.get(),
+            decision = tracing::field::Empty,
+        ),
+    )]
+    fn on_vote_request(&mut self, request: RequestVote) -> Action<C> {
+        if request.term > self.state.current_term {
+            self.become_follower(request.term);
+        }
+
+        let is_valid_term = request.term == self.state.current_term;
+        let is_vote_available = self
+            .state
+            .voted_for
+            .is_none_or(|v| v == request.candidate_id);
+        let candidate_log_valid = self.state.log.is_superseded_by(request.last_log_id);
+
+        let granted = is_valid_term && is_vote_available && candidate_log_valid;
+        if granted {
+            self.state.voted_for = Some(request.candidate_id);
+            self.reset_election_timer();
+        }
+
+        tracing::Span::current().record(
+            telemetry::fields::DECISION,
+            if granted { "granted" } else { "rejected" },
+        );
+
+        let msg = VoteResponse {
+            term: self.state.current_term,
+            result: if granted {
+                VoteResult::Granted
+            } else {
+                VoteResult::Rejected
+            },
+        };
+
+        Action::Send {
+            to: request.candidate_id,
+            message: VoteResponse(msg),
         }
     }
 
@@ -349,6 +415,41 @@ impl<C: Clone> Engine<C> {
 
         vec![]
     }
+
+    /// True iff we're a candidate whose tally has reached cluster majority.
+    fn has_majority_votes(&self) -> bool {
+        match self.role() {
+            RoleState::Candidate(state) => state.votes_granted.len() >= self.cluster_majority(),
+            _ => false,
+        }
+    }
+
+    /// Begin a new election: bump term, vote for self, send `RequestVote` to
+    /// every peer. Single-node clusters self-elect immediately.
+    fn start_election(&mut self) -> Vec<Action<C>> {
+        self.become_candidate();
+        if self.has_majority_votes() {
+            return self.become_leader();
+        }
+
+        let request = RequestVote {
+            term: self.state.current_term,
+            candidate_id: self.id(),
+            last_log_id: self.state.log.last_log_id(),
+        };
+
+        self.peers
+            .iter()
+            .map(|&peer| Action::Send {
+                to: peer,
+                message: VoteRequest(request),
+            })
+            .collect()
+    }
+
+    // =========================================================================
+    // Replication — AppendEntries in both directions (§5.3)
+    // =========================================================================
 
     #[instrument(
         target = "jotun::engine",
@@ -429,6 +530,51 @@ impl<C: Clone> Engine<C> {
         }
     }
 
+    #[instrument(target = "jotun::engine", skip_all)]
+    fn on_append_entries_response(
+        &mut self,
+        peer: NodeId,
+        response: AppendEntriesResponse,
+    ) -> Vec<Action<C>> {
+        todo!()
+    }
+
+    /// Send one `AppendEntries` per peer carrying every log entry from that
+    /// peer's `nextIndex` onward. When the peer is caught up the slice is
+    /// empty (effective heartbeat); when behind it carries the missing tail.
+    /// Called from `on_tick` (heartbeat), `become_leader` (initial broadcast),
+    /// and `on_client_proposal` (post-append replication).
+    fn broadcast_append_entries(&self) -> Vec<Action<C>> {
+        let RoleState::Leader(leader) = &self.state.role else {
+            return vec![];
+        };
+
+        self.peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                let next = leader.progress.next_for(peer).unwrap_or(LogIndex::new(1));
+                debug_assert!(next.get() >= 1, "nextIndex floor is 1");
+                let prev_log_index = LogIndex::new(next.get() - 1);
+                let prev_log_id = self.state.log.entry_at(prev_log_index).map(|e| e.id);
+                let entries = self.state.log.entries_from(next).to_vec();
+
+                Action::Send {
+                    to: peer,
+                    message: AppendEntriesRequest(RequestAppendEntries {
+                        term: self.state.current_term,
+                        leader_id: self.id,
+                        prev_log_id,
+                        entries,
+                        leader_commit: self.state.commit_index,
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// Build an `AppendEntries` Conflict response. Helper for the rejection
+    /// paths in [`Engine::on_append_entries_request`].
     fn conflict(&self, leader_id: NodeId, hint: LogIndex) -> Action<C> {
         Action::Send {
             to: leader_id,
@@ -441,52 +587,9 @@ impl<C: Clone> Engine<C> {
         }
     }
 
-    #[instrument(
-        target = "jotun::engine",
-        skip_all,
-        fields(
-            candidate = %request.candidate_id,
-            request_term = request.term.get(),
-            decision = tracing::field::Empty,
-        ),
-    )]
-    fn on_vote_request(&mut self, request: RequestVote) -> Action<C> {
-        if request.term > self.state.current_term {
-            self.become_follower(request.term);
-        }
-
-        let is_valid_term = request.term == self.state.current_term;
-        let is_vote_available = self
-            .state
-            .voted_for
-            .is_none_or(|v| v == request.candidate_id);
-        let candidate_log_valid = self.state.log.is_superseded_by(request.last_log_id);
-
-        let granted = is_valid_term && is_vote_available && candidate_log_valid;
-        if granted {
-            self.state.voted_for = Some(request.candidate_id);
-            self.reset_election_timer();
-        }
-
-        tracing::Span::current().record(
-            telemetry::fields::DECISION,
-            if granted { "granted" } else { "rejected" },
-        );
-
-        let msg = VoteResponse {
-            term: self.state.current_term,
-            result: if granted {
-                VoteResult::Granted
-            } else {
-                VoteResult::Rejected
-            },
-        };
-
-        Action::Send {
-            to: request.candidate_id,
-            message: VoteResponse(msg),
-        }
-    }
+    // =========================================================================
+    // Role transitions and the timer reset they delegate to
+    // =========================================================================
 
     /// Transition to follower. Does NOT reset the election timer — per §5.2,
     /// the timer resets only on accepting `AppendEntries` from the current
@@ -504,6 +607,8 @@ impl<C: Clone> Engine<C> {
         telemetry::became_follower(self.id, term);
     }
 
+    /// Transition to candidate: bump term, vote for self, reset the election
+    /// timer (a fresh election starts a fresh deadline).
     fn become_candidate(&mut self) {
         let from_term = self.state.current_term;
         self.state.current_term = self.state.current_term.next();
@@ -519,6 +624,8 @@ impl<C: Clone> Engine<C> {
         telemetry::became_candidate(self.id, self.state.current_term);
     }
 
+    /// Transition to leader: initialize per-peer progress and emit the
+    /// initial heartbeat broadcast.
     fn become_leader(&mut self) -> Vec<Action<C>> {
         let last_log_index = self.log().last_log_id().map_or(LogIndex::ZERO, |l| l.index);
 
@@ -527,5 +634,15 @@ impl<C: Clone> Engine<C> {
         telemetry::became_leader(self.id, self.state.current_term);
 
         self.broadcast_append_entries()
+    }
+
+    /// Re-roll the election timeout from `Env` and zero the elapsed counter.
+    /// §5.2 says to invoke this on the two events that prove the cluster is
+    /// alive: granting a vote, and accepting `AppendEntries` from a current-
+    /// term leader. Also called by `become_candidate` so a fresh election
+    /// starts with a fresh deadline.
+    fn reset_election_timer(&mut self) {
+        self.state.election_elapsed = 0;
+        self.state.election_timeout_ticks = self.env.next_election_timeout();
     }
 }

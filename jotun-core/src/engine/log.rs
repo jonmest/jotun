@@ -5,8 +5,22 @@
 use crate::records::log_entry::LogEntry;
 use crate::types::{index::LogIndex, log::LogId, term::Term};
 
-/// indices are 1-based (Raft convention). `LogIndex::ZERO` is a sentinel
-/// meaning "before any entry" and is never the index of a real entry.
+/// The replicated log — the linear, append-mostly history that consensus
+/// is engineered to deliver to every node identically.
+///
+/// Indices are 1-based (Raft convention). [`LogIndex::ZERO`] is a
+/// pre-log sentinel meaning "before any entry" and is never the index
+/// of a real entry. Internally backed by a `Vec`; later this can be
+/// swapped for a disk-backed implementation behind the same API.
+///
+/// **Invariants** (debug-checked by [`Log::check_invariants`]):
+///  - Entry indices are contiguous starting at 1.
+///  - Entry terms are non-decreasing across the log (a leader only
+///    appends at its current term, which is monotonic across leadership).
+///
+/// Followers reconcile against incoming `AppendEntries` via
+/// [`Log::truncate_from`] + [`Log::append`]; leaders use
+/// [`Log::entries_from`] to slice out what each peer needs next.
 #[derive(Debug)]
 pub struct Log<C> {
     entries: Vec<LogEntry<C>>,
