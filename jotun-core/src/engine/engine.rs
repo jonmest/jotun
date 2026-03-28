@@ -14,6 +14,8 @@ use crate::engine::telemetry;
 use crate::records::append_entries::{
     AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries,
 };
+use crate::records::log_entry::{LogEntry, LogPayload};
+use crate::types::log::LogId;
 #[allow(clippy::enum_glob_use)] // match-heavy file; variants are used unqualified throughout
 use crate::records::message::Message::*;
 use crate::records::vote::{RequestVote, VoteResponse, VoteResult};
@@ -624,9 +626,25 @@ impl<C: Clone> Engine<C> {
         telemetry::became_candidate(self.id, self.state.current_term);
     }
 
-    /// Transition to leader: initialize per-peer progress and emit the
-    /// initial heartbeat broadcast.
+    /// Transition to leader: initialize per-peer progress, append a no-op
+    /// entry at the new leader's term (§5.4.2), and emit the initial
+    /// `AppendEntries` broadcast.
+    ///
+    /// The no-op exists to make prior-term entries committable. §5.4.2
+    /// forbids a leader from counting an entry as committed by majority
+    /// replication alone unless the entry is from the leader's current
+    /// term; the no-op guarantees there is always such an entry available
+    /// without waiting for a client proposal.
     fn become_leader(&mut self) -> Vec<Action<C>> {
+        let next_index = self
+            .log()
+            .last_log_id()
+            .map_or(LogIndex::new(1), |l| l.index.next());
+        self.state.log.append(LogEntry {
+            id: LogId::new(next_index, self.state.current_term),
+            payload: LogPayload::Noop,
+        });
+
         let last_log_index = self.log().last_log_id().map_or(LogIndex::ZERO, |l| l.index);
 
         let progress = PeerProgress::new(self.peers.iter().copied(), last_log_index);

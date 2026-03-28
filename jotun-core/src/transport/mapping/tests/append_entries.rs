@@ -75,6 +75,16 @@ proptest! {
         );
     }
 
+    // Missing payload oneof on a LogEntry must always reject.
+    #[test]
+    fn log_entry_missing_payload_rejected(mut p in valid_proto_log_entry()) {
+        p.payload = None;
+        prop_assert_eq!(
+            <LogEntry<Vec<u8>>>::try_from(p),
+            Err(ConvertError::MissingField("LogEntry.payload"))
+        );
+    }
+
     // Zero leader_id must always reject.
     #[test]
     fn request_append_entries_zero_leader_rejected(mut p in valid_proto_request_append_entries()) {

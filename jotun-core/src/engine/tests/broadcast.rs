@@ -10,6 +10,7 @@ use super::fixtures::{
 use crate::engine::env::StaticEnv;
 use crate::engine::event::Event;
 use crate::engine::role_state::{LeaderState, RoleState};
+use crate::records::log_entry::LogPayload;
 use crate::types::index::LogIndex;
 
 /// Drive a fresh follower → candidate → leader for a 3-node cluster.
@@ -57,22 +58,40 @@ fn non_leader_emits_no_append_entries() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn empty_log_yields_prev_none_and_no_entries() {
+fn empty_pre_election_log_yields_prev_at_the_become_leader_noop() {
+    // §5.4.2: become_leader appends a no-op at the new term. With an empty
+    // pre-election log, the no-op is at (1, 1). PeerProgress::new then sets
+    // nextIndex = 2, so the heartbeat carries prev = (1, 1) and no entries —
+    // peers are *assumed* to already have the no-op until proven otherwise.
     let mut engine = elected_leader_3_node();
     let actions = engine.step(Event::Tick);
 
     for (_peer, req) in collect_append_entries(&actions) {
-        assert_eq!(req.prev_log_id, None, "no entries → no prev");
-        assert!(req.entries.is_empty(), "no log → no entries to send");
+        assert_eq!(req.prev_log_id, Some(log_id(1, 1)), "prev = the no-op");
+        assert!(req.entries.is_empty(), "peers assumed caught up");
     }
 }
 
 #[test]
+fn become_leader_appends_a_noop_at_current_term() {
+    let engine = elected_leader_3_node();
+    // Last entry must be the no-op at the leader's current term.
+    let last = engine.log().last_log_id().expect("noop must be present");
+    assert_eq!(last, log_id(1, 1));
+    let entry = engine
+        .log()
+        .entry_at(LogIndex::new(1))
+        .expect("entry must exist");
+    assert!(matches!(entry.payload, LogPayload::Noop));
+}
+
+#[test]
 fn behind_peer_receives_unsent_entries_starting_at_next() {
-    // Pre-seed: leader has 3 entries before becoming leader. Once elected,
-    // PeerProgress::new sets nextIndex = 4 for every peer (last+1). So the
-    // first heartbeat sends nothing — peers are assumed up-to-date until
-    // proven otherwise. This test verifies that.
+    // Pre-seed: leader has 3 entries before becoming leader. become_leader
+    // then appends a no-op at term 1, pushing the log to 4 entries.
+    // PeerProgress::new sets nextIndex = 4 for every peer (last_pre_noop+1),
+    // so the first broadcast carries just the no-op (entry 4) — peers are
+    // assumed caught up to the seeded portion until proven otherwise.
     let env = StaticEnv(1);
     let mut engine = follower_with_env(1, &[2, 3], Box::new(env));
     seed_log(&mut engine, &[1, 1, 1]); // log: (1,1) (2,1) (3,1)
@@ -84,10 +103,10 @@ fn behind_peer_receives_unsent_entries_starting_at_next() {
     for (_peer, req) in collect_append_entries(&actions) {
         assert_eq!(
             req.prev_log_id,
-            Some(log_id(3, 1)),
-            "prev = leader's last entry; peer is assumed caught up",
+            Some(log_id(4, 1)),
+            "prev = the no-op the new leader appended on top of the seeded log",
         );
-        assert!(req.entries.is_empty(), "nothing newer to send");
+        assert!(req.entries.is_empty(), "peers assumed caught up");
     }
 }
 
@@ -167,15 +186,18 @@ fn rewinding_peer_next_index_replays_missing_entries() {
         .find(|(p, _)| *p == node(3))
         .expect("expected an append to peer 3");
 
-    // Peer 2 was rewound to nextIndex=2, so prev_log_index=1 → prev = (1,1).
-    // Entries 2 and 3 should be sent.
+    // become_leader appended a no-op at (4, 1), so log = (1,1)(2,1)(3,1)(4,1).
+    // PeerProgress initialized nextIndex=5 for every peer, then peer 2 was
+    // rewound to 2: prev_log_index=1 → prev = (1,1), entries 2, 3, 4 sent.
     assert_eq!(req2.prev_log_id, Some(log_id(1, 1)));
-    assert_eq!(req2.entries.len(), 2);
+    assert_eq!(req2.entries.len(), 3);
     assert_eq!(req2.entries[0].id, log_id(2, 1));
     assert_eq!(req2.entries[1].id, log_id(3, 1));
+    assert_eq!(req2.entries[2].id, log_id(4, 1));
+    assert!(matches!(req2.entries[2].payload, LogPayload::Noop));
 
-    // Peer 3 still at nextIndex=4 → no entries to send.
-    assert_eq!(req3.prev_log_id, Some(log_id(3, 1)));
+    // Peer 3 still at nextIndex=5 → caught up, no entries.
+    assert_eq!(req3.prev_log_id, Some(log_id(4, 1)));
     assert!(req3.entries.is_empty());
 }
 
@@ -196,9 +218,10 @@ fn far_behind_peer_with_next_at_one_receives_all_entries() {
     let appends = collect_append_entries(&actions);
     let (_, req2) = appends.iter().find(|(p, _)| *p == node(2)).unwrap();
 
+    // 4 seeded entries + 1 no-op from become_leader = 5 entries total.
     // nextIndex=1 → prev_log_index=0 → prev_log_id = None (before-log sentinel).
     assert_eq!(req2.prev_log_id, None);
-    assert_eq!(req2.entries.len(), 4, "all entries sent");
+    assert_eq!(req2.entries.len(), 5, "all entries sent");
 }
 
 // ---------------------------------------------------------------------------

@@ -193,7 +193,8 @@ fn five_node_cluster_needs_two_grants_to_win() {
 
 #[test]
 fn becoming_leader_initializes_peer_progress_correctly() {
-    // Empty log means nextIndex should start at 1 for every peer.
+    // Empty pre-election log; become_leader appends a no-op at index 1
+    // (§5.4.2), so peers' nextIndex starts at 2 (last_log_index + 1).
     let mut engine = candidate_in_cluster(1, &[2, 3]);
     engine.step(vote_response_from(2, 1, true));
 
@@ -207,8 +208,8 @@ fn becoming_leader_initializes_peer_progress_correctly() {
             for peer in [node(2), node(3)] {
                 assert_eq!(
                     s.progress.next_for(peer),
-                    Some(LogIndex::new(1)),
-                    "empty log → nextIndex starts at 1",
+                    Some(LogIndex::new(2)),
+                    "empty pre-election log + leader noop → nextIndex starts at 2",
                 );
                 assert_eq!(
                     s.progress.match_for(peer),

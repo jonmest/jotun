@@ -1,6 +1,6 @@
 use crate::records::{
     append_entries::{AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries},
-    log_entry::LogEntry,
+    log_entry::{LogEntry, LogPayload},
 };
 use crate::types::{index::LogIndex, node::NodeId, term::Term};
 
@@ -9,9 +9,13 @@ use super::ConvertError;
 
 impl<C: Into<Vec<u8>>> From<LogEntry<C>> for proto::LogEntry {
     fn from(v: LogEntry<C>) -> Self {
+        let payload = match v.payload {
+            LogPayload::Noop => proto::log_entry::Payload::Noop(proto::Noop {}),
+            LogPayload::Command(c) => proto::log_entry::Payload::Command(c.into()),
+        };
         Self {
             id: Some(v.id.into()),
-            command: v.command.into(),
+            payload: Some(payload),
         }
     }
 }
@@ -20,12 +24,19 @@ impl<C: From<Vec<u8>>> TryFrom<proto::LogEntry> for LogEntry<C> {
     type Error = ConvertError;
 
     fn try_from(v: proto::LogEntry) -> Result<Self, Self::Error> {
+        let payload = match v
+            .payload
+            .ok_or(ConvertError::MissingField("LogEntry.payload"))?
+        {
+            proto::log_entry::Payload::Noop(_) => LogPayload::Noop,
+            proto::log_entry::Payload::Command(b) => LogPayload::Command(C::from(b)),
+        };
         Ok(Self {
             id: v
                 .id
                 .ok_or(ConvertError::MissingField("LogEntry.id"))?
                 .into(),
-            command: C::from(v.command),
+            payload,
         })
     }
 }

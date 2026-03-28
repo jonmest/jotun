@@ -7,7 +7,7 @@ use crate::engine::env::{Env, StaticEnv};
 use crate::engine::event::Event;
 use crate::engine::incoming::Incoming;
 use crate::records::append_entries::{AppendEntriesResponse, RequestAppendEntries};
-use crate::records::log_entry::LogEntry;
+use crate::records::log_entry::{LogEntry, LogPayload};
 use crate::records::message::Message;
 use crate::records::vote::{RequestVote, VoteResponse};
 use crate::types::{index::LogIndex, log::LogId, node::NodeId, term::Term};
@@ -82,7 +82,7 @@ pub(super) fn seed_log(engine: &mut Engine<Vec<u8>>, terms: &[u64]) {
         let index = LogIndex::new((i + 1) as u64);
         log.append(LogEntry {
             id: LogId::new(index, term(t)),
-            command: Vec::new(),
+            payload: LogPayload::Command(Vec::new()),
         });
     }
 }
@@ -91,7 +91,7 @@ pub(super) fn seed_log(engine: &mut Engine<Vec<u8>>, terms: &[u64]) {
 pub(super) fn log_entry(index: u64, term_n: u64) -> LogEntry<Vec<u8>> {
     LogEntry {
         id: log_id(index, term_n),
-        command: Vec::new(),
+        payload: LogPayload::Command(Vec::new()),
     }
 }
 

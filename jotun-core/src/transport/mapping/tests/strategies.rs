@@ -3,7 +3,7 @@ use proptest::prelude::*;
 
 use crate::records::{
     append_entries::{AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries},
-    log_entry::LogEntry,
+    log_entry::{LogEntry, LogPayload},
     message::Message,
     vote::{RequestVote, VoteResponse, VoteResult},
 };
@@ -43,8 +43,15 @@ pub(super) fn vote_response() -> impl Strategy<Value = VoteResponse> {
     (term(), vote_result()).prop_map(|(term, result)| VoteResponse { term, result })
 }
 
+pub(super) fn log_payload() -> impl Strategy<Value = LogPayload<Vec<u8>>> {
+    prop_oneof![
+        Just(LogPayload::Noop),
+        vec(any::<u8>(), 0..64).prop_map(LogPayload::Command),
+    ]
+}
+
 pub(super) fn log_entry() -> impl Strategy<Value = LogEntry<Vec<u8>>> {
-    (log_id(), vec(any::<u8>(), 0..64)).prop_map(|(id, command)| LogEntry { id, command })
+    (log_id(), log_payload()).prop_map(|(id, payload)| LogEntry { id, payload })
 }
 
 pub(super) fn request_append_entries() -> impl Strategy<Value = RequestAppendEntries<Vec<u8>>> {
