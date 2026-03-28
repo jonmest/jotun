@@ -161,6 +161,22 @@ pub(super) fn expect_vote_response(actions: &[Action<Vec<u8>>]) -> VoteResponse 
     }
 }
 
+/// Extract every `Send(AppendEntriesRequest)` action, paired with destination.
+pub(super) fn collect_append_entries(
+    actions: &[Action<Vec<u8>>],
+) -> Vec<(NodeId, RequestAppendEntries<Vec<u8>>)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                to,
+                message: Message::AppendEntriesRequest(req),
+            } => Some((*to, req.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Wrap a `VoteResponse` into the Event envelope the engine accepts.
 pub(super) fn vote_response_from(from: u64, term_n: u64, granted: bool) -> Event<Vec<u8>> {
     use crate::records::vote::{VoteResponse, VoteResult};

@@ -50,7 +50,7 @@ pub struct Engine<C> {
     state: RaftState<C>,
 }
 
-impl<C> Engine<C> {
+impl<C: Clone> Engine<C> {
     /// Create a fresh follower in term 0 with an empty log and no recorded vote.
     ///
     /// `peers` is any iterable of peer node ids. Self is automatically
@@ -242,7 +242,7 @@ impl<C> Engine<C> {
                 self.state.heartbeat_elapsed += 1;
                 if self.state.heartbeat_elapsed >= self.heartbeat_interval_ticks {
                     self.state.heartbeat_elapsed = 0;
-                    return self.send_heartbeats();
+                    return self.broadcast_append_entries();
                 }
                 vec![]
             }
@@ -270,11 +270,33 @@ impl<C> Engine<C> {
             .collect()
     }
 
-    fn send_heartbeats(&mut self) -> Vec<Action<C>> {
-        // TODO: actually build and send AppendEntries heartbeats to every peer.
-        // Leader-side work is pending (§5.2). Returning empty keeps on_tick's
-        // leader branch reachable and harmless until then.
-        vec![]
+    fn broadcast_append_entries(&self) -> Vec<Action<C>> {
+        let RoleState::Leader(leader) = &self.state.role else {
+            return vec![];
+        };
+
+        self.peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                let next = leader.progress.next_for(peer).unwrap_or(LogIndex::new(1));
+                debug_assert!(next.get() >= 1, "nextIndex floor is 1");
+                let prev_log_index = LogIndex::new(next.get() - 1);
+                let prev_log_id = self.state.log.entry_at(prev_log_index).map(|e| e.id);
+                let entries = self.state.log.entries_from(next).to_vec();
+
+                Action::Send {
+                    to: peer,
+                    message: AppendEntriesRequest(RequestAppendEntries {
+                        term: self.state.current_term,
+                        leader_id: self.id,
+                        prev_log_id,
+                        entries,
+                        leader_commit: self.state.commit_index,
+                    }),
+                }
+            })
+            .collect()
     }
 
     #[instrument(target = "jotun::engine", skip_all)]
@@ -504,6 +526,6 @@ impl<C> Engine<C> {
         self.state.role = RoleState::Leader(LeaderState { progress });
         telemetry::became_leader(self.id, self.state.current_term);
 
-        self.send_heartbeats()
+        self.broadcast_append_entries()
     }
 }

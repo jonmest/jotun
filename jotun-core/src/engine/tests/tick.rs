@@ -223,8 +223,8 @@ fn leader_resets_heartbeat_elapsed_after_interval() {
 
     let actions = engine.step(Event::Tick); // 3 == interval → fire + reset
     assert_eq!(engine.heartbeat_elapsed(), 0, "reset after interval");
-    // send_heartbeats stub returns empty; real impl will emit AppendEntries.
-    assert!(actions.is_empty(), "stub heartbeat emits nothing yet");
+    // The broadcast emits one AppendEntries per peer in the cluster (here, 1).
+    assert_eq!(actions.len(), 1, "one AppendEntries per peer");
 }
 
 #[test]
