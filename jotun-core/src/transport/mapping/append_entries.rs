@@ -35,7 +35,7 @@ impl<C: From<Vec<u8>>> TryFrom<proto::LogEntry> for LogEntry<C> {
             id: v
                 .id
                 .ok_or(ConvertError::MissingField("LogEntry.id"))?
-                .into(),
+                .try_into()?,
             payload,
         })
     }
@@ -60,7 +60,7 @@ impl<C: From<Vec<u8>>> TryFrom<proto::RequestAppendEntries> for RequestAppendEnt
         Ok(Self {
             term: Term::new(v.term),
             leader_id: NodeId::new(v.leader_id).ok_or(ConvertError::ZeroNodeId)?,
-            prev_log_id: v.prev_log_id.map(Into::into),
+            prev_log_id: v.prev_log_id.map(TryInto::try_into).transpose()?,
             entries: v
                 .entries
                 .into_iter()
@@ -100,12 +100,28 @@ impl TryFrom<proto::AppendEntriesResponse> for AppendEntriesResponse {
             .result
             .ok_or(ConvertError::MissingField("AppendEntriesResponse.result"))?
         {
-            R::Success(s) => AppendEntriesResult::Success {
-                last_appended: s.last_appended.map(LogIndex::new),
-            },
-            R::Conflict(c) => AppendEntriesResult::Conflict {
-                next_index_hint: LogIndex::new(c.next_index_hint),
-            },
+            R::Success(s) => {
+                // None = "no entries"; Some(0) is the pre-log sentinel
+                // and must not appear on the wire as an ack target.
+                if let Some(0) = s.last_appended {
+                    return Err(ConvertError::ZeroLogIndex(
+                        "AppendEntriesResponse.success.last_appended",
+                    ));
+                }
+                AppendEntriesResult::Success {
+                    last_appended: s.last_appended.map(LogIndex::new),
+                }
+            }
+            R::Conflict(c) => {
+                if c.next_index_hint == 0 {
+                    return Err(ConvertError::ZeroLogIndex(
+                        "AppendEntriesResponse.conflict.next_index_hint",
+                    ));
+                }
+                AppendEntriesResult::Conflict {
+                    next_index_hint: LogIndex::new(c.next_index_hint),
+                }
+            }
         };
         Ok(Self {
             term: Term::new(v.term),

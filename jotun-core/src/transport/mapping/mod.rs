@@ -12,6 +12,10 @@ use super::protobuf as proto;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvertError {
     ZeroNodeId,
+    /// A field that should carry a real log position arrived as 0.
+    /// `LogIndex::ZERO` is a pre-log sentinel and must never appear on
+    /// the wire as the index of an actual entry or response position.
+    ZeroLogIndex(&'static str),
     MissingField(&'static str),
     UnknownEnum(&'static str, i32),
 }
@@ -20,6 +24,9 @@ impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ZeroNodeId => write!(f, "node id must be non-zero"),
+            Self::ZeroLogIndex(field) => {
+                write!(f, "log index must be non-zero in field: {field}")
+            }
             Self::MissingField(name) => write!(f, "missing required field: {name}"),
             Self::UnknownEnum(name, v) => write!(f, "unknown enum value for {name}: {v}"),
         }
@@ -37,9 +44,14 @@ impl From<LogId> for proto::LogId {
     }
 }
 
-impl From<proto::LogId> for LogId {
-    fn from(v: proto::LogId) -> Self {
-        LogId::new(LogIndex::new(v.index), Term::new(v.term))
+impl TryFrom<proto::LogId> for LogId {
+    type Error = ConvertError;
+
+    fn try_from(v: proto::LogId) -> Result<Self, Self::Error> {
+        if v.index == 0 {
+            return Err(ConvertError::ZeroLogIndex("LogId.index"));
+        }
+        Ok(LogId::new(LogIndex::new(v.index), Term::new(v.term)))
     }
 }
 

@@ -21,7 +21,7 @@ impl TryFrom<proto::RequestVote> for RequestVote {
         Ok(Self {
             term: Term::new(v.term),
             candidate_id: NodeId::new(v.candidate_id).ok_or(ConvertError::ZeroNodeId)?,
-            last_log_id: v.last_log_id.map(Into::into),
+            last_log_id: v.last_log_id.map(TryInto::try_into).transpose()?,
         })
     }
 }

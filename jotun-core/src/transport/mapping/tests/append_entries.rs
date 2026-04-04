@@ -124,4 +124,62 @@ proptest! {
             Err(ConvertError::MissingField("AppendEntriesResponse.result"))
         );
     }
+
+    // A LogEntry whose id has index=0 must reject — index 0 is the
+    // pre-log sentinel and never names a real entry.
+    #[test]
+    fn log_entry_zero_index_rejected(mut p in valid_proto_log_entry()) {
+        if let Some(id) = p.id.as_mut() {
+            id.index = 0;
+        }
+        prop_assert_eq!(
+            <LogEntry<Vec<u8>>>::try_from(p),
+            Err(ConvertError::ZeroLogIndex("LogId.index"))
+        );
+    }
+
+    // A RequestAppendEntries whose prev_log_id has index=0 must reject.
+    // None encodes "before any entry"; Some(0) is malformed.
+    #[test]
+    fn request_append_entries_zero_prev_log_index_rejected(
+        mut p in valid_proto_request_append_entries(),
+    ) {
+        p.prev_log_id = Some(proto::LogId { index: 0, term: 1 });
+        prop_assert_eq!(
+            <RequestAppendEntries<Vec<u8>>>::try_from(p),
+            Err(ConvertError::ZeroLogIndex("LogId.index"))
+        );
+    }
+}
+
+// AppendEntriesResponse::Success { last_appended: Some(0) } must reject
+// — None already encodes "no entries", so Some(0) is malformed.
+#[test]
+fn append_entries_response_success_zero_last_appended_rejected() {
+    let p = proto::AppendEntriesResponse {
+        term: 1,
+        result: Some(proto::append_entries_response::Result::Success(
+            proto::AppendSuccess { last_appended: Some(0) },
+        )),
+    };
+    let err = AppendEntriesResponse::try_from(p).unwrap_err();
+    assert_eq!(
+        err,
+        ConvertError::ZeroLogIndex("AppendEntriesResponse.success.last_appended"),
+    );
+}
+
+#[test]
+fn append_entries_response_conflict_zero_hint_rejected() {
+    let p = proto::AppendEntriesResponse {
+        term: 1,
+        result: Some(proto::append_entries_response::Result::Conflict(
+            proto::AppendConflict { next_index_hint: 0 },
+        )),
+    };
+    let err = AppendEntriesResponse::try_from(p).unwrap_err();
+    assert_eq!(
+        err,
+        ConvertError::ZeroLogIndex("AppendEntriesResponse.conflict.next_index_hint"),
+    );
 }

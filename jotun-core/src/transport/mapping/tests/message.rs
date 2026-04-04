@@ -10,7 +10,7 @@ use prost::Message as _;
 proptest! {
     #[test]
     fn log_id_roundtrip(id in strategies::log_id()) {
-        let round: LogId = proto::LogId::from(id).into();
+        let round: LogId = proto::LogId::from(id).try_into().unwrap();
         prop_assert_eq!(id, round);
     }
 

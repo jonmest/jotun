@@ -13,8 +13,17 @@ pub(super) fn term() -> impl Strategy<Value = Term> {
     any::<u64>().prop_map(Term::new)
 }
 
+/// Any [`LogIndex`] including the pre-log sentinel (0). Suitable for fields
+/// that may legitimately be zero, like `leader_commit` before any commit
+/// has happened.
 pub(super) fn log_index() -> impl Strategy<Value = LogIndex> {
     any::<u64>().prop_map(LogIndex::new)
+}
+
+/// Strictly positive [`LogIndex`] — for fields that name a real log
+/// position (entry positions, ack targets, conflict hints).
+pub(super) fn nonzero_log_index() -> impl Strategy<Value = LogIndex> {
+    (1u64..=u64::MAX).prop_map(LogIndex::new)
 }
 
 pub(super) fn node_id() -> impl Strategy<Value = NodeId> {
@@ -22,7 +31,7 @@ pub(super) fn node_id() -> impl Strategy<Value = NodeId> {
 }
 
 pub(super) fn log_id() -> impl Strategy<Value = LogId> {
-    (log_index(), term()).prop_map(|(i, t)| LogId::new(i, t))
+    (nonzero_log_index(), term()).prop_map(|(i, t)| LogId::new(i, t))
 }
 
 pub(super) fn request_vote() -> impl Strategy<Value = RequestVote> {
@@ -75,9 +84,10 @@ pub(super) fn request_append_entries() -> impl Strategy<Value = RequestAppendEnt
 
 pub(super) fn append_entries_result() -> impl Strategy<Value = AppendEntriesResult> {
     prop_oneof![
-        proptest::option::of(log_index())
+        proptest::option::of(nonzero_log_index())
             .prop_map(|last_appended| AppendEntriesResult::Success { last_appended }),
-        log_index().prop_map(|next_index_hint| AppendEntriesResult::Conflict { next_index_hint }),
+        nonzero_log_index()
+            .prop_map(|next_index_hint| AppendEntriesResult::Conflict { next_index_hint }),
     ]
 }
 
