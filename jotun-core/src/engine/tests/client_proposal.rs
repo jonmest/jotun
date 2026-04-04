@@ -1,0 +1,256 @@
+//! Tests for [`Engine::on_client_proposal`] — the application-side write
+//! entry point. Leader appends + broadcasts; followers redirect when they
+//! know who the leader is, otherwise drop; candidates always drop.
+//!
+//! Also covers `FollowerState::leader_id` bookkeeping via
+//! `on_append_entries_request`, since the redirect path depends on it.
+
+use super::fixtures::{
+    append_entries_from, append_entries_request, client_proposal, collect_append_entries,
+    collect_redirects, follower, follower_with_env, log_id, node, vote_response_from,
+};
+use crate::engine::engine::Engine;
+use crate::engine::env::StaticEnv;
+use crate::engine::event::Event;
+use crate::engine::role_state::RoleState;
+use crate::records::log_entry::LogPayload;
+use crate::types::index::LogIndex;
+
+/// 3-node leader (self=1, peers=2,3) at term 1, log = [(1,1)=Noop].
+fn elected_leader_3_node() -> Engine<Vec<u8>> {
+    let env = StaticEnv(1);
+    let mut engine = follower_with_env(1, &[2, 3], Box::new(env));
+    engine.step(Event::Tick);
+    engine.step(vote_response_from(2, 1, true));
+    assert!(matches!(engine.role(), RoleState::Leader(_)));
+    engine
+}
+
+// ---------------------------------------------------------------------------
+// Leader path — append at (last+1, current_term) and broadcast
+// ---------------------------------------------------------------------------
+
+#[test]
+fn leader_appends_command_at_next_index_and_current_term() {
+    let mut engine = elected_leader_3_node();
+    let term_now = engine.current_term();
+    let last_before = engine.log().last_log_id().unwrap().index;
+
+    engine.step(client_proposal(b"set x = 1"));
+
+    let last_after = engine.log().last_log_id().unwrap();
+    assert_eq!(last_after.index, last_before.next());
+    assert_eq!(last_after.term, term_now);
+    let entry = engine.log().entry_at(last_after.index).unwrap();
+    match &entry.payload {
+        LogPayload::Command(c) => assert_eq!(c, b"set x = 1"),
+        LogPayload::Noop => panic!("expected Command payload, got Noop"),
+    }
+}
+
+#[test]
+fn leader_broadcasts_immediately_after_appending() {
+    let mut engine = elected_leader_3_node();
+    let actions = engine.step(client_proposal(b"hello"));
+    let appends = collect_append_entries(&actions);
+
+    assert_eq!(
+        appends.len(),
+        2,
+        "one AppendEntries per peer, kicked off without waiting for heartbeat",
+    );
+    let mut peers: Vec<u64> = appends.iter().map(|(p, _)| p.get()).collect();
+    peers.sort_unstable();
+    assert_eq!(peers, vec![2, 3]);
+}
+
+#[test]
+fn first_proposal_on_empty_log_lands_at_index_one() {
+    // Construct a leader synthetically with an empty log so we can verify
+    // the LogIndex::new(1) fallback in next_index. (A naturally elected
+    // leader always has the no-op at index 1 already.)
+    let mut engine = follower(1);
+    engine.state_mut().current_term = crate::types::term::Term::new(2);
+    engine.state_mut().role = RoleState::Leader(crate::engine::role_state::LeaderState::default());
+
+    engine.step(client_proposal(b"first"));
+
+    let last = engine.log().last_log_id().unwrap();
+    assert_eq!(last.index, LogIndex::new(1));
+}
+
+#[test]
+fn leader_proposal_carries_command_to_peers() {
+    let mut engine = elected_leader_3_node();
+    let actions = engine.step(client_proposal(b"payload"));
+    let appends = collect_append_entries(&actions);
+
+    for (_peer, req) in &appends {
+        // The new command must be in the entries vec being shipped.
+        let last = req.entries.last().expect("must carry the new entry");
+        match &last.payload {
+            LogPayload::Command(c) => assert_eq!(c, b"payload"),
+            LogPayload::Noop => panic!("expected Command in broadcast tail"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Follower path — Redirect when leader known, drop otherwise
+// ---------------------------------------------------------------------------
+
+#[test]
+fn follower_with_known_leader_emits_redirect() {
+    // A fresh follower learns its leader from any accepted AppendEntries.
+    let mut engine = follower(1);
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, None, vec![], 0),
+    ));
+    // Now a client lands on us.
+    let actions = engine.step(client_proposal(b"go away"));
+    let redirects = collect_redirects(&actions);
+    assert_eq!(redirects, vec![node(2)]);
+    // No entries appended on a follower.
+    assert!(engine.log().is_empty());
+}
+
+#[test]
+fn follower_without_known_leader_drops_silently() {
+    // Just booted — never heard from a leader. Nothing to redirect to.
+    let mut engine = follower(1);
+    let actions = engine.step(client_proposal(b"orphan"));
+    assert!(actions.is_empty());
+    assert!(engine.log().is_empty());
+}
+
+#[test]
+fn higher_term_append_entries_resets_known_leader_and_then_records_new_one() {
+    // Follower learned leader=2 at term 1. A higher-term AE from leader=3
+    // demotes via become_follower (which clears leader_id), then records
+    // leader=3 for the new term.
+    let mut engine = follower(1);
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, None, vec![], 0),
+    ));
+    if let RoleState::Follower(f) = engine.role() {
+        assert_eq!(f.leader_id, Some(node(2)));
+    } else {
+        panic!("expected Follower");
+    }
+
+    engine.step(append_entries_from(
+        3,
+        append_entries_request(5, 3, None, vec![], 0),
+    ));
+    if let RoleState::Follower(f) = engine.role() {
+        assert_eq!(f.leader_id, Some(node(3)), "leader for new term recorded");
+    } else {
+        panic!("expected Follower");
+    }
+}
+
+#[test]
+fn stepping_down_to_follower_clears_known_leader() {
+    // A higher-term VoteResponse demotes a candidate to follower. The new
+    // FollowerState is fresh — leader_id starts None until the new
+    // leader's first AppendEntries arrives.
+    let env = StaticEnv(1);
+    let mut engine = follower_with_env(1, &[2, 3], Box::new(env));
+    // First, become a follower of leader 2 at term 1 so leader_id is set.
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, None, vec![], 0),
+    ));
+    // Then trigger candidacy.
+    for _ in 0..crate::engine::tests::fixtures::DEFAULT_ELECTION_TIMEOUT {
+        engine.step(Event::Tick);
+    }
+    assert!(matches!(engine.role(), RoleState::Candidate(_)));
+    // A higher-term response demotes us back to follower.
+    engine.step(vote_response_from(2, 99, false));
+    match engine.role() {
+        RoleState::Follower(f) => assert_eq!(
+            f.leader_id, None,
+            "new term, new election in progress: no trusted leader yet",
+        ),
+        other => panic!("expected Follower, got {other:?}"),
+    }
+
+    // And a proposal here drops, since there's no leader to redirect to.
+    let actions = engine.step(client_proposal(b"limbo"));
+    assert!(actions.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Candidate path — always drop
+// ---------------------------------------------------------------------------
+
+#[test]
+fn candidate_drops_proposal_silently() {
+    let env = StaticEnv(1);
+    let mut engine = follower_with_env(1, &[2, 3], Box::new(env));
+    engine.step(Event::Tick); // → Candidate
+    assert!(matches!(engine.role(), RoleState::Candidate(_)));
+
+    let actions = engine.step(client_proposal(b"midflight"));
+    assert!(actions.is_empty());
+    // Log untouched.
+    assert!(engine.log().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// leader_id is recorded only on accepted AE (term-valid path)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stale_term_append_entries_does_not_update_known_leader() {
+    let mut engine = follower(1);
+    // First, set leader=2 at term 5.
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(5, 2, None, vec![], 0),
+    ));
+    if let RoleState::Follower(f) = engine.role() {
+        assert_eq!(f.leader_id, Some(node(2)));
+    } else {
+        panic!("expected Follower");
+    }
+
+    // Stale AE from leader=3 at term 1 must be rejected and must not
+    // overwrite leader_id.
+    engine.step(append_entries_from(
+        3,
+        append_entries_request(1, 3, None, vec![], 0),
+    ));
+    if let RoleState::Follower(f) = engine.role() {
+        assert_eq!(f.leader_id, Some(node(2)), "stale AE must not hijack leader");
+    } else {
+        panic!("expected Follower");
+    }
+}
+
+#[test]
+fn prev_log_mismatch_still_records_leader_for_the_term() {
+    // The peer at term 1 is the legitimate leader of the term even if its
+    // first AE conflicts with our log — we should still know who it is so
+    // a client redirect is possible.
+    let mut engine = follower(1);
+    // Seed our log so a prev_log_id mismatch is forced.
+    crate::engine::tests::fixtures::seed_log(&mut engine, &[1, 1]);
+
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, Some(log_id(99, 1)), vec![], 0),
+    ));
+    if let RoleState::Follower(f) = engine.role() {
+        assert_eq!(
+            f.leader_id,
+            Some(node(2)),
+            "leader recorded before the prev_log check fails",
+        );
+    } else {
+        panic!("expected Follower");
+    }
+}

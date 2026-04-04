@@ -30,4 +30,6 @@ pub enum Action<C> {
     /// engine advances `last_applied` to the last index in the slice
     /// when emitting this; the host must not skip the action.
     Apply(Vec<LogEntry<C>>),
+
+    Redirect { leader_hint: NodeId },
 }

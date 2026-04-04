@@ -332,12 +332,38 @@ impl<C: Clone> Engine<C> {
         }
     }
 
-    /// The application is asking the leader to replicate a command.
-    /// On non-leaders this is where the host would redirect to the current
-    /// leader (engine currently no-ops).
+    /// The application is asking us to replicate a command.
+    ///
+    ///  - Leader: append the command at `(last+1, current_term)` and
+    ///    broadcast — replication kicks off immediately rather than
+    ///    waiting for the next heartbeat.
+    ///  - Follower with a known leader: emit `Action::Redirect` so the
+    ///    host can forward the client to the right node.
+    ///  - Otherwise (candidate, or follower that hasn't heard from a
+    ///    leader this term): drop — the host should retry.
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_client_proposal(&mut self, command: C) -> Vec<Action<C>> {
-        todo!()
+        match &self.state.role {
+            RoleState::Leader(_) => {}
+            RoleState::Follower(f) => {
+                return match f.leader_id {
+                    Some(leader) => vec![Action::Redirect { leader_hint: leader }],
+                    None => vec![],
+                };
+            }
+            RoleState::Candidate(_) => return vec![],
+        }
+
+        let next_index = self
+            .state
+            .log
+            .last_log_id()
+            .map_or(LogIndex::new(1), |l| l.index.next());
+        self.state.log.append(LogEntry {
+            id: LogId::new(next_index, self.state.current_term),
+            payload: LogPayload::Command(command),
+        });
+        self.broadcast_append_entries()
     }
 
     // =========================================================================
@@ -470,6 +496,12 @@ impl<C: Clone> Engine<C> {
         }
         if request.term < self.state.current_term {
             return vec![self.conflict(request.leader_id, LogIndex::ZERO)];
+        }
+
+        // We're Follower at `request.term`. Record the leader so client
+        // proposals landing here can be redirected.
+        if let RoleState::Follower(f) = &mut self.state.role {
+            f.leader_id = Some(request.leader_id);
         }
 
         self.reset_election_timer();

@@ -4,11 +4,14 @@ use crate::{engine::peer_progress::PeerProgress, types::node::NodeId};
 
 /// Per-role state the follower carries while in the Follower role.
 ///
-/// Currently empty — followers don't need any role-specific bookkeeping
-/// beyond what's already on `RaftState` (term, log, `voted_for`). Reserved
-/// for future fields like "current leader id" if observability needs it.
+/// Tracks the current leader — learned from any `AppendEntries` accepted
+/// in the current term — so the host can redirect client proposals that
+/// land on this node. `None` means "we haven't heard from a leader this
+/// term yet" (just booted, or just stepped down from candidate/leader).
 #[derive(Default, Copy, Clone, Debug)]
-pub struct FollowerState {}
+pub struct FollowerState {
+    pub leader_id: Option<NodeId>,
+}
 
 /// Per-role state the engine carries while in the Candidate role (§5.2).
 ///

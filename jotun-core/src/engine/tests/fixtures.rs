@@ -230,6 +230,22 @@ pub(super) fn collect_apply(actions: &[Action<Vec<u8>>]) -> Vec<Vec<LogEntry<Vec
         .collect()
 }
 
+/// Extract every `Action::Redirect` leader hint from an action vector.
+pub(super) fn collect_redirects(actions: &[Action<Vec<u8>>]) -> Vec<NodeId> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Redirect { leader_hint } => Some(*leader_hint),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Wrap an arbitrary command into a `ClientProposal` Event.
+pub(super) fn client_proposal(command: &[u8]) -> Event<Vec<u8>> {
+    Event::ClientProposal(command.to_vec())
+}
+
 /// Wrap a `VoteResponse` into the Event envelope the engine accepts.
 pub(super) fn vote_response_from(from: u64, term_n: u64, granted: bool) -> Event<Vec<u8>> {
     use crate::records::vote::{VoteResponse, VoteResult};
