@@ -254,3 +254,60 @@ fn prev_log_mismatch_still_records_leader_for_the_term() {
         panic!("expected Follower");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Invariants (property tests)
+// ---------------------------------------------------------------------------
+
+use proptest::prelude::*;
+
+proptest! {
+    /// On a leader, every proposal grows the log by exactly 1, with the
+    /// new entry at (last_before + 1, current_term) and a Command payload.
+    #[test]
+    fn leader_log_grows_by_one_per_proposal(
+        commands in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..16), 0..10),
+    ) {
+        let mut engine = elected_leader_3_node();
+        for cmd in commands {
+            let term_now = engine.current_term();
+            let last_before = engine
+                .log()
+                .last_log_id()
+                .map_or(0, |l| l.index.get());
+
+            engine.step(Event::ClientProposal(cmd.clone()));
+
+            let last_after = engine.log().last_log_id().expect("log non-empty after proposal");
+            prop_assert_eq!(last_after.index.get(), last_before + 1);
+            prop_assert_eq!(last_after.term, term_now);
+
+            let entry = engine.log().entry_at(last_after.index).expect("entry must exist");
+            match &entry.payload {
+                LogPayload::Command(c) => prop_assert_eq!(c, &cmd),
+                LogPayload::Noop => prop_assert!(false, "expected Command, got Noop"),
+            }
+        }
+    }
+
+    /// Non-leaders never grow their own log via a proposal — replication
+    /// is leader-driven. Followers may emit a Redirect; candidates always
+    /// drop. Either way the log is untouched.
+    #[test]
+    fn non_leader_proposal_never_grows_log(
+        commands in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..16), 0..10),
+        as_candidate in any::<bool>(),
+    ) {
+        let env = StaticEnv(1);
+        let mut engine = follower_with_env(1, &[2, 3], Box::new(env));
+        if as_candidate {
+            engine.step(Event::Tick);
+            prop_assert!(matches!(engine.role(), RoleState::Candidate(_)));
+        }
+        let log_len_before = engine.log().len();
+        for cmd in commands {
+            engine.step(Event::ClientProposal(cmd));
+            prop_assert_eq!(engine.log().len(), log_len_before);
+        }
+    }
+}

@@ -289,3 +289,165 @@ fn conflict_does_not_advance_commit_or_emit_apply() {
     assert!(collect_apply(&actions).is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Invariants (property tests)
+// ---------------------------------------------------------------------------
+
+use proptest::prelude::*;
+
+/// One step in a session: a Success or Conflict response from a peer.
+#[derive(Debug, Clone)]
+enum Reply {
+    Success { peer: u64, last_appended: u64 },
+    Conflict { peer: u64, hint: u64 },
+}
+
+fn reply_strategy() -> impl Strategy<Value = Reply> {
+    prop_oneof![
+        (1u64..=3, 0u64..=10).prop_map(|(peer, last)| Reply::Success {
+            peer,
+            last_appended: last,
+        }),
+        (1u64..=3, 1u64..=10).prop_map(|(peer, hint)| Reply::Conflict { peer, hint }),
+    ]
+}
+
+proptest! {
+    /// commit_index is monotonically non-decreasing across any sequence of
+    /// responses, regardless of peer order, payload, or interleaving with
+    /// stale/conflicting messages.
+    #[test]
+    fn commit_index_never_regresses(
+        replies in proptest::collection::vec(reply_strategy(), 0..30),
+    ) {
+        let mut engine = elected_leader_3_node();
+        let mut last_commit = engine.commit_index();
+        for r in replies {
+            match r {
+                Reply::Success { peer, last_appended } => {
+                    engine.step(append_entries_success_from(
+                        peer,
+                        engine.current_term().get(),
+                        last_appended,
+                    ));
+                }
+                Reply::Conflict { peer, hint } => {
+                    engine.step(append_entries_conflict_from(
+                        peer,
+                        engine.current_term().get(),
+                        hint,
+                    ));
+                }
+            }
+            let now = engine.commit_index();
+            prop_assert!(
+                now >= last_commit,
+                "commit_index regressed: {last_commit:?} -> {now:?}",
+            );
+            last_commit = now;
+        }
+    }
+
+    /// `last_applied <= commit_index` is the Figure 2 invariant. The
+    /// debug_assert in check_invariants enforces this every step, but
+    /// asserting it explicitly here makes the property visible and
+    /// gives mutation testing a target.
+    #[test]
+    fn last_applied_never_exceeds_commit_index(
+        replies in proptest::collection::vec(reply_strategy(), 0..30),
+    ) {
+        let mut engine = elected_leader_3_node();
+        for r in replies {
+            match r {
+                Reply::Success { peer, last_appended } => {
+                    engine.step(append_entries_success_from(
+                        peer,
+                        engine.current_term().get(),
+                        last_appended,
+                    ));
+                }
+                Reply::Conflict { peer, hint } => {
+                    engine.step(append_entries_conflict_from(
+                        peer,
+                        engine.current_term().get(),
+                        hint,
+                    ));
+                }
+            }
+            let commit = engine.commit_index();
+            let last_applied = engine.state_mut().last_applied;
+            prop_assert!(last_applied <= commit);
+        }
+    }
+
+    /// Apply emits each log index at most once across a session — the
+    /// host must never see the same entry twice. This is the property
+    /// that proves last_applied is honored.
+    #[test]
+    fn no_log_index_is_applied_more_than_once(
+        replies in proptest::collection::vec(reply_strategy(), 0..30),
+    ) {
+        let mut engine = elected_leader_3_node();
+        let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for r in replies {
+            let actions = match r {
+                Reply::Success { peer, last_appended } => engine.step(
+                    append_entries_success_from(peer, engine.current_term().get(), last_appended),
+                ),
+                Reply::Conflict { peer, hint } => engine.step(append_entries_conflict_from(
+                    peer,
+                    engine.current_term().get(),
+                    hint,
+                )),
+            };
+            for batch in collect_apply(&actions) {
+                for entry in batch {
+                    let idx = entry.id.index.get();
+                    prop_assert!(seen.insert(idx), "index {idx} applied twice");
+                }
+            }
+        }
+    }
+
+    /// §5.4.2 in property form: every commit advance moves commit_index
+    /// to an index whose entry term equals current_term. (Prior-term
+    /// entries can become committed, but only as a side-effect of a
+    /// current-term commit sweeping them — so the *advancement target*
+    /// itself is always a current-term entry.)
+    #[test]
+    fn commit_advances_only_to_current_term_entries(
+        replies in proptest::collection::vec(reply_strategy(), 0..30),
+    ) {
+        let mut engine = elected_leader_3_node();
+        let mut prev_commit = engine.commit_index();
+        for r in replies {
+            match r {
+                Reply::Success { peer, last_appended } => {
+                    engine.step(append_entries_success_from(
+                        peer,
+                        engine.current_term().get(),
+                        last_appended,
+                    ));
+                }
+                Reply::Conflict { peer, hint } => {
+                    engine.step(append_entries_conflict_from(
+                        peer,
+                        engine.current_term().get(),
+                        hint,
+                    ));
+                }
+            }
+            let now = engine.commit_index();
+            if now > prev_commit {
+                let term_at_target = engine.log().term_at(now);
+                prop_assert_eq!(
+                    term_at_target,
+                    Some(engine.current_term()),
+                    "commit advanced to index {} whose term is not current_term", now.get(),
+                );
+            }
+            prev_commit = now;
+        }
+    }
+}
+
