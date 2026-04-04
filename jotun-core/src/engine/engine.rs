@@ -532,13 +532,81 @@ impl<C: Clone> Engine<C> {
         }
     }
 
+    /// Process a peer's `AppendEntries` response (§5.3).
+    ///
+    /// On Success: record the peer's new `matchIndex`, then attempt to
+    /// advance `commit_index` — but only to an entry from the leader's
+    /// current term (§5.4.2; see `become_leader`'s no-op for why).
+    /// When commit advances, emit an `Action::Apply` for the newly
+    /// committed range and bump `last_applied` so we don't replay it.
+    ///
+    /// On Conflict: rewind the peer's `nextIndex` to the hint and
+    /// immediately re-send to that peer alone — waiting a full heartbeat
+    /// interval just to retry a known-broken peer is wasteful.
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_append_entries_response(
         &mut self,
         peer: NodeId,
         response: AppendEntriesResponse,
     ) -> Vec<Action<C>> {
-        todo!()
+        if response.term > self.current_term() {
+            self.become_follower(response.term);
+            return vec![];
+        }
+        if response.term < self.current_term() {
+            return vec![];
+        }
+        let RoleState::Leader(leader) = &mut self.state.role else {
+            return vec![];
+        };
+
+        match response.result {
+            AppendEntriesResult::Success { last_appended } => {
+                let last_appended = last_appended.unwrap_or(LogIndex::ZERO);
+                leader.progress.record_success(peer, last_appended);
+
+                let leader_last = self
+                    .state
+                    .log
+                    .last_log_id()
+                    .map_or(LogIndex::ZERO, |l| l.index);
+                let RoleState::Leader(leader) = &self.state.role else {
+                    unreachable!("we just confirmed Leader above");
+                };
+                let n = leader.progress.majority_index(leader_last);
+
+                if n > self.state.commit_index
+                    && self.state.log.term_at(n) == Some(self.state.current_term)
+                {
+                    self.state.commit_index = n;
+                    return self.drain_apply();
+                }
+                vec![]
+            }
+            AppendEntriesResult::Conflict { next_index_hint } => {
+                leader.progress.record_conflict(peer, next_index_hint);
+                vec![self.append_entries_to(peer)]
+            }
+        }
+    }
+
+    /// Slice newly-committed-but-not-yet-applied entries out of the log
+    /// into an `Action::Apply`, then bump `last_applied` to the new
+    /// commit point. Returns an empty vec if there's nothing to apply.
+    fn drain_apply(&mut self) -> Vec<Action<C>> {
+        let from = LogIndex::new(self.state.last_applied.get() + 1);
+        let to = self.state.commit_index;
+        if from > to {
+            return vec![];
+        }
+        let entries: Vec<LogEntry<C>> = (from.get()..=to.get())
+            .filter_map(|i| self.state.log.entry_at(LogIndex::new(i)).cloned())
+            .collect();
+        if entries.is_empty() {
+            return vec![];
+        }
+        self.state.last_applied = to;
+        vec![Action::Apply(entries)]
     }
 
     /// Send one `AppendEntries` per peer carrying every log entry from that
@@ -547,32 +615,40 @@ impl<C: Clone> Engine<C> {
     /// Called from `on_tick` (heartbeat), `become_leader` (initial broadcast),
     /// and `on_client_proposal` (post-append replication).
     fn broadcast_append_entries(&self) -> Vec<Action<C>> {
-        let RoleState::Leader(leader) = &self.state.role else {
+        if !matches!(self.state.role, RoleState::Leader(_)) {
             return vec![];
-        };
-
+        }
         self.peers
             .iter()
             .copied()
-            .map(|peer| {
-                let next = leader.progress.next_for(peer).unwrap_or(LogIndex::new(1));
-                debug_assert!(next.get() >= 1, "nextIndex floor is 1");
-                let prev_log_index = LogIndex::new(next.get() - 1);
-                let prev_log_id = self.state.log.entry_at(prev_log_index).map(|e| e.id);
-                let entries = self.state.log.entries_from(next).to_vec();
-
-                Action::Send {
-                    to: peer,
-                    message: AppendEntriesRequest(RequestAppendEntries {
-                        term: self.state.current_term,
-                        leader_id: self.id,
-                        prev_log_id,
-                        entries,
-                        leader_commit: self.state.commit_index,
-                    }),
-                }
-            })
+            .map(|peer| self.append_entries_to(peer))
             .collect()
+    }
+
+    /// Build the `AppendEntries` we'd send to a single peer right now,
+    /// based on its current `nextIndex`. On non-leaders we fall back to
+    /// nextIndex = 1 since there's no progress map; in practice this is
+    /// only called from leader paths.
+    fn append_entries_to(&self, peer: NodeId) -> Action<C> {
+        let next = match &self.state.role {
+            RoleState::Leader(l) => l.progress.next_for(peer).unwrap_or(LogIndex::new(1)),
+            _ => LogIndex::new(1),
+        };
+        debug_assert!(next.get() >= 1, "nextIndex floor is 1");
+        let prev_log_index = LogIndex::new(next.get() - 1);
+        let prev_log_id = self.state.log.entry_at(prev_log_index).map(|e| e.id);
+        let entries = self.state.log.entries_from(next).to_vec();
+
+        Action::Send {
+            to: peer,
+            message: AppendEntriesRequest(RequestAppendEntries {
+                term: self.state.current_term,
+                leader_id: self.id,
+                prev_log_id,
+                entries,
+                leader_commit: self.state.commit_index,
+            }),
+        }
     }
 
     /// Build an `AppendEntries` Conflict response. Helper for the rejection

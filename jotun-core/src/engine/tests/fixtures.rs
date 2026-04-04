@@ -6,7 +6,9 @@ use crate::engine::engine::Engine;
 use crate::engine::env::{Env, StaticEnv};
 use crate::engine::event::Event;
 use crate::engine::incoming::Incoming;
-use crate::records::append_entries::{AppendEntriesResponse, RequestAppendEntries};
+use crate::records::append_entries::{
+    AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries,
+};
 use crate::records::log_entry::{LogEntry, LogPayload};
 use crate::records::message::Message;
 use crate::records::vote::{RequestVote, VoteResponse};
@@ -172,6 +174,52 @@ pub(super) fn collect_append_entries(
                 to,
                 message: Message::AppendEntriesRequest(req),
             } => Some((*to, req.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Wrap a peer's `AppendEntriesResponse::Success` into an Event.
+/// `last_appended_idx = 0` encodes "no entries" (the wire `None`).
+pub(super) fn append_entries_success_from(
+    from: u64,
+    term_n: u64,
+    last_appended_idx: u64,
+) -> Event<Vec<u8>> {
+    Event::Incoming(Incoming {
+        from: node(from),
+        message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            term: term(term_n),
+            result: AppendEntriesResult::Success {
+                last_appended: (last_appended_idx > 0).then(|| LogIndex::new(last_appended_idx)),
+            },
+        }),
+    })
+}
+
+/// Wrap a peer's `AppendEntriesResponse::Conflict` into an Event.
+pub(super) fn append_entries_conflict_from(
+    from: u64,
+    term_n: u64,
+    next_index_hint: u64,
+) -> Event<Vec<u8>> {
+    Event::Incoming(Incoming {
+        from: node(from),
+        message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            term: term(term_n),
+            result: AppendEntriesResult::Conflict {
+                next_index_hint: LogIndex::new(next_index_hint),
+            },
+        }),
+    })
+}
+
+/// Extract every `Action::Apply` payload from an action vector.
+pub(super) fn collect_apply(actions: &[Action<Vec<u8>>]) -> Vec<Vec<LogEntry<Vec<u8>>>> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Apply(entries) => Some(entries.clone()),
             _ => None,
         })
         .collect()

@@ -1,6 +1,6 @@
 use crate::{
     records::{log_entry::LogEntry, message::Message},
-    types::{index::LogIndex, node::NodeId},
+    types::node::NodeId,
 };
 
 /// The engine's only output, in vector form per `step()` call.
@@ -25,8 +25,9 @@ pub enum Action<C> {
     /// host should persist them. Reserved for when persistence is
     /// wired in.
     AppendLogEntries(Vec<LogEntry<C>>),
-    /// All entries up to and including this index have been committed;
-    /// the application state machine may apply them. Reserved for when
-    /// the application layer is wired in.
-    ApplyUpTo(LogIndex),
+    /// These entries (in index order, contiguous, all newly committed)
+    /// are now safe to feed to the application state machine. The
+    /// engine advances `last_applied` to the last index in the slice
+    /// when emitting this; the host must not skip the action.
+    Apply(Vec<LogEntry<C>>),
 }
