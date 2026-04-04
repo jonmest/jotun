@@ -1,10 +1,3 @@
-#![allow(
-    dead_code,
-    unused_variables,
-    unreachable_code,
-    clippy::needless_pass_by_value,
-    clippy::unused_self
-)]
 use std::collections::BTreeSet;
 
 use crate::engine::env::Env;
