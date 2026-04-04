@@ -1,6 +1,6 @@
 use crate::{
     records::{log_entry::LogEntry, message::Message},
-    types::node::NodeId,
+    types::{node::NodeId, term::Term},
 };
 
 /// The engine's only output, in vector form per `step()` call.
@@ -10,8 +10,27 @@ use crate::{
 /// the actions however it likes — sockets, async runtimes, in-memory
 /// simulators. This is what makes the engine purely synchronous and
 /// testable without a network or filesystem.
+/// The engine emits actions in causal order: every action that must reach
+/// stable storage before any subsequent network send appears earlier in the
+/// vector. Hosts MUST process actions in order and MUST flush
+/// [`Action::PersistHardState`] / [`Action::PersistLogEntries`] to disk
+/// before performing any [`Action::Send`] that follows them. This is what
+/// keeps Raft crash-safe (Figure 2: "respond to RPCs only after updating
+/// stable storage").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action<C> {
+    /// Persist the §5.1 hard state — the values the engine must recover
+    /// after a crash to remain safe. Emitted whenever `current_term` or
+    /// `voted_for` changes.
+    PersistHardState {
+        current_term: Term,
+        voted_for: Option<NodeId>,
+    },
+    /// Persist these log entries. Emitted in the same `step()` that
+    /// appended them (follower receiving `AppendEntries`, leader
+    /// proposing or appending its election no-op). Entries are in index
+    /// order and contiguous with whatever the host already has.
+    PersistLogEntries(Vec<LogEntry<C>>),
     /// Send `message` to peer `to`. The host owns the network
     /// transport; the engine just describes who and what.
     Send { to: NodeId, message: Message<C> },

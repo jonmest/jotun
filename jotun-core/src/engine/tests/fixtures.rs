@@ -154,18 +154,21 @@ pub(super) fn expect_append_entries_response(actions: &[Action<Vec<u8>>]) -> App
 /// Assert that the actions contain exactly one `Send` of a `VoteResponse`, and
 /// return that response. Tests call this and then assert on the result.
 pub(super) fn expect_vote_response(actions: &[Action<Vec<u8>>]) -> VoteResponse {
-    assert_eq!(
-        actions.len(),
-        1,
-        "expected exactly one action, got {actions:?}"
-    );
-    match &actions[0] {
+    let mut found = actions.iter().filter_map(|a| match a {
         Action::Send {
-            message: Message::VoteResponse(response),
+            message: Message::VoteResponse(r),
             ..
-        } => *response,
-        other => panic!("expected Send(VoteResponse), got {other:?}"),
-    }
+        } => Some(*r),
+        _ => None,
+    });
+    let response = found
+        .next()
+        .unwrap_or_else(|| panic!("expected one Send(VoteResponse), got {actions:?}"));
+    assert!(
+        found.next().is_none(),
+        "expected exactly one VoteResponse, got more in {actions:?}",
+    );
+    response
 }
 
 /// Extract every `Send(AppendEntriesRequest)` action, paired with destination.
@@ -217,6 +220,35 @@ pub(super) fn append_entries_conflict_from(
             },
         }),
     })
+}
+
+/// Extract every `Action::PersistHardState` from an action vector.
+pub(super) fn collect_persist_hard_state(
+    actions: &[Action<Vec<u8>>],
+) -> Vec<(Term, Option<NodeId>)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::PersistHardState {
+                current_term,
+                voted_for,
+            } => Some((*current_term, *voted_for)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Extract every `Action::PersistLogEntries` payload from an action vector.
+pub(super) fn collect_persist_log_entries(
+    actions: &[Action<Vec<u8>>],
+) -> Vec<Vec<LogEntry<Vec<u8>>>> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::PersistLogEntries(entries) => Some(entries.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Extract every `Action::Apply` payload from an action vector.

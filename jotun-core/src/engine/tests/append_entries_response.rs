@@ -39,7 +39,14 @@ fn higher_term_response_demotes_leader_to_follower() {
 
     assert!(matches!(engine.role(), RoleState::Follower(_)));
     assert_eq!(engine.current_term(), term_before.next());
-    assert!(actions.is_empty(), "step-down emits no actions");
+    // Step-down to higher term advances current_term and clears voted_for —
+    // both persistent. Engine must emit a single PersistHardState and no
+    // network sends.
+    assert_eq!(actions.len(), 1, "expected only PersistHardState, got {actions:?}");
+    assert!(matches!(
+        actions[0],
+        crate::engine::action::Action::PersistHardState { .. }
+    ));
 }
 
 #[test]

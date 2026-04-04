@@ -284,6 +284,20 @@ impl<C: Clone> Engine<C> {
     }
 
     // =========================================================================
+    // Persistence helpers
+    // =========================================================================
+
+    /// Build an `Action::PersistHardState` snapshot of the §5.1 hard state.
+    /// Callers emit this after any state change that touched
+    /// `current_term` or `voted_for`, before any subsequent `Send`.
+    fn persist_hard_state(&self) -> Action<C> {
+        Action::PersistHardState {
+            current_term: self.state.current_term,
+            voted_for: self.state.voted_for,
+        }
+    }
+
+    // =========================================================================
     // Top-level dispatch — one handler per Event variant.
     // =========================================================================
 
@@ -314,7 +328,7 @@ impl<C: Clone> Engine<C> {
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_incoming(&mut self, incoming: Incoming<C>) -> Vec<Action<C>> {
         match incoming.message {
-            VoteRequest(request) => vec![self.on_vote_request(request)],
+            VoteRequest(request) => self.on_vote_request(request),
             VoteResponse(response) => self.on_vote_response(incoming.from, response),
             AppendEntriesRequest(request) => self.on_append_entries_request(request),
             AppendEntriesResponse(response) => {
@@ -350,11 +364,15 @@ impl<C: Clone> Engine<C> {
             .log
             .last_log_id()
             .map_or(LogIndex::new(1), |l| l.index.next());
-        self.state.log.append(LogEntry {
+        let entry = LogEntry {
             id: LogId::new(next_index, self.state.current_term),
             payload: LogPayload::Command(command),
-        });
-        self.broadcast_append_entries()
+        };
+        self.state.log.append(entry.clone());
+
+        let mut out = vec![Action::PersistLogEntries(vec![entry])];
+        out.extend(self.broadcast_append_entries());
+        out
     }
 
     // =========================================================================
@@ -370,7 +388,10 @@ impl<C: Clone> Engine<C> {
             decision = tracing::field::Empty,
         ),
     )]
-    fn on_vote_request(&mut self, request: RequestVote) -> Action<C> {
+    fn on_vote_request(&mut self, request: RequestVote) -> Vec<Action<C>> {
+        let prior_term = self.state.current_term;
+        let prior_voted_for = self.state.voted_for;
+
         if request.term > self.state.current_term {
             self.become_follower(request.term);
         }
@@ -402,17 +423,22 @@ impl<C: Clone> Engine<C> {
             },
         };
 
-        Action::Send {
+        let mut out = Vec::new();
+        if self.state.current_term != prior_term || self.state.voted_for != prior_voted_for {
+            out.push(self.persist_hard_state());
+        }
+        out.push(Action::Send {
             to: request.candidate_id,
             message: VoteResponse(msg),
-        }
+        });
+        out
     }
 
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_vote_response(&mut self, voter_id: NodeId, response: VoteResponse) -> Vec<Action<C>> {
         if response.term > self.state.current_term {
             self.become_follower(response.term);
-            return vec![];
+            return vec![self.persist_hard_state()];
         }
         if response.term < self.state.current_term {
             return vec![];
@@ -447,8 +473,14 @@ impl<C: Clone> Engine<C> {
     /// every peer. Single-node clusters self-elect immediately.
     fn start_election(&mut self) -> Vec<Action<C>> {
         self.become_candidate();
+        // become_candidate bumped current_term and set voted_for to self.
+        // Persist before any Send: a crashed-and-recovered candidate must
+        // remember it already voted in this term.
+        let mut out = vec![self.persist_hard_state()];
+
         if self.has_majority_votes() {
-            return self.become_leader();
+            out.extend(self.become_leader());
+            return out;
         }
 
         let request = RequestVote {
@@ -457,13 +489,11 @@ impl<C: Clone> Engine<C> {
             last_log_id: self.state.log.last_log_id(),
         };
 
-        self.peers
-            .iter()
-            .map(|&peer| Action::Send {
-                to: peer,
-                message: VoteRequest(request),
-            })
-            .collect()
+        out.extend(self.peers.iter().map(|&peer| Action::Send {
+            to: peer,
+            message: VoteRequest(request),
+        }));
+        out
     }
 
     // =========================================================================
@@ -479,6 +509,9 @@ impl<C: Clone> Engine<C> {
         )
     )]
     fn on_append_entries_request(&mut self, request: RequestAppendEntries<C>) -> Vec<Action<C>> {
+        let prior_term = self.state.current_term;
+        let prior_voted_for = self.state.voted_for;
+
         if request.term > self.state.current_term
             || (request.term == self.state.current_term
                 && matches!(self.state.role, RoleState::Candidate(_)))
@@ -497,6 +530,9 @@ impl<C: Clone> Engine<C> {
 
         self.reset_election_timer();
 
+        let hard_state_changed =
+            self.state.current_term != prior_term || self.state.voted_for != prior_voted_for;
+
         if let Some(prev) = request.prev_log_id
             && self
                 .state
@@ -504,38 +540,41 @@ impl<C: Clone> Engine<C> {
                 .entry_at(prev.index)
                 .is_none_or(|e| e.id.term != prev.term)
         {
-            // The leader will set nextIndex[us] = hint, then build a new
-            // AppendEntries with prev_log_index = hint - 1. We must NEVER
-            // return a hint past `prev.index` itself: that would let the
-            // leader synthesize a prev_log_id covering a region we and it
-            // don't actually agree on, and the next reply would falsely
-            // ack entries we don't have. Cap at min(our_last + 1, prev.index).
+            // See §5.3 conflict-hint comment elsewhere: cap at prev.index.
             let our_last_next = self
                 .state
                 .log
                 .last_log_id()
                 .map_or(LogIndex::new(1), |l| l.index.next());
             let hint = our_last_next.min(prev.index);
-            return vec![self.conflict(request.leader_id, hint)];
+            let mut out = Vec::new();
+            if hard_state_changed {
+                out.push(self.persist_hard_state());
+            }
+            out.push(self.conflict(request.leader_id, hint));
+            return out;
         }
 
+        let mut newly_persisted: Vec<LogEntry<C>> = Vec::new();
         for entry in request.entries {
             match self.state.log.entry_at(entry.id.index) {
-                None => self.state.log.append(entry),
+                None => {
+                    newly_persisted.push(entry.clone());
+                    self.state.log.append(entry);
+                }
                 Some(existing) => {
                     if existing.id.term != entry.id.term {
-                        // §5.4.1 guarantees a correct leader never asks us to
-                        // overwrite a committed entry. Defend against malformed
-                        // or buggy senders rather than corrupt committed state.
                         if entry.id.index <= self.state.commit_index {
-                            // Cap at the conflicting index so the leader
-                            // doesn't get a hint past where we actually
-                            // disagree. See the comment in the prev-log
-                            // mismatch arm.
                             let hint = entry.id.index;
-                            return vec![self.conflict(request.leader_id, hint)];
+                            let mut out = Vec::new();
+                            if hard_state_changed {
+                                out.push(self.persist_hard_state());
+                            }
+                            out.push(self.conflict(request.leader_id, hint));
+                            return out;
                         }
                         self.state.log.truncate_from(entry.id.index);
+                        newly_persisted.push(entry.clone());
                         self.state.log.append(entry);
                     }
                 }
@@ -552,7 +591,14 @@ impl<C: Clone> Engine<C> {
             self.state.commit_index = request.leader_commit.min(last_appended);
         }
 
-        let mut out = self.drain_apply();
+        let mut out = Vec::new();
+        if hard_state_changed {
+            out.push(self.persist_hard_state());
+        }
+        if !newly_persisted.is_empty() {
+            out.push(Action::PersistLogEntries(newly_persisted));
+        }
+        out.extend(self.drain_apply());
         out.push(Action::Send {
             to: request.leader_id,
             message: AppendEntriesResponse(AppendEntriesResponse {
@@ -584,7 +630,7 @@ impl<C: Clone> Engine<C> {
     ) -> Vec<Action<C>> {
         if response.term > self.current_term() {
             self.become_follower(response.term);
-            return vec![];
+            return vec![self.persist_hard_state()];
         }
         if response.term < self.current_term() {
             return vec![];
@@ -771,10 +817,11 @@ impl<C: Clone> Engine<C> {
             .log()
             .last_log_id()
             .map_or(LogIndex::new(1), |l| l.index.next());
-        self.state.log.append(LogEntry {
+        let noop = LogEntry {
             id: LogId::new(next_index, self.state.current_term),
             payload: LogPayload::Noop,
-        });
+        };
+        self.state.log.append(noop.clone());
 
         let last_log_index = self.log().last_log_id().map_or(LogIndex::ZERO, |l| l.index);
 
@@ -782,7 +829,11 @@ impl<C: Clone> Engine<C> {
         self.state.role = RoleState::Leader(LeaderState { progress });
         telemetry::became_leader(self.id, self.state.current_term);
 
-        self.broadcast_append_entries()
+        // The no-op is now in our log; persist before we announce it via
+        // the initial broadcast.
+        let mut out = vec![Action::PersistLogEntries(vec![noop])];
+        out.extend(self.broadcast_append_entries());
+        out
     }
 
     /// Re-roll the election timeout from `Env` and zero the elapsed counter.

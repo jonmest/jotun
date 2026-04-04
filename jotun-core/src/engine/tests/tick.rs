@@ -59,7 +59,7 @@ fn follower_starts_election_at_exactly_the_timeout() {
         "role transitioned to candidate at timeout",
     );
     assert_eq!(
-        actions.len(),
+        collect_vote_requests(&actions).len(),
         1,
         "expected one RequestVote to the single peer, got {actions:?}",
     );

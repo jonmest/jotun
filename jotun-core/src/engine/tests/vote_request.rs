@@ -340,8 +340,11 @@ proptest! {
         prop_assert_eq!(response.term, engine.current_term());
     }
 
-    /// Replaying an identical request must not change state. Covers the case
-    /// where a candidate resends because our response was lost.
+    /// Replaying an identical request must leave the engine in the same
+    /// state and produce the same outgoing VoteResponse. Action vectors
+    /// may differ on the second call (no PersistHardState since voted_for
+    /// already matches), which is the correct shape for "we already voted
+    /// for this candidate at this term".
     #[test]
     fn identical_requests_are_idempotent(
         (from, request) in any_vote_request(),
@@ -355,6 +358,10 @@ proptest! {
 
         prop_assert_eq!(engine.current_term(), term_after_first);
         prop_assert_eq!(engine.voted_for(), voted_after_first);
-        prop_assert_eq!(first, second, "identical input produced different output");
+        prop_assert_eq!(
+            expect_vote_response(&first),
+            expect_vote_response(&second),
+            "identical input must produce the same VoteResponse",
+        );
     }
 }
