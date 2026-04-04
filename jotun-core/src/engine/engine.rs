@@ -701,7 +701,15 @@ impl<C: Clone> Engine<C> {
     fn become_follower(&mut self, term: Term) {
         let from_term = self.state.current_term;
         self.state.current_term = term;
-        self.state.voted_for = None;
+        // §5.1: voted_for is per-term. Only clear it when the term actually
+        // advances — a same-term step-down (e.g. a candidate discovering
+        // the legitimate current-term leader via AppendEntries) must
+        // preserve the self-vote already cast in this term, otherwise a
+        // delayed RequestVote from another candidate could be granted and
+        // we'd violate "at most one vote per term".
+        if term > from_term {
+            self.state.voted_for = None;
+        }
         self.state.role = RoleState::Follower(FollowerState::default());
 
         if from_term != term {

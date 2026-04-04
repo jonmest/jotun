@@ -95,6 +95,51 @@ fn candidate_steps_down_when_current_term_leader_appears() {
     assert_eq!(engine.current_term(), term(1), "term unchanged");
 }
 
+#[test]
+fn candidate_step_down_in_same_term_preserves_self_vote() {
+    // §5.1 + §5.2: voted_for is per-term. A candidate who steps down to
+    // follower because of a same-term AppendEntries from the legitimate
+    // leader has already cast its self-vote in this term and MUST keep
+    // it — otherwise a delayed RequestVote from another candidate could
+    // be granted, violating "at most one vote per term".
+    use crate::engine::role_state::{CandidateState, RoleState};
+    use super::fixtures::{node, vote_request, vote_request_from};
+    use crate::records::vote::VoteResult;
+
+    let mut engine = follower(1);
+    {
+        let state = engine.state_mut();
+        state.current_term = term(1);
+        state.voted_for = Some(node(1));
+        let mut votes_granted = BTreeSet::new();
+        votes_granted.insert(node(1));
+        state.role = RoleState::Candidate(CandidateState { votes_granted });
+    }
+
+    // Same-term leader appears → step down.
+    engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, None, vec![], 0),
+    ));
+    assert!(matches!(engine.role(), RoleState::Follower(_)));
+    assert_eq!(engine.current_term(), term(1));
+    assert_eq!(
+        engine.voted_for(),
+        Some(node(1)),
+        "self-vote in current term must survive same-term step-down",
+    );
+
+    // A late RequestVote from a different candidate at the same term
+    // must be rejected — we already voted for ourselves.
+    let actions = engine.step(vote_request_from(3, vote_request(3, 1, None)));
+    let response = super::fixtures::expect_vote_response(&actions);
+    assert_eq!(
+        response.result,
+        VoteResult::Rejected,
+        "must reject RequestVote at term we already voted in",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Previous-log matching — §5.3 rule 2
 // ---------------------------------------------------------------------------
@@ -387,10 +432,11 @@ fn stale_term_append_entries_does_not_reset_the_election_timer() {
 }
 
 #[test]
-#[ignore = "engine currently only resets on Success; see review discussion"]
 fn append_entries_with_prev_log_mismatch_still_resets_timer() {
-    // If the engine is updated to reset on any valid-term AppendEntries (the
-    // tighter interpretation of §5.2), flip this to non-ignored.
+    // §5.2: any AppendEntries from a current-term leader resets the timer,
+    // even if the prev_log_id check then forces a Conflict reply. The
+    // leader-discovery signal is the term match, not whether replication
+    // succeeds on this particular RPC.
     let mut engine = follower(1);
     seed_log(&mut engine, &[1, 1]);
     engine.state_mut().election_elapsed = 5;
