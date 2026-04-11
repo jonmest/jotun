@@ -9,7 +9,9 @@
 //! crash — exactly mirroring the "we sent before fsync completed"
 //! failure mode Raft's action-ordering contract exists to catch.
 
-use jotun_core::{Action, Engine, LogEntry, LogIndex, NodeId, Term};
+use std::collections::BTreeSet;
+
+use jotun_core::{Action, Engine, LogEntry, LogId, LogIndex, NodeId, Term};
 
 use crate::env::SharedRng;
 use crate::env::SimEnv;
@@ -60,6 +62,16 @@ pub(crate) struct NodeHarness<C> {
     pub(crate) pending: Vec<PendingWrite<C>>,
     pub(crate) applied: Vec<LogEntry<C>>,
     pub(crate) heartbeat_interval_ticks: u64,
+    /// Every log-entry id the engine has ever asked to persist, across
+    /// every step. A `Send` carrying entries must reference ids in this
+    /// set — otherwise the engine violated §5.1 action ordering. Carries
+    /// across crash/recover so the recovered engine's re-broadcasts of
+    /// older entries don't false-fire the check.
+    pub(crate) ever_persisted: BTreeSet<LogId>,
+    /// Similar ledger for hard-state advances: `(term, voted_for)`
+    /// pairs that have ever shown up in a PersistHardState. A Send
+    /// carrying a term the engine never persisted is a violation.
+    pub(crate) ever_persisted_terms: BTreeSet<Term>,
 }
 
 impl<C: Clone> NodeHarness<C> {
@@ -71,6 +83,8 @@ impl<C: Clone> NodeHarness<C> {
     ) -> Self {
         let env = Box::new(SimEnv::new(rng));
         let engine = Engine::new(id, peers.iter().copied(), env, heartbeat_interval_ticks);
+        let mut ever_persisted_terms = BTreeSet::new();
+        ever_persisted_terms.insert(Term::ZERO);
         Self {
             id,
             peers,
@@ -79,6 +93,8 @@ impl<C: Clone> NodeHarness<C> {
             pending: Vec::new(),
             applied: Vec::new(),
             heartbeat_interval_ticks,
+            ever_persisted: BTreeSet::new(),
+            ever_persisted_terms,
         }
     }
 
@@ -97,12 +113,6 @@ impl<C: Clone> NodeHarness<C> {
     where
         C: PartialEq,
     {
-        let mut hard_state_persisted_this_step = false;
-        let mut entries_persisted_this_step: Vec<LogEntry<C>> = Vec::new();
-        let pre_step_term = self.persisted.current_term;
-        let pre_step_voted_for = self.persisted.voted_for;
-        let pre_step_log_end = self.persisted.log.len();
-
         for (i, action) in actions.iter().enumerate() {
             match action {
                 Action::PersistHardState {
@@ -113,22 +123,21 @@ impl<C: Clone> NodeHarness<C> {
                         current_term: *current_term,
                         voted_for: *voted_for,
                     });
-                    hard_state_persisted_this_step = true;
+                    self.ever_persisted_terms.insert(*current_term);
                 }
                 Action::PersistLogEntries(entries) => {
+                    for entry in entries {
+                        self.ever_persisted.insert(entry.id);
+                    }
                     self.pending
                         .push(PendingWrite::LogEntries(entries.clone()));
-                    entries_persisted_this_step.extend(entries.iter().cloned());
                 }
                 Action::Send { message, .. } => {
                     check_send_ordering(
                         i,
                         message,
-                        pre_step_term,
-                        pre_step_voted_for,
-                        pre_step_log_end,
-                        hard_state_persisted_this_step,
-                        &entries_persisted_this_step,
+                        &self.ever_persisted,
+                        &self.ever_persisted_terms,
                     )?;
                 }
                 Action::Apply(entries) => {
@@ -232,10 +241,16 @@ fn hydrate_engine<C: Clone>(engine: &mut Engine<C>, persisted: &PersistedState<C
         return;
     }
 
-    // Pick any peer as the synthetic "leader" of the hydration message.
-    // Safety: we only call this on a node with peers, which every
-    // multi-node cluster has. Single-node simulation doesn't hit this.
-    let Some(peer) = engine.peers().iter().copied().next() else {
+    // Pick a peer as the synthetic "leader" of the hydration message
+    // that is NOT the persisted voted_for — otherwise the follow-up
+    // vote-restoration step has nothing to send from.
+    let peer = engine
+        .peers()
+        .iter()
+        .copied()
+        .find(|p| Some(*p) != persisted.voted_for)
+        .or_else(|| engine.peers().iter().copied().next());
+    let Some(peer) = peer else {
         return;
     };
 
@@ -280,21 +295,22 @@ pub(crate) struct PersistOrderingError {
     pub(crate) reason: &'static str,
 }
 
-/// Verify that any state change visible in `message` has a matching
-/// Persist earlier in the same `step()` action vec. Raft Figure 2:
-/// "respond to RPCs only after updating stable storage".
-fn check_send_ordering<C: PartialEq>(
+/// Verify that any state visible in `message` corresponds to something
+/// the engine has previously emitted a `Persist*` action for. Raft
+/// Figure 2 demands "respond to RPCs only after updating stable storage";
+/// the sim enforces the engine's half (emit Persist before Send) and
+/// leaves actual disk flushing to the scheduler via Flush/crash events.
+///
+/// The ledger is cumulative across steps: re-broadcasting an old entry
+/// is fine because it was persisted in some earlier step.
+fn check_send_ordering<C>(
     i: usize,
     message: &jotun_core::Message<C>,
-    pre_term: Term,
-    pre_voted_for: Option<NodeId>,
-    pre_log_end: usize,
-    hard_state_persisted: bool,
-    entries_persisted: &[LogEntry<C>],
+    ever_persisted: &BTreeSet<LogId>,
+    ever_persisted_terms: &BTreeSet<Term>,
 ) -> Result<(), PersistOrderingError> {
     use jotun_core::Message as M;
 
-    // Determine the term visible in the outgoing message.
     let msg_term = match message {
         M::VoteRequest(r) => r.term,
         M::VoteResponse(r) => r.term,
@@ -302,51 +318,28 @@ fn check_send_ordering<C: PartialEq>(
         M::AppendEntriesResponse(r) => r.term,
     };
 
-    // If the message term exceeds what was already durable *and* we
-    // haven't seen a PersistHardState earlier this step, that's the
-    // classic "sent before fsync" bug.
-    if msg_term > pre_term && !hard_state_persisted {
+    // The engine must have persisted this term (or a later one) before
+    // emitting any message that carries it. Term::ZERO is seeded into
+    // the ledger at construction — the engine starts there.
+    if !ever_persisted_terms.contains(&msg_term) {
         return Err(PersistOrderingError {
             send_index_in_actions: i,
-            reason: "Send carries a term greater than last durable term with no prior PersistHardState",
+            reason: "Send carries a term that was never covered by a PersistHardState",
         });
     }
 
-    // VoteRequest => we became candidate => voted_for changed => same
-    // rule. (VoteResponse granting a vote also mutates voted_for; the
-    // engine emits persist_hard_state() on grant.)
-    if matches!(message, M::VoteRequest(_)) && !hard_state_persisted {
-        return Err(PersistOrderingError {
-            send_index_in_actions: i,
-            reason: "VoteRequest sent without prior PersistHardState in the same step",
-        });
-    }
-
-    // AppendEntriesRequest carrying entries => those entries must have
-    // been persisted earlier this step (we're the leader that just
-    // appended them). Heartbeats — empty entries — don't need a log
-    // persist, but the leader's no-op broadcast after an election does.
-    if let M::AppendEntriesRequest(r) = message
-        && !r.entries.is_empty()
-    {
-        let _ = pre_log_end; // reserved for future use
+    // Every log entry referenced in an outbound AppendEntriesRequest
+    // must have been persisted previously.
+    if let M::AppendEntriesRequest(r) = message {
         for entry in &r.entries {
-            if !entries_persisted.iter().any(|e| e.id == entry.id) {
-                // Only fire if the entry is new this step. If the entry
-                // was already durable (index <= pre_log_end and matches
-                // persisted state), we didn't need to persist it again
-                // this step — it was persisted in some prior step.
-                if (entry.id.index.get() as usize) <= pre_log_end {
-                    continue;
-                }
+            if !ever_persisted.contains(&entry.id) {
                 return Err(PersistOrderingError {
                     send_index_in_actions: i,
-                    reason: "AppendEntriesRequest carries entries not persisted earlier this step",
+                    reason: "AppendEntriesRequest carries an entry the engine never persisted",
                 });
             }
         }
     }
 
-    let _ = pre_voted_for;
     Ok(())
 }

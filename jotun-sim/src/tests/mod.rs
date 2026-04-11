@@ -5,6 +5,7 @@
 //! internals (the scheduler policy in particular) to set up specific
 //! scenarios; crate-external users can't.
 
+mod chaos;
 mod invariants;
 mod proptests;
 mod smoke;

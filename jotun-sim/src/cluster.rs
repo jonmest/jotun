@@ -85,6 +85,23 @@ impl<C: Clone> Policy<C> {
             proposal_command,
         }
     }
+
+    /// Adversarial policy: everything on. Messages can drop or
+    /// reorder, nodes can crash mid-fsync and recover from a partial
+    /// write, the network can partition. Liveness isn't guaranteed
+    /// under this policy — only safety.
+    #[cfg(test)]
+    pub(crate) fn chaos(proposal_command: Option<C>) -> Self {
+        Self {
+            allow_drop: true,
+            allow_reorder: true,
+            allow_partition: true,
+            allow_crash: true,
+            partial_flush_probability: 0.3,
+            proposal_command,
+        }
+    }
+
 }
 
 impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
@@ -122,6 +139,23 @@ impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
     #[cfg(test)]
     pub(crate) fn set_policy(&mut self, policy: Policy<C>) {
         self.policy = policy;
+    }
+
+    /// Forcibly crash a node outside the scheduler. Test-only: real
+    /// runs let the scheduler pick events.
+    #[cfg(test)]
+    pub(crate) fn crash_for_test(&mut self, id: NodeId) {
+        if let Some(h) = self.nodes.get_mut(&id) {
+            h.crash();
+        }
+    }
+
+    /// Forcibly recover a node outside the scheduler. Test-only.
+    #[cfg(test)]
+    pub(crate) fn recover_for_test(&mut self, id: NodeId) {
+        if let Some(h) = self.nodes.get_mut(&id) {
+            h.recover(Arc::clone(&self.rng));
+        }
     }
 
     /// Advance the cluster by one scheduler-picked event, apply every
@@ -341,9 +375,16 @@ impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
                     .filter(|(_, h)| h.is_up() && !h.pending.is_empty())
                     .map(|(id, _)| *id)
                     .collect();
-                if let Some(&id) = up.choose(&mut *self.rng.lock().expect("sim RNG mutex poisoned")) {
+                let picked = {
+                    let mut rng = self.rng.lock().expect("sim RNG mutex poisoned");
+                    up.choose(&mut *rng).copied()
+                };
+                if let Some(id) = picked {
                     let pending = self.nodes[&id].pending.len();
-                    let n = self.rng.lock().expect("sim RNG mutex poisoned").random_range(1..=pending);
+                    let n = {
+                        let mut rng = self.rng.lock().expect("sim RNG mutex poisoned");
+                        rng.random_range(1..=pending)
+                    };
                     Event::Flush(id, n)
                 } else {
                     Event::Tick(

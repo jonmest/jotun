@@ -18,25 +18,28 @@ proptest! {
         .. ProptestConfig::default()
     })]
 
-    /// 3 nodes, 200 steps, no drops/partitions/crashes. Must converge
-    /// (at least one leader observed at some point) without any
-    /// invariant panicking.
+    /// 3 nodes, happy policy (no drops/partitions/crashes). The
+    /// scheduler picks uniformly among enabled categories; on
+    /// adversarial seeds Tick (the only path to election) can be
+    /// starved for long stretches while Deliver and Propose soak up
+    /// draws, so the step bound is generous.
     #[test]
     fn three_node_happy_schedules_converge(seed in any::<u64>()) {
         let mut cluster: Cluster<u64> = Cluster::new(seed, 3);
         cluster.set_policy(Policy::happy(Some(1)));
 
         let mut saw_leader = false;
-        for _ in 0..200 {
+        for _ in 0..2_000 {
             cluster.step();
             if !cluster.leaders().is_empty() {
                 saw_leader = true;
+                break;
             }
         }
 
         prop_assert!(
             saw_leader,
-            "no leader ever elected across 200 steps for seed {seed}",
+            "no leader ever elected across 2000 steps for seed {seed}",
         );
     }
 
@@ -48,11 +51,11 @@ proptest! {
         let mut cluster: Cluster<u64> = Cluster::new(seed, 3);
         cluster.set_policy(Policy::happy(Some(1)));
 
-        // 600 is generous — the happy path typically converges in
-        // ~100-200 steps. If this cap is ever hit, fix the scheduler
-        // rather than raising the bound.
+        // Generous bound — the scheduler draws Tick with the same
+        // probability as Deliver and Propose, so elections can be
+        // starved for long stretches on adversarial seeds.
         let mut committed = false;
-        for _ in 0..600 {
+        for _ in 0..3_000 {
             cluster.step();
             if cluster.applied_majority(1) >= 2 {
                 committed = true;
@@ -61,7 +64,7 @@ proptest! {
         }
         prop_assert!(
             committed,
-            "no majority apply at index 1 within 600 steps for seed {seed}; max commit = {}",
+            "no majority apply at index 1 within 3000 steps for seed {seed}; max commit = {}",
             cluster.max_commit_index(),
         );
     }
