@@ -12,12 +12,27 @@ message LogEntry {
   oneof payload {
     Noop noop = 2;
     bytes command = 3;
+    ConfigChange config_change = 4;
   }
 }
 
 // A leader-emitted no-op entry. Appended at the start of every term so
 // prior-term entries can commit safely under §5.4.2.
 message Noop {}
+
+// Single-server cluster membership change (§4.3 of the Raft thesis).
+message ConfigChange {
+  oneof kind {
+    NodeIdRef add_peer = 1;
+    NodeIdRef remove_peer = 2;
+  }
+}
+
+// Wrapper around a NodeId so we can keep "id == 0 is invalid" rejection
+// consistent with the rest of the wire format.
+message NodeIdRef {
+  uint64 id = 1;
+}
 
 message RequestVote {
   uint64 term = 1;

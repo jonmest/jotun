@@ -1,17 +1,45 @@
 use crate::records::{
     append_entries::{AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries},
-    log_entry::{LogEntry, LogPayload},
+    log_entry::{ConfigChange, LogEntry, LogPayload},
 };
 use crate::types::{index::LogIndex, node::NodeId, term::Term};
 
 use super::super::protobuf as proto;
 use super::ConvertError;
 
+impl From<ConfigChange> for proto::ConfigChange {
+    fn from(v: ConfigChange) -> Self {
+        use proto::config_change::Kind;
+        let kind = match v {
+            ConfigChange::AddPeer(id) => Kind::AddPeer(proto::NodeIdRef { id: id.get() }),
+            ConfigChange::RemovePeer(id) => Kind::RemovePeer(proto::NodeIdRef { id: id.get() }),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+impl TryFrom<proto::ConfigChange> for ConfigChange {
+    type Error = ConvertError;
+
+    fn try_from(v: proto::ConfigChange) -> Result<Self, Self::Error> {
+        use proto::config_change::Kind;
+        match v.kind.ok_or(ConvertError::MissingField("ConfigChange.kind"))? {
+            Kind::AddPeer(r) => Ok(ConfigChange::AddPeer(
+                NodeId::new(r.id).ok_or(ConvertError::ZeroNodeId)?,
+            )),
+            Kind::RemovePeer(r) => Ok(ConfigChange::RemovePeer(
+                NodeId::new(r.id).ok_or(ConvertError::ZeroNodeId)?,
+            )),
+        }
+    }
+}
+
 impl<C: Into<Vec<u8>>> From<LogEntry<C>> for proto::LogEntry {
     fn from(v: LogEntry<C>) -> Self {
         let payload = match v.payload {
             LogPayload::Noop => proto::log_entry::Payload::Noop(proto::Noop {}),
             LogPayload::Command(c) => proto::log_entry::Payload::Command(c.into()),
+            LogPayload::ConfigChange(cc) => proto::log_entry::Payload::ConfigChange(cc.into()),
         };
         Self {
             id: Some(v.id.into()),
@@ -30,6 +58,9 @@ impl<C: From<Vec<u8>>> TryFrom<proto::LogEntry> for LogEntry<C> {
         {
             proto::log_entry::Payload::Noop(_) => LogPayload::Noop,
             proto::log_entry::Payload::Command(b) => LogPayload::Command(C::from(b)),
+            proto::log_entry::Payload::ConfigChange(cc) => {
+                LogPayload::ConfigChange(cc.try_into()?)
+            }
         };
         Ok(Self {
             id: v

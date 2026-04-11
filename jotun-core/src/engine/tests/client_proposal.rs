@@ -44,7 +44,7 @@ fn leader_appends_command_at_next_index_and_current_term() {
     let entry = engine.log().entry_at(last_after.index).unwrap();
     match &entry.payload {
         LogPayload::Command(c) => assert_eq!(c, b"set x = 1"),
-        LogPayload::Noop => panic!("expected Command payload, got Noop"),
+        other => panic!("expected Command payload, got {other:?}"),
     }
 }
 
@@ -90,7 +90,7 @@ fn leader_proposal_carries_command_to_peers() {
         let last = req.entries.last().expect("must carry the new entry");
         match &last.payload {
             LogPayload::Command(c) => assert_eq!(c, b"payload"),
-            LogPayload::Noop => panic!("expected Command in broadcast tail"),
+            other => panic!("expected Command in broadcast tail, got {other:?}"),
         }
     }
 }
@@ -289,7 +289,7 @@ proptest! {
             let entry = engine.log().entry_at(last_after.index).expect("entry must exist");
             match &entry.payload {
                 LogPayload::Command(c) => prop_assert_eq!(c, &cmd),
-                LogPayload::Noop => prop_assert!(false, "expected Command, got Noop"),
+                other => prop_assert!(false, "expected Command, got {other:?}"),
             }
         }
     }

@@ -180,7 +180,7 @@ fn client_proposal_on_leader_emits_persist_before_broadcast() {
     assert_eq!(persisted[0].len(), 1);
     match &persisted[0][0].payload {
         LogPayload::Command(c) => assert_eq!(c, b"x"),
-        LogPayload::Noop => panic!("expected Command"),
+        other => panic!("expected Command, got {other:?}"),
     }
 
     // Persist precedes the Send broadcasts.
