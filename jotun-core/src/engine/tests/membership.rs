@@ -23,8 +23,15 @@ fn vote_request_from_non_member_is_dropped() {
     // follower(1) has peers {2, 3}. Node 99 is not a member.
     let mut engine = follower(1);
     let actions = engine.step(vote_request_from(99, vote_request(99, 1, None)));
-    assert!(actions.is_empty(), "non-member request must yield no actions");
-    assert_eq!(engine.voted_for(), None, "must not record a vote for a non-member");
+    assert!(
+        actions.is_empty(),
+        "non-member request must yield no actions"
+    );
+    assert_eq!(
+        engine.voted_for(),
+        None,
+        "must not record a vote for a non-member"
+    );
 }
 
 #[test]
@@ -34,7 +41,10 @@ fn append_entries_request_from_non_member_is_dropped() {
         99,
         append_entries_request(5, 99, None, vec![], 0),
     ));
-    assert!(actions.is_empty(), "non-member request must yield no actions");
+    assert!(
+        actions.is_empty(),
+        "non-member request must yield no actions"
+    );
     // Crucially, the higher term in the body must NOT have been observed.
     // Otherwise a non-member could force everyone into a phantom term.
     assert_eq!(
@@ -91,7 +101,10 @@ fn vote_request_body_candidate_id_must_match_from() {
     let mut engine = follower(1);
     let req = vote_request(3, 1, None); // body says 3
     let actions = engine.step(vote_request_from(2, req)); // wire says 2
-    assert!(actions.is_empty(), "mismatched candidate_id must be dropped");
+    assert!(
+        actions.is_empty(),
+        "mismatched candidate_id must be dropped"
+    );
     assert_eq!(engine.voted_for(), None);
 }
 

@@ -38,7 +38,10 @@ fn granting_a_vote_emits_persist_hard_state_before_response() {
             _ => None,
         })
         .collect();
-    assert!(matches!(actions[positions[0]], Action::PersistHardState { .. }));
+    assert!(matches!(
+        actions[positions[0]],
+        Action::PersistHardState { .. }
+    ));
     assert!(matches!(actions[positions[1]], Action::Send { .. }));
 
     let response = expect_vote_response(&actions);

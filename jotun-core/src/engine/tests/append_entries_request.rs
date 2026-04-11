@@ -102,8 +102,8 @@ fn candidate_step_down_in_same_term_preserves_self_vote() {
     // leader has already cast its self-vote in this term and MUST keep
     // it — otherwise a delayed RequestVote from another candidate could
     // be granted, violating "at most one vote per term".
-    use crate::engine::role_state::{CandidateState, RoleState};
     use super::fixtures::{node, vote_request, vote_request_from};
+    use crate::engine::role_state::{CandidateState, RoleState};
     use crate::records::vote::VoteResult;
 
     let mut engine = follower(1);

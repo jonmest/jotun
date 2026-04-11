@@ -8,10 +8,10 @@ use crate::records::append_entries::{
     AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries,
 };
 use crate::records::log_entry::{LogEntry, LogPayload};
-use crate::types::log::LogId;
 #[allow(clippy::enum_glob_use)] // match-heavy file; variants are used unqualified throughout
 use crate::records::message::Message::*;
 use crate::records::vote::{RequestVote, VoteResponse, VoteResult};
+use crate::types::log::LogId;
 use crate::{
     engine::{
         action::Action,
@@ -375,7 +375,9 @@ impl<C: Clone> Engine<C> {
             RoleState::Leader(_) => {}
             RoleState::Follower(f) => {
                 return match f.leader_id {
-                    Some(leader) => vec![Action::Redirect { leader_hint: leader }],
+                    Some(leader) => vec![Action::Redirect {
+                        leader_hint: leader,
+                    }],
                     None => vec![],
                 };
             }

@@ -159,7 +159,9 @@ fn append_entries_response_success_zero_last_appended_rejected() {
     let p = proto::AppendEntriesResponse {
         term: 1,
         result: Some(proto::append_entries_response::Result::Success(
-            proto::AppendSuccess { last_appended: Some(0) },
+            proto::AppendSuccess {
+                last_appended: Some(0),
+            },
         )),
     };
     let err = AppendEntriesResponse::try_from(p).unwrap_err();

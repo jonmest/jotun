@@ -225,7 +225,11 @@ fn stale_term_append_entries_does_not_update_known_leader() {
         append_entries_request(1, 3, None, vec![], 0),
     ));
     if let RoleState::Follower(f) = engine.role() {
-        assert_eq!(f.leader_id, Some(node(2)), "stale AE must not hijack leader");
+        assert_eq!(
+            f.leader_id,
+            Some(node(2)),
+            "stale AE must not hijack leader"
+        );
     } else {
         panic!("expected Follower");
     }

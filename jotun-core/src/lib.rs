@@ -39,7 +39,9 @@ pub use engine::event::Event;
 pub use engine::incoming::Incoming;
 pub use engine::role_state::{CandidateState, FollowerState, LeaderState, RoleState};
 
-pub use records::append_entries::{AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries};
+pub use records::append_entries::{
+    AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries,
+};
 pub use records::log_entry::{LogEntry, LogPayload};
 pub use records::message::Message;
 pub use records::vote::{RequestVote, VoteResponse, VoteResult};

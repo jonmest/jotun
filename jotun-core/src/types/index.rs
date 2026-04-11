@@ -37,4 +37,3 @@ impl fmt::Display for LogIndex {
         write!(f, "log_index:{}", self.0)
     }
 }
-

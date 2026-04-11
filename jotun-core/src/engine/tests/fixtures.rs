@@ -27,7 +27,11 @@ pub(super) const DEFAULT_HEARTBEAT_INTERVAL: u64 = 1;
 /// care about specific peer composition; just enough peers to satisfy the
 /// `on_incoming` membership check.
 pub(super) fn follower(id: u64) -> Engine<Vec<u8>> {
-    let peers: Vec<NodeId> = [2u64, 3].into_iter().filter(|&p| p != id).map(node).collect();
+    let peers: Vec<NodeId> = [2u64, 3]
+        .into_iter()
+        .filter(|&p| p != id)
+        .map(node)
+        .collect();
     Engine::new(
         node(id),
         peers,
