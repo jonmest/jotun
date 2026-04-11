@@ -364,6 +364,8 @@ fn check_send_ordering<C>(
         M::VoteResponse(r) => r.term,
         M::AppendEntriesRequest(r) => r.term,
         M::AppendEntriesResponse(r) => r.term,
+        M::InstallSnapshotRequest(r) => r.term,
+        M::InstallSnapshotResponse(r) => r.term,
     };
 
     // The engine must have persisted this term (or a later one) before

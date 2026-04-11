@@ -1,4 +1,5 @@
 pub mod append_entries;
+pub mod install_snapshot;
 pub mod vote;
 
 #[cfg(test)]
@@ -63,6 +64,8 @@ impl<C: Into<Vec<u8>>> From<Message<C>> for proto::Message {
             Message::VoteResponse(m) => Kind::VoteResponse(m.into()),
             Message::AppendEntriesRequest(m) => Kind::AppendEntriesRequest(m.into()),
             Message::AppendEntriesResponse(m) => Kind::AppendEntriesResponse(m.into()),
+            Message::InstallSnapshotRequest(m) => Kind::InstallSnapshotRequest(m.into()),
+            Message::InstallSnapshotResponse(m) => Kind::InstallSnapshotResponse(m.into()),
         };
         Self { kind: Some(kind) }
     }
@@ -78,6 +81,8 @@ impl<C: From<Vec<u8>>> TryFrom<proto::Message> for Message<C> {
             Kind::VoteResponse(m) => Ok(Message::VoteResponse(m.try_into()?)),
             Kind::AppendEntriesRequest(m) => Ok(Message::AppendEntriesRequest(m.try_into()?)),
             Kind::AppendEntriesResponse(m) => Ok(Message::AppendEntriesResponse(m.try_into()?)),
+            Kind::InstallSnapshotRequest(m) => Ok(Message::InstallSnapshotRequest(m.try_into()?)),
+            Kind::InstallSnapshotResponse(m) => Ok(Message::InstallSnapshotResponse(m.try_into()?)),
         }
     }
 }

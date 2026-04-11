@@ -76,11 +76,39 @@ message AppendConflict {
   uint64 next_index_hint = 1;
 }
 
+// §7 InstallSnapshot. Sent by a leader to a follower whose nextIndex has
+// fallen below the leader's log floor — replication via AppendEntries
+// can no longer construct a valid prev_log_id from log entries that
+// have been compacted into the snapshot.
+message RequestInstallSnapshot {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  // (index, term) at the snapshot's tail. Receiver replaces all log
+  // entries with index ≤ last_included.index.
+  LogId last_included = 3;
+  // Opaque application snapshot bytes. The receiver hands these to
+  // its state machine via Action::ApplySnapshot.
+  bytes data = 4;
+  // Same role as in AppendEntries: the leader's commit_index, used
+  // by the follower to advance its own commit_index.
+  uint64 leader_commit = 5;
+}
+
+message InstallSnapshotResponse {
+  // Receiver's term. If higher than the leader's, the leader steps
+  // down. There's no Conflict shape — the snapshot is take-it-or-
+  // leave-it; a follower that can't accept it just doesn't, and the
+  // leader retries.
+  uint64 term = 1;
+}
+
 message Message {
   oneof kind {
     RequestVote vote_request = 1;
     VoteResponse vote_response = 2;
     RequestAppendEntries append_entries_request = 3;
     AppendEntriesResponse append_entries_response = 4;
+    RequestInstallSnapshot install_snapshot_request = 5;
+    InstallSnapshotResponse install_snapshot_response = 6;
   }
 }

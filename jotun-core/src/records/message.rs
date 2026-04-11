@@ -1,5 +1,6 @@
 use crate::records::{
     append_entries::{AppendEntriesResponse, RequestAppendEntries},
+    install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot},
     vote::{RequestVote, VoteResponse},
 };
 
@@ -9,10 +10,13 @@ use crate::records::{
 /// validated, and then handed to the engine wrapped in
 /// [`crate::engine::incoming::Incoming`].
 ///
-/// The four variants form two request/response pairs:
+/// Three request/response pairs:
 ///  - `VoteRequest` / `VoteResponse` — leader election (§5.2).
 ///  - `AppendEntriesRequest` / `AppendEntriesResponse` — log replication,
 ///    heartbeats, and commit-index propagation (§5.3).
+///  - `InstallSnapshotRequest` / `InstallSnapshotResponse` — snapshot
+///    catch-up for followers whose `nextIndex` falls below the leader's
+///    log floor (§7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message<C> {
     /// A candidate is asking for our vote.
@@ -23,4 +27,9 @@ pub enum Message<C> {
     AppendEntriesRequest(RequestAppendEntries<C>),
     /// Reply to one of our outgoing `AppendEntriesRequest`s.
     AppendEntriesResponse(AppendEntriesResponse),
+    /// A leader is sending us a snapshot to catch us up past its log
+    /// floor (§7).
+    InstallSnapshotRequest(RequestInstallSnapshot),
+    /// Reply to one of our outgoing `InstallSnapshotRequest`s.
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }

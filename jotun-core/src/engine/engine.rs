@@ -7,6 +7,7 @@ use crate::engine::telemetry;
 use crate::records::append_entries::{
     AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries,
 };
+use crate::records::install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot};
 use crate::records::log_entry::{ConfigChange, LogEntry, LogPayload};
 #[allow(clippy::enum_glob_use)] // match-heavy file; variants are used unqualified throughout
 use crate::records::message::Message::*;
@@ -376,6 +377,15 @@ impl<C: Clone> Engine<C> {
             }
             AppendEntriesResponse(response) => {
                 self.on_append_entries_response(incoming.from, response)
+            }
+            InstallSnapshotRequest(request) => {
+                if request.leader_id != incoming.from {
+                    return vec![];
+                }
+                self.on_install_snapshot_request(request)
+            }
+            InstallSnapshotResponse(response) => {
+                self.on_install_snapshot_response(incoming.from, response)
             }
         }
     }
@@ -966,6 +976,151 @@ impl<C: Clone> Engine<C> {
         }
     }
 
+    /// Receive an `InstallSnapshot` from the current leader (§7).
+    ///
+    /// Term checks first (same shape as `on_append_entries_request`).
+    /// On accept: install the snapshot floor in our log, persist the
+    /// snapshot bytes, advance `commit_index` and `last_applied` to
+    /// the snapshot's tail, and emit `ApplySnapshot` for the host's
+    /// state machine. The `PersistSnapshot` action is emitted before
+    /// the final response Send to honour the persist-before-send rule.
+    #[instrument(target = "jotun::engine", skip_all)]
+    fn on_install_snapshot_request(
+        &mut self,
+        request: RequestInstallSnapshot,
+    ) -> Vec<Action<C>> {
+        let prior_term = self.state.current_term;
+        let prior_voted_for = self.state.voted_for;
+
+        if request.term > self.state.current_term
+            || (request.term == self.state.current_term
+                && matches!(self.state.role, RoleState::Candidate(_)))
+        {
+            self.become_follower(request.term);
+        }
+        if request.term < self.state.current_term {
+            // Stale leader. Reply with our (higher) term so they step
+            // down. No state mutation.
+            return vec![Action::Send {
+                to: request.leader_id,
+                message: InstallSnapshotResponse(InstallSnapshotResponse {
+                    term: self.state.current_term,
+                }),
+            }];
+        }
+
+        // Record the leader for client redirects.
+        if let RoleState::Follower(f) = &mut self.state.role {
+            f.leader_id = Some(request.leader_id);
+        }
+        self.reset_election_timer();
+
+        let hard_state_changed =
+            self.state.current_term != prior_term || self.state.voted_for != prior_voted_for;
+
+        // Stale snapshot at or below our existing floor: ack but do
+        // nothing else.
+        if request.last_included.index <= self.state.log.snapshot_last().index {
+            let mut out = Vec::new();
+            if hard_state_changed {
+                out.push(self.persist_hard_state());
+            }
+            out.push(Action::Send {
+                to: request.leader_id,
+                message: InstallSnapshotResponse(InstallSnapshotResponse {
+                    term: self.state.current_term,
+                }),
+            });
+            return out;
+        }
+
+        // Install the snapshot floor. Log::install_snapshot keeps
+        // post-floor entries iff our log already had a matching
+        // boundary entry; otherwise it wipes the in-memory tail.
+        self.state
+            .log
+            .install_snapshot(request.last_included.index, request.last_included.term);
+        self.state.snapshot_bytes = Some(request.data.clone());
+
+        // Advance commit / applied past the snapshot. The snapshot
+        // captures everything up to `last_included.index`, so we treat
+        // it as if those entries had already been applied.
+        if request.last_included.index > self.state.commit_index {
+            self.state.commit_index = request.last_included.index;
+        }
+        if request.last_included.index > self.state.last_applied {
+            self.state.last_applied = request.last_included.index;
+        }
+        // leader_commit may also exceed the snapshot's tail — propagate.
+        if request.leader_commit > self.state.commit_index {
+            // Cap at our last log index, same rule as on_append_entries.
+            let last_log = self
+                .state
+                .log
+                .last_log_id()
+                .map_or(LogIndex::ZERO, |l| l.index);
+            self.state.commit_index = request.leader_commit.min(last_log);
+        }
+        // Recompute active config from scratch — entries below the
+        // floor are gone, so we need to start over from initial_peers.
+        // The snapshot is opaque to us (host's state-machine bytes);
+        // we trust the leader that whatever membership it implies is
+        // captured in the post-snapshot log entries we still have or
+        // will receive.
+        self.recompute_active_config();
+
+        let mut out = Vec::new();
+        if hard_state_changed {
+            out.push(self.persist_hard_state());
+        }
+        out.push(Action::PersistSnapshot {
+            last_included_index: request.last_included.index,
+            last_included_term: request.last_included.term,
+            bytes: request.data.clone(),
+        });
+        out.push(Action::ApplySnapshot {
+            bytes: request.data,
+        });
+        out.push(Action::Send {
+            to: request.leader_id,
+            message: InstallSnapshotResponse(InstallSnapshotResponse {
+                term: self.state.current_term,
+            }),
+        });
+        out
+    }
+
+    /// Process a peer's `InstallSnapshot` reply.
+    ///
+    /// On higher term: step down. Otherwise: assume the peer caught
+    /// up to our snapshot's tail and bump `matchIndex` / `nextIndex`
+    /// accordingly. The snapshot's `last_included.index` is the
+    /// highest entry the peer can be holding; treat it as a Success
+    /// at that index.
+    #[instrument(target = "jotun::engine", skip_all)]
+    fn on_install_snapshot_response(
+        &mut self,
+        peer: NodeId,
+        response: InstallSnapshotResponse,
+    ) -> Vec<Action<C>> {
+        if response.term > self.state.current_term {
+            self.become_follower(response.term);
+            return vec![self.persist_hard_state()];
+        }
+        if response.term < self.state.current_term {
+            return vec![];
+        }
+        let RoleState::Leader(leader) = &mut self.state.role else {
+            return vec![];
+        };
+        // The peer just installed a snapshot whose tail is at our log's
+        // current floor (which is what we sent). Update progress to
+        // match.
+        let snapshot_floor = self.state.log.snapshot_last().index;
+        leader.progress.record_success(peer, snapshot_floor);
+        vec![]
+    }
+
     /// Slice newly-committed-but-not-yet-applied entries out of the log
     /// into an `Action::Apply`, then bump `last_applied` to the new
     /// commit point. Returns an empty vec if there's nothing to apply.
@@ -1010,18 +1165,36 @@ impl<C: Clone> Engine<C> {
             .collect()
     }
 
-    /// Build the `AppendEntries` we'd send to a single peer right now,
-    /// based on its current `nextIndex`. On non-leaders we fall back to
-    /// nextIndex = 1 since there's no progress map; in practice this is
-    /// only called from leader paths.
+    /// Build the next replication message for a single peer, based on
+    /// its current `nextIndex`. Usually an `AppendEntries`, but if the
+    /// peer's `nextIndex` has fallen below the leader's snapshot floor
+    /// we need an `InstallSnapshot` instead — there's no `prev_log_id`
+    /// to construct from log entries that have been compacted away.
+    /// On non-leaders we fall back to `nextIndex = 1`; in practice
+    /// this is only called from leader paths.
     fn append_entries_to(&self, peer: NodeId) -> Action<C> {
         let next = match &self.state.role {
             RoleState::Leader(l) => l.progress.next_for(peer).unwrap_or(LogIndex::new(1)),
             _ => LogIndex::new(1),
         };
         debug_assert!(next.get() >= 1, "nextIndex floor is 1");
+
+        // §7: if the peer's nextIndex is at or below the snapshot floor,
+        // we can't address the prev entry — send the snapshot instead.
+        let snapshot_floor = self.state.log.snapshot_last().index;
+        if snapshot_floor != LogIndex::ZERO && next.get() <= snapshot_floor.get() {
+            return self.install_snapshot_to(peer);
+        }
+
         let prev_log_index = LogIndex::new(next.get() - 1);
-        let prev_log_id = self.state.log.entry_at(prev_log_index).map(|e| e.id);
+        // term_at handles the snapshot floor: at index == snapshot_last,
+        // it returns the snapshot's term (no in-memory entry exists).
+        let prev_log_id = self
+            .state
+            .log
+            .term_at(prev_log_index)
+            .map(|t| LogId::new(prev_log_index, t))
+            .filter(|_| prev_log_index != LogIndex::ZERO);
         let entries = self.state.log.entries_from(next).to_vec();
 
         Action::Send {
@@ -1031,6 +1204,29 @@ impl<C: Clone> Engine<C> {
                 leader_id: self.id,
                 prev_log_id,
                 entries,
+                leader_commit: self.state.commit_index,
+            }),
+        }
+    }
+
+    /// Build an `InstallSnapshot` for a peer that has fallen behind
+    /// the leader's log floor. Caller must have already checked that
+    /// `nextIndex[peer] ≤ snapshot_last_index` and that we have
+    /// snapshot bytes in memory.
+    fn install_snapshot_to(&self, peer: NodeId) -> Action<C> {
+        let last_included = self.state.log.snapshot_last();
+        let bytes = self
+            .state
+            .snapshot_bytes
+            .clone()
+            .unwrap_or_default();
+        Action::Send {
+            to: peer,
+            message: InstallSnapshotRequest(RequestInstallSnapshot {
+                term: self.state.current_term,
+                leader_id: self.id,
+                last_included,
+                data: bytes,
                 leader_commit: self.state.commit_index,
             }),
         }

@@ -287,6 +287,78 @@ pub(super) fn snapshot_taken(last_included_index: u64, bytes: Vec<u8>) -> Event<
     }
 }
 
+pub(super) fn install_snapshot_from(
+    from: u64,
+    term_n: u64,
+    last_included_index: u64,
+    last_included_term: u64,
+    leader_commit: u64,
+    bytes: Vec<u8>,
+) -> Event<Vec<u8>> {
+    use crate::records::install_snapshot::RequestInstallSnapshot;
+    Event::Incoming(Incoming {
+        from: node(from),
+        message: Message::InstallSnapshotRequest(RequestInstallSnapshot {
+            term: term(term_n),
+            leader_id: node(from),
+            last_included: log_id(last_included_index, last_included_term),
+            data: bytes,
+            leader_commit: LogIndex::new(leader_commit),
+        }),
+    })
+}
+
+pub(super) fn install_snapshot_response_from(from: u64, term_n: u64) -> Event<Vec<u8>> {
+    use crate::records::install_snapshot::InstallSnapshotResponse;
+    Event::Incoming(Incoming {
+        from: node(from),
+        message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+            term: term(term_n),
+        }),
+    })
+}
+
+pub(super) fn collect_persist_snapshots(
+    actions: &[Action<Vec<u8>>],
+) -> Vec<(LogIndex, Term, Vec<u8>)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::PersistSnapshot {
+                last_included_index,
+                last_included_term,
+                bytes,
+            } => Some((*last_included_index, *last_included_term, bytes.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) fn collect_apply_snapshots(actions: &[Action<Vec<u8>>]) -> Vec<Vec<u8>> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::ApplySnapshot { bytes } => Some(bytes.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) fn collect_install_snapshots(
+    actions: &[Action<Vec<u8>>],
+) -> Vec<(NodeId, crate::records::install_snapshot::RequestInstallSnapshot)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                to,
+                message: Message::InstallSnapshotRequest(req),
+            } => Some((*to, req.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(super) fn propose_add_peer(id: u64) -> Event<Vec<u8>> {
     use crate::records::log_entry::ConfigChange;
     Event::ProposeConfigChange(ConfigChange::AddPeer(node(id)))
