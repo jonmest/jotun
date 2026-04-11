@@ -1,6 +1,6 @@
 use crate::{
     records::{log_entry::LogEntry, message::Message},
-    types::{node::NodeId, term::Term},
+    types::{index::LogIndex, node::NodeId, term::Term},
 };
 
 /// The engine's only output, in vector form per `step()` call.
@@ -43,4 +43,21 @@ pub enum Action<C> {
     /// retarget the client at this peer (the leader for the current
     /// term, as last observed via `AppendEntries`).
     Redirect { leader_hint: NodeId },
+    /// Persist `bytes` to durable storage as the latest snapshot. The
+    /// engine has already truncated its in-memory log up to and
+    /// including `last_included_index` and recorded the snapshot
+    /// floor; the host MUST flush these bytes before any subsequent
+    /// `Send` referring to indices at or below the floor (in
+    /// practice, before any `InstallSnapshot` reply).
+    PersistSnapshot {
+        last_included_index: LogIndex,
+        last_included_term: Term,
+        bytes: Vec<u8>,
+    },
+    /// Restore the application's state machine from `bytes`. Emitted
+    /// only when the engine just installed a snapshot it received
+    /// from a leader; the host's state machine should call its
+    /// `restore` method with these bytes before consuming any
+    /// subsequent `Apply`.
+    ApplySnapshot { bytes: Vec<u8> },
 }

@@ -1,5 +1,6 @@
 use crate::engine::incoming::Incoming;
 use crate::records::log_entry::ConfigChange;
+use crate::types::index::LogIndex;
 
 /// The single input type the engine accepts via
 /// [`crate::engine::engine::Engine::step`].
@@ -37,4 +38,17 @@ pub enum Event<C> {
     /// an existing member, removing a non-member). On accept, the
     /// active config mutates immediately (pre-commit) per §4.3.
     ProposeConfigChange(ConfigChange),
+    /// The host has just produced a snapshot of the application state
+    /// machine that captures everything applied up to
+    /// `last_included_index`. The engine truncates its in-memory log
+    /// up to and including that index, records the snapshot floor,
+    /// and emits an [`crate::engine::action::Action::PersistSnapshot`]
+    /// for the host to flush.
+    ///
+    /// Rejected (silently) if `last_included_index > commit_index` —
+    /// the host can only snapshot committed state.
+    SnapshotTaken {
+        last_included_index: LogIndex,
+        bytes: Vec<u8>,
+    },
 }

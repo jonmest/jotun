@@ -70,6 +70,11 @@ pub(crate) struct RaftState<C> {
     /// can recompute the active config from scratch after a log truncation
     /// rolls back uncommitted `ConfigChange` entries.
     pub(crate) initial_peers: BTreeSet<NodeId>,
+    /// Bytes of the most recent snapshot, if any. Held in memory so a
+    /// leader can include them in `InstallSnapshot` RPCs without going
+    /// back to the host. Pass-1: just stored after `SnapshotTaken`;
+    /// pass-2 will read from here to populate outbound RPCs.
+    pub(crate) snapshot_bytes: Option<Vec<u8>>,
 }
 
 /// The Raft state machine — a single node's complete consensus engine.
@@ -135,6 +140,7 @@ impl<C: Clone> Engine<C> {
                 election_timeout_ticks,
                 peers,
                 initial_peers,
+                snapshot_bytes: None,
             },
         }
     }
@@ -277,6 +283,10 @@ impl<C: Clone> Engine<C> {
             Event::Incoming(incoming) => self.on_incoming(incoming),
             Event::ClientProposal(command) => self.on_client_proposal(command),
             Event::ProposeConfigChange(change) => self.on_propose_config_change(change),
+            Event::SnapshotTaken {
+                last_included_index,
+                bytes,
+            } => self.on_snapshot_taken(last_included_index, bytes),
         };
 
         #[cfg(debug_assertions)]
@@ -462,6 +472,50 @@ impl<C: Clone> Engine<C> {
         let mut out = vec![Action::PersistLogEntries(vec![entry])];
         out.extend(self.broadcast_append_entries());
         out
+    }
+
+    // =========================================================================
+    // Snapshot — host-driven log compaction (§7)
+    // =========================================================================
+
+    /// The host has finished producing a snapshot of its state machine
+    /// covering everything applied up to `last_included_index`. Truncate
+    /// our in-memory log up to and including that index, record the
+    /// snapshot floor, stash the bytes for future `InstallSnapshot`
+    /// RPCs, and emit a `PersistSnapshot` for the host to flush.
+    ///
+    /// Silently dropped if `last_included_index > commit_index` (the
+    /// host can only snapshot committed state) or if it doesn't
+    /// advance the floor (a stale snapshot, harmless to ignore).
+    #[instrument(target = "jotun::engine", skip_all)]
+    fn on_snapshot_taken(
+        &mut self,
+        last_included_index: LogIndex,
+        bytes: Vec<u8>,
+    ) -> Vec<Action<C>> {
+        if last_included_index > self.state.commit_index {
+            return vec![];
+        }
+        if last_included_index <= self.state.log.snapshot_last().index {
+            return vec![];
+        }
+        // Term lookup must happen *before* install_snapshot moves the
+        // floor — install_snapshot will overwrite snapshot_last and
+        // potentially drop the entry from in-memory storage.
+        let Some(last_included_term) = self.state.log.term_at(last_included_index) else {
+            // Index sits past the in-memory tail or in some other
+            // unreachable spot — refuse rather than fabricate a term.
+            return vec![];
+        };
+        self.state
+            .log
+            .install_snapshot(last_included_index, last_included_term);
+        self.state.snapshot_bytes = Some(bytes.clone());
+        vec![Action::PersistSnapshot {
+            last_included_index,
+            last_included_term,
+            bytes,
+        }]
     }
 
     // =========================================================================

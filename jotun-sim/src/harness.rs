@@ -27,6 +27,18 @@ pub(crate) struct PersistedState<C> {
     pub(crate) current_term: Term,
     pub(crate) voted_for: Option<NodeId>,
     pub(crate) log: Vec<LogEntry<C>>,
+    /// Most recent snapshot, if any. Replaces every log entry with
+    /// index ≤ `last_included_index`.
+    pub(crate) snapshot: Option<PersistedSnapshot>,
+}
+
+/// The on-disk representation of a Raft snapshot.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read by pass-2 InstallSnapshot hydration
+pub(crate) struct PersistedSnapshot {
+    pub(crate) last_included_index: LogIndex,
+    pub(crate) last_included_term: Term,
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl<C> Default for PersistedState<C> {
@@ -35,6 +47,7 @@ impl<C> Default for PersistedState<C> {
             current_term: Term::ZERO,
             voted_for: None,
             log: Vec::new(),
+            snapshot: None,
         }
     }
 }
@@ -47,6 +60,11 @@ pub(crate) enum PendingWrite<C> {
         voted_for: Option<NodeId>,
     },
     LogEntries(Vec<LogEntry<C>>),
+    Snapshot {
+        last_included_index: LogIndex,
+        last_included_term: Term,
+        bytes: Vec<u8>,
+    },
 }
 
 /// One node in the simulated cluster: a live engine, its durable
@@ -143,7 +161,21 @@ impl<C: Clone> NodeHarness<C> {
                 Action::Apply(entries) => {
                     self.applied.extend(entries.iter().cloned());
                 }
-                Action::Redirect { .. } => {}
+                Action::PersistSnapshot {
+                    last_included_index,
+                    last_included_term,
+                    bytes,
+                } => {
+                    self.pending.push(PendingWrite::Snapshot {
+                        last_included_index: *last_included_index,
+                        last_included_term: *last_included_term,
+                        bytes: bytes.clone(),
+                    });
+                }
+                // Redirect: nothing for the harness to do; tests inspect
+                // these directly. ApplySnapshot: pass-2 InstallSnapshot
+                // path; pass-1 SnapshotTaken never emits it.
+                Action::Redirect { .. } | Action::ApplySnapshot { .. } => {}
             }
         }
         Ok(())
@@ -216,6 +248,22 @@ fn apply_write<C>(persisted: &mut PersistedState<C>, write: PendingWrite<C>) {
                     }
                 }
             }
+        }
+        PendingWrite::Snapshot {
+            last_included_index,
+            last_included_term,
+            bytes,
+        } => {
+            persisted.snapshot = Some(PersistedSnapshot {
+                last_included_index,
+                last_included_term,
+                bytes,
+            });
+            // Drop log entries up to and including the snapshot floor.
+            // Indices are 1-based; entries[0] = log index 1.
+            let drop_through = last_included_index.get() as usize;
+            let keep_from = drop_through.min(persisted.log.len());
+            persisted.log.drain(..keep_from);
         }
     }
 }

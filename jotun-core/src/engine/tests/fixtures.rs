@@ -280,6 +280,13 @@ pub(super) fn collect_redirects(actions: &[Action<Vec<u8>>]) -> Vec<NodeId> {
 }
 
 /// Wrap an arbitrary command into a `ClientProposal` Event.
+pub(super) fn snapshot_taken(last_included_index: u64, bytes: Vec<u8>) -> Event<Vec<u8>> {
+    Event::SnapshotTaken {
+        last_included_index: LogIndex::new(last_included_index),
+        bytes,
+    }
+}
+
 pub(super) fn propose_add_peer(id: u64) -> Event<Vec<u8>> {
     use crate::records::log_entry::ConfigChange;
     Event::ProposeConfigChange(ConfigChange::AddPeer(node(id)))

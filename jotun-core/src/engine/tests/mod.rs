@@ -6,6 +6,7 @@ mod config_change;
 mod fixtures;
 mod membership;
 mod persistence;
+mod snapshot;
 mod tick;
 mod vote_request;
 mod vote_response;
