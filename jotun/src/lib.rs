@@ -26,7 +26,7 @@ pub mod storage;
 pub mod transport;
 
 pub use state_machine::{DecodeError, StateMachine};
-pub use storage::{Storage, StoredHardState, StoredSnapshot};
+pub use storage::{DiskStorage, DiskStorageError, Storage, StoredHardState, StoredSnapshot};
 pub use transport::Transport;
 
 // Convenience re-exports from jotun-core. Saves users from having to

@@ -7,10 +7,14 @@
 //! atomic per call (a crash during one of these methods either keeps
 //! the prior state or persists the new one, never half-applied).
 //!
-//! The default impl ([`crate::storage::DiskStorage`], not yet built)
-//! uses a segmented append-only log + a small hard-state file. Users
-//! who want different storage (sled, rocksdb, foundationdb, S3-tiered)
-//! plug in their own [`Storage`].
+//! The default impl is [`disk::DiskStorage`]: a hand-rolled
+//! append-only log + small hard-state file, no external KV store.
+//! Users who want different storage (sled, rocksdb, foundationdb,
+//! S3-tiered) plug in their own [`Storage`].
+
+pub mod disk;
+
+pub use disk::{DiskStorage, DiskStorageError};
 
 use std::future::Future;
 
