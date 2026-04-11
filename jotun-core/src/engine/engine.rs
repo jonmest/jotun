@@ -802,10 +802,13 @@ impl<C: Clone> Engine<C> {
             && self
                 .state
                 .log
-                .entry_at(prev.index)
-                .is_none_or(|e| e.id.term != prev.term)
+                .term_at(prev.index)
+                .is_none_or(|t| t != prev.term)
         {
             // See §5.3 conflict-hint comment elsewhere: cap at prev.index.
+            // term_at handles the snapshot floor: prev_log at exactly the
+            // snapshot's tail returns the snapshot's term, not None, so a
+            // follower with floor=N can validate prev=(N, snapshot_term).
             let our_last_next = self
                 .state
                 .log
@@ -822,7 +825,15 @@ impl<C: Clone> Engine<C> {
 
         let mut newly_persisted: Vec<LogEntry<C>> = Vec::new();
         let mut truncated = false;
+        let snapshot_floor = self.state.log.snapshot_last().index;
         for entry in request.entries {
+            // Entries at or below the snapshot floor are already
+            // captured by the snapshot — silently skip them. Happens
+            // when the leader's view of nextIndex lags our snapshot
+            // install (we haven't acked InstallSnapshot yet).
+            if entry.id.index <= snapshot_floor {
+                continue;
+            }
             match self.state.log.entry_at(entry.id.index) {
                 None => {
                     // Plain append: incrementally apply any ConfigChange.
@@ -1114,10 +1125,17 @@ impl<C: Clone> Engine<C> {
             return vec![];
         };
         // The peer just installed a snapshot whose tail is at our log's
-        // current floor (which is what we sent). Update progress to
-        // match.
+        // current floor (which is what we sent). record_success only
+        // advances when last_appended > matchIndex; an idempotent
+        // InstallSnapshot ack at exactly the floor would otherwise
+        // leave nextIndex stuck at floor, looping the leader forever.
+        // Push nextIndex to floor + 1 unconditionally so the next
+        // broadcast switches back to AppendEntries.
         let snapshot_floor = self.state.log.snapshot_last().index;
         leader.progress.record_success(peer, snapshot_floor);
+        leader
+            .progress
+            .ensure_next_at_least(peer, snapshot_floor.next());
         vec![]
     }
 

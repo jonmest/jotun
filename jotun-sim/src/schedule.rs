@@ -47,4 +47,8 @@ pub(crate) enum Event<C> {
     /// scheduler picks them only in scripted scenarios — but they ride
     /// the same machinery as `Propose` once chosen.
     ProposeConfigChange(NodeId, ConfigChange),
+    /// Tell node `id` to take a snapshot covering everything up to
+    /// the given index, with the supplied bytes. Scripted scenarios
+    /// drive these directly via [`crate::Cluster::snapshot_to`].
+    Snapshot(NodeId, jotun_core::LogIndex, Vec<u8>),
 }

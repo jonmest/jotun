@@ -283,9 +283,11 @@ fn hydrate_engine<C: Clone>(engine: &mut Engine<C>, persisted: &PersistedState<C
     // follow up with a `RequestVote` from that candidate at the same
     // term to restore the vote.
     //
-    // If the persisted log is empty and term is zero, no hydration is
-    // needed — the fresh engine already matches.
-    if persisted.current_term == Term::ZERO && persisted.log.is_empty() {
+    // If nothing persisted at all, no hydration needed.
+    if persisted.current_term == Term::ZERO
+        && persisted.log.is_empty()
+        && persisted.snapshot.is_none()
+    {
         return;
     }
 
@@ -302,17 +304,54 @@ fn hydrate_engine<C: Clone>(engine: &mut Engine<C>, persisted: &PersistedState<C
         return;
     };
 
-    let request = RequestAppendEntries {
-        term: persisted.current_term,
-        leader_id: peer,
-        prev_log_id: None,
-        entries: persisted.log.clone(),
-        leader_commit: LogIndex::ZERO,
+    // If we have a snapshot, install it first via a forged
+    // InstallSnapshot RPC. That sets the floor, advances commit and
+    // last_applied past it, and drops any in-memory log we'd otherwise
+    // try to feed below the floor.
+    let snapshot_index = if let Some(snap) = &persisted.snapshot {
+        use jotun_core::RequestInstallSnapshot;
+        let _ = engine.step(Event::Incoming(Incoming {
+            from: peer,
+            message: Message::InstallSnapshotRequest(RequestInstallSnapshot {
+                term: persisted.current_term,
+                leader_id: peer,
+                last_included: LogId::new(snap.last_included_index, snap.last_included_term),
+                data: snap.bytes.clone(),
+                leader_commit: snap.last_included_index,
+            }),
+        }));
+        snap.last_included_index
+    } else {
+        LogIndex::ZERO
     };
-    let _ = engine.step(Event::Incoming(Incoming {
-        from: peer,
-        message: Message::AppendEntriesRequest(request),
-    }));
+
+    // Feed any post-snapshot log entries via a synthetic AE. prev_log_id
+    // points at the snapshot tail (or None if there's no snapshot) so
+    // the engine accepts cleanly.
+    let post_snapshot: Vec<_> = persisted
+        .log
+        .iter()
+        .filter(|e| e.id.index.get() > snapshot_index.get())
+        .cloned()
+        .collect();
+    if !post_snapshot.is_empty() || snapshot_index == LogIndex::ZERO {
+        let prev_log_id = persisted
+            .snapshot
+            .as_ref()
+            .filter(|_| snapshot_index != LogIndex::ZERO)
+            .map(|snap| LogId::new(snap.last_included_index, snap.last_included_term));
+        let request = RequestAppendEntries {
+            term: persisted.current_term,
+            leader_id: peer,
+            prev_log_id,
+            entries: post_snapshot,
+            leader_commit: LogIndex::ZERO,
+        };
+        let _ = engine.step(Event::Incoming(Incoming {
+            from: peer,
+            message: Message::AppendEntriesRequest(request),
+        }));
+    }
 
     if let Some(voted_for) = persisted.voted_for
         && voted_for != peer
@@ -321,9 +360,18 @@ fn hydrate_engine<C: Clone>(engine: &mut Engine<C>, persisted: &PersistedState<C
         // its vote for that candidate at the current term. The log
         // predicate requires the candidate's log to be at least as
         // up-to-date — we pass the persisted last log id, which the
-        // engine itself holds, so the predicate passes.
+        // engine itself now holds, so the predicate passes.
         use jotun_core::RequestVote;
-        let last_log_id = persisted.log.last().map(|e| e.id);
+        let last_log_id = persisted
+            .log
+            .last()
+            .map(|e| e.id)
+            .or_else(|| {
+                persisted
+                    .snapshot
+                    .as_ref()
+                    .map(|s| LogId::new(s.last_included_index, s.last_included_term))
+            });
         let _ = engine.step(Event::Incoming(Incoming {
             from: voted_for,
             message: Message::VoteRequest(RequestVote {

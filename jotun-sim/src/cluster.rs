@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use jotun_core::{Action, ConfigChange, Event as CoreEvent, Incoming, NodeId};
+use jotun_core::{Action, ConfigChange, Engine, Event as CoreEvent, Incoming, NodeId};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
@@ -163,6 +163,33 @@ impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
     pub fn step(&mut self) {
         self.clock += 1;
         let event = self.pick_event();
+        self.apply_event(event.clone());
+        self.history.push(HistoryEntry {
+            at_clock: self.clock,
+            event,
+        });
+        if let Err(violation) = self.checker.check(&self.nodes) {
+            panic!(
+                "safety violation: {:?}\nschedule so far ({} events):\n{}",
+                violation,
+                self.history.len(),
+                self.format_schedule(),
+            );
+        }
+    }
+
+    /// Tell node `id` to take a snapshot at its current `last_applied`,
+    /// using the supplied bytes (real systems would serialize state
+    /// machine state; the harness can hand any opaque bytes through).
+    /// Recorded in history; passes through the safety checker.
+    pub fn snapshot_to(&mut self, id: NodeId, bytes: Vec<u8>) {
+        self.clock += 1;
+        let last_applied = self
+            .nodes
+            .get(&id)
+            .and_then(|h| h.engine.as_ref())
+            .map_or(jotun_core::LogIndex::ZERO, Engine::commit_index);
+        let event = Event::Snapshot(id, last_applied, bytes);
         self.apply_event(event.clone());
         self.history.push(HistoryEntry {
             at_clock: self.clock,
@@ -481,6 +508,15 @@ impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
             Event::Heal => self.network.heal(),
             Event::ProposeConfigChange(id, change) => {
                 self.drive_engine(id, CoreEvent::ProposeConfigChange(change));
+            }
+            Event::Snapshot(id, last_included_index, bytes) => {
+                self.drive_engine(
+                    id,
+                    CoreEvent::SnapshotTaken {
+                        last_included_index,
+                        bytes,
+                    },
+                );
             }
         }
     }

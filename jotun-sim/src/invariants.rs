@@ -69,6 +69,13 @@ pub enum SafetyViolation {
     /// flight); the leader-side append guard exists exactly to prevent
     /// this.
     MultipleUncommittedConfigChanges { node: NodeId, indices: Vec<LogIndex> },
+    /// A node's snapshot floor is past its `commit_index`. Snapshots
+    /// must only cover committed state — §7 invariant.
+    SnapshotPastCommit {
+        node: NodeId,
+        snapshot_index: LogIndex,
+        commit_index: LogIndex,
+    },
 }
 
 /// Running ledger used by the checks that need history across steps.
@@ -107,6 +114,29 @@ impl<C: Clone + PartialEq> SafetyChecker<C> {
         self.observe_committed(nodes);
         self.check_leader_completeness(nodes)?;
         Self::check_single_in_flight_config_change(nodes)?;
+        Self::check_snapshot_within_commit(nodes)?;
+        Ok(())
+    }
+
+    /// §7 invariant: a node's snapshot floor never exceeds its own
+    /// `commit_index`. Snapshots are always of committed state.
+    fn check_snapshot_within_commit(
+        nodes: &BTreeMap<NodeId, NodeHarness<C>>,
+    ) -> Result<(), SafetyViolation> {
+        for harness in nodes.values() {
+            let Some(engine) = harness.engine.as_ref() else {
+                continue;
+            };
+            let snap = engine.log().snapshot_last().index;
+            let commit = engine.commit_index();
+            if snap > commit {
+                return Err(SafetyViolation::SnapshotPastCommit {
+                    node: engine.id(),
+                    snapshot_index: snap,
+                    commit_index: commit,
+                });
+            }
+        }
         Ok(())
     }
 

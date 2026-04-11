@@ -136,6 +136,19 @@ impl PeerProgress {
         self.next_index.remove(&peer);
         self.match_index.remove(&peer);
     }
+
+    /// Advance `nextIndex[peer]` to at least `floor`, idempotently.
+    /// Used after an `InstallSnapshot` ack at exactly the snapshot's
+    /// tail: `record_success` won't move `matchIndex` past where it
+    /// already is, but we still need `nextIndex` to step into the
+    /// post-floor range so the leader switches back to `AppendEntries`.
+    pub(crate) fn ensure_next_at_least(&mut self, peer: NodeId, floor: LogIndex) {
+        if let Some(n) = self.next_index.get_mut(&peer)
+            && *n < floor
+        {
+            *n = floor;
+        }
+    }
 }
 
 #[cfg(test)]
