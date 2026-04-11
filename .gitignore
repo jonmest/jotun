@@ -12,3 +12,7 @@ mutants.out.old/
 *.profraw
 *.profdata
 /lcov.info
+
+# Design notes (local-only scratch)
+MEMBERSHIP_DESIGN.md
+*_DESIGN.md
