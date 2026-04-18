@@ -48,6 +48,27 @@ fn entry(index: u64, term: u64, cmd: &[u8]) -> LogEntry<Vec<u8>> {
     }
 }
 
+async fn open_segmented(tmp: &TmpDir, segment_target_bytes: u64) -> DiskStorage {
+    DiskStorage::open_with_segment_target(&tmp.0, segment_target_bytes)
+        .await
+        .unwrap()
+}
+
+fn segment_names(tmp: &TmpDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(tmp.0.join("log"))
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .into_string()
+                .expect("segment filename is valid utf-8")
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 #[tokio::test]
 async fn fresh_recovery_returns_default_empty() {
     let tmp = TmpDir::new();
@@ -229,4 +250,131 @@ async fn appends_after_snapshot_use_correct_indices() {
             .await
             .unwrap();
     assert_eq!(r.log, vec![entry(3, 1, b"c")]);
+}
+
+#[tokio::test]
+async fn segmented_log_rolls_over_to_new_files() {
+    let tmp = TmpDir::new();
+    let mut s = open_segmented(&tmp, 1).await;
+
+    <DiskStorage as Storage<Vec<u8>>>::append_log(
+        &mut s,
+        vec![entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 1, b"c")],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        segment_names(&tmp),
+        vec![
+            "000000000000001.log".to_string(),
+            "000000000000002.log".to_string(),
+            "000000000000003.log".to_string()
+        ]
+    );
+
+    drop(s);
+    let mut reopened = open_segmented(&tmp, 1).await;
+    let recovered = <DiskStorage as Storage<Vec<u8>>>::recover(&mut reopened)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.log,
+        vec![entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 1, b"c")]
+    );
+}
+
+#[tokio::test]
+async fn truncate_drops_whole_segment_files() {
+    let tmp = TmpDir::new();
+    let mut s = open_segmented(&tmp, 1).await;
+    let entries = vec![
+        entry(1, 1, b"a"),
+        entry(2, 1, b"b"),
+        entry(3, 1, b"c"),
+        entry(4, 1, b"d"),
+    ];
+    <DiskStorage as Storage<Vec<u8>>>::append_log(&mut s, entries.clone())
+        .await
+        .unwrap();
+
+    <DiskStorage as Storage<Vec<u8>>>::truncate_log(&mut s, LogIndex::new(3))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        segment_names(&tmp),
+        vec![
+            "000000000000001.log".to_string(),
+            "000000000000002.log".to_string()
+        ]
+    );
+
+    drop(s);
+    let mut reopened = open_segmented(&tmp, 1).await;
+    let recovered = <DiskStorage as Storage<Vec<u8>>>::recover(&mut reopened)
+        .await
+        .unwrap();
+    assert_eq!(recovered.log, entries[..2].to_vec());
+}
+
+#[tokio::test]
+async fn snapshot_drops_whole_segment_files() {
+    let tmp = TmpDir::new();
+    let mut s = open_segmented(&tmp, 1).await;
+    let entries = vec![
+        entry(1, 1, b"a"),
+        entry(2, 1, b"b"),
+        entry(3, 1, b"c"),
+        entry(4, 1, b"d"),
+    ];
+    <DiskStorage as Storage<Vec<u8>>>::append_log(&mut s, entries)
+        .await
+        .unwrap();
+
+    <DiskStorage as Storage<Vec<u8>>>::persist_snapshot(
+        &mut s,
+        StoredSnapshot {
+            last_included_index: LogIndex::new(3),
+            last_included_term: Term::new(1),
+            peers: std::collections::BTreeSet::new(),
+            bytes: b"snap".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(segment_names(&tmp), vec!["000000000000004.log".to_string()]);
+
+    drop(s);
+    let mut reopened = open_segmented(&tmp, 1).await;
+    let recovered = <DiskStorage as Storage<Vec<u8>>>::recover(&mut reopened)
+        .await
+        .unwrap();
+    assert_eq!(recovered.log, vec![entry(4, 1, b"d")]);
+}
+
+#[tokio::test]
+async fn recover_ignores_torn_tail_frame() {
+    let tmp = TmpDir::new();
+    let mut s = open_segmented(&tmp, u64::MAX).await;
+
+    <DiskStorage as Storage<Vec<u8>>>::append_log(
+        &mut s,
+        vec![entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 1, b"c")],
+    )
+    .await
+    .unwrap();
+    drop(s);
+
+    let segment_path = tmp.0.join("log/000000000000001.log");
+    let bytes = std::fs::read(&segment_path).unwrap();
+    assert!(bytes.len() > 1, "segment must contain at least one frame");
+    std::fs::write(&segment_path, &bytes[..bytes.len() - 1]).unwrap();
+
+    let mut reopened = open_segmented(&tmp, u64::MAX).await;
+    let recovered = <DiskStorage as Storage<Vec<u8>>>::recover(&mut reopened)
+        .await
+        .unwrap();
+    assert_eq!(recovered.log, vec![entry(1, 1, b"a"), entry(2, 1, b"b")]);
 }
