@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["jotun-core", "jotun-sim", "jotun"]
+members = ["jotun-core", "jotun-sim", "jotun", "jotun-examples"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
