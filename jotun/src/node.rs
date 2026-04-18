@@ -65,7 +65,10 @@ impl<S: StateMachine> Clone for Node<S> {
 pub enum Bootstrap {
     /// Initial cluster bring-up. The runtime trusts [`Config::peers`]
     /// as the authoritative initial membership; every founding node
-    /// must be started with the same `members` set.
+    /// should be started with the same `Config::peers` set.
+    ///
+    /// `members` is retained for pre-0.1 API continuity; the runtime
+    /// does not consult it when constructing the engine.
     NewCluster {
         /// The full initial cluster membership (self included).
         members: Vec<NodeId>,
@@ -286,18 +289,15 @@ impl<S: StateMachine> Node<S> {
         let recovered = storage.recover().await.map_err(NodeStartError::Storage)?;
 
         // Resolve the initial peer set from the Bootstrap variant.
-        //  - NewCluster: trust `members`, drop self (Engine::new filters
-        //    self anyway, but we're explicit).
+        //  - NewCluster: trust Config::peers. `Bootstrap::NewCluster`
+        //    still carries `members` for pre-0.1 API continuity, but
+        //    `Config::peers` is the authoritative engine input.
         //  - Join: empty — the existing leader will splice us in.
         //  - Recover: use config.peers as a fallback seed; any
         //    persisted ConfigChange entries will be replayed during
         //    hydrate_engine and mutate the set into its real shape.
         let initial_peers: Vec<NodeId> = match &config.bootstrap {
-            Bootstrap::NewCluster { members } => members
-                .iter()
-                .copied()
-                .filter(|p| *p != config.node_id)
-                .collect(),
+            Bootstrap::NewCluster { .. } => config.peers.clone(),
             Bootstrap::Join => Vec::new(),
             Bootstrap::Recover => config.peers.clone(),
         };
@@ -777,28 +777,22 @@ where
             }
             Action::Apply(entries) => {
                 apply_entries(d, entries)?;
-                // Engine advances its own last_applied to commit_index
-                // whenever it drains Apply, including past filtered-out
-                // Noop/ConfigChange entries. Mirror that here so
-                // NodeStatus.last_applied matches.
-                if d.engine.commit_index() > d.last_applied {
-                    d.last_applied = d.engine.commit_index();
-                }
             }
             Action::ApplySnapshot { bytes } => {
                 d.state_machine.restore(bytes);
-                // A snapshot advances applied to the snapshot's tail.
-                // commit_index is updated to at least that index inside
-                // on_install_snapshot_request, so it's the right ceiling.
-                if d.engine.commit_index() > d.last_applied {
-                    d.last_applied = d.engine.commit_index();
-                }
             }
             Action::Redirect { .. } => {
                 // Already handled at the propose call site; engine
                 // shouldn't emit Redirect from any other path.
             }
         }
+    }
+    // Mirror the engine's internal last_applied onto the driver's
+    // status cache. This catches both visible Apply actions and
+    // filtered internal entries (Noop/ConfigChange) that still advance
+    // the engine's own last_applied to commit_index.
+    if d.engine.commit_index() > d.last_applied {
+        d.last_applied = d.engine.commit_index();
     }
     Ok(())
 }
