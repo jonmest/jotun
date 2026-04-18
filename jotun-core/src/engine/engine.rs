@@ -78,6 +78,35 @@ pub(crate) struct RaftState<C> {
     pub(crate) snapshot_bytes: Option<Vec<u8>>,
 }
 
+/// What the host hands back to [`Engine::recover_from`] at boot:
+/// everything Raft requires to be durable (§5.1 + §7).
+#[derive(Debug, Clone)]
+pub struct RecoveredHardState<C> {
+    /// The term the engine was at when the last `PersistHardState`
+    /// hit disk, or `Term::ZERO` for a fresh node.
+    pub current_term: Term,
+    /// Whoever we last granted our vote to in `current_term`, if any.
+    /// Restoring this is critical: §5.1 "at most one vote per term"
+    /// is only enforceable if a crashed-and-recovered node remembers
+    /// the vote it already cast.
+    pub voted_for: Option<NodeId>,
+    /// Most recent snapshot, or `None` for a fresh node.
+    pub snapshot: Option<RecoveredSnapshot>,
+    /// Log entries persisted past the snapshot floor (or the full
+    /// log if there's no snapshot). Indices must be contiguous and
+    /// start at `snapshot.last_included_index + 1` when a snapshot
+    /// is present, or at 1 otherwise.
+    pub post_snapshot_log: Vec<LogEntry<C>>,
+}
+
+/// The durable snapshot piece of [`RecoveredHardState`].
+#[derive(Debug, Clone)]
+pub struct RecoveredSnapshot {
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
+    pub bytes: Vec<u8>,
+}
+
 /// The Raft state machine — a single node's complete consensus engine.
 ///
 /// Pure: no I/O, no async, no clock of its own. Driven by
@@ -144,6 +173,52 @@ impl<C: Clone> Engine<C> {
                 snapshot_bytes: None,
             },
         }
+    }
+
+    /// Restore an engine from previously-persisted state, as emerges
+    /// from [`Action::PersistHardState`], [`Action::PersistLogEntries`],
+    /// and [`Action::PersistSnapshot`] (host reads them back at boot).
+    ///
+    /// After this call the engine holds:
+    ///  - `current_term` and `voted_for` from the supplied
+    ///    [`RecoveredHardState`] (§5.1 hard state — a safely-cast vote
+    ///    survives restart);
+    ///  - a snapshot floor at `(last_included_index, last_included_term)`
+    ///    with the supplied snapshot bytes stashed for outbound
+    ///    `InstallSnapshot` RPCs;
+    ///  - any post-snapshot log entries in `post_snapshot_log`;
+    ///  - `commit_index == last_applied == snapshot.last_included_index`
+    ///    (we only know snapshotted state is committed; everything past
+    ///    the snapshot floor is uncommitted until a current-term leader
+    ///    tells us via `AppendEntries`).
+    ///
+    /// Peer set stays at the one passed to `new()` for the moment —
+    /// the snapshot-carries-membership fix lands in a follow-up commit.
+    pub fn recover_from(&mut self, recovered: RecoveredHardState<C>) {
+        self.state.current_term = recovered.current_term;
+        self.state.voted_for = recovered.voted_for;
+        if let Some(snap) = recovered.snapshot {
+            // Install the floor. Log::install_snapshot clears entries
+            // at or below the floor unless they match the snapshot's
+            // term at last_included_index — which they won't, because
+            // we're starting from an empty in-memory log.
+            self.state
+                .log
+                .install_snapshot(snap.last_included_index, snap.last_included_term);
+            self.state.snapshot_bytes = Some(snap.bytes);
+            self.state.commit_index = snap.last_included_index;
+            self.state.last_applied = snap.last_included_index;
+        }
+        for entry in recovered.post_snapshot_log {
+            self.state.log.append(entry);
+        }
+        // Reset role to Follower regardless of what we were before the
+        // crash. Volatile state (role, election/heartbeat counters) is
+        // rebuilt by the host's tick loop, which will detect a missing
+        // leader and start a new election at `current_term + 1`.
+        self.state.role = RoleState::Follower(FollowerState::default());
+        self.state.election_elapsed = 0;
+        self.state.heartbeat_elapsed = 0;
     }
 
     // =========================================================================

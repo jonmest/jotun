@@ -180,6 +180,68 @@ async fn shutdown_handle_after_first_use_returns_shutdown_error() {
 }
 
 // ---------------------------------------------------------------------------
+// Engine recovery: a restarted node preserves its persisted voted_for
+// across a crash. Without this, §5.1 "at most one vote per term" is
+// unenforceable — a node restarted in the same term could cast a
+// second vote.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn restart_preserves_voted_for() {
+    use jotun_core::{RecoveredHardState, RecoveredSnapshot, StaticEnv};
+
+    // Seed a DiskStorage with a specific hard state that represents
+    // "we voted for node 2 in term 7, then crashed".
+    let tmp = TmpDir::new("recover-voted-for");
+    {
+        let mut storage = DiskStorage::open(&tmp.0).await.unwrap();
+        <DiskStorage as jotun::Storage<Vec<u8>>>::persist_hard_state(
+            &mut storage,
+            jotun::StoredHardState {
+                current_term: jotun_core::Term::new(7),
+                voted_for: Some(nid(2)),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Build an engine directly (not through Node::start, so we can
+    // call recover_from and assert on the state). This exercises the
+    // Engine::recover_from path the runtime uses inside hydrate_engine.
+    let mut storage: DiskStorage = DiskStorage::open(&tmp.0).await.unwrap();
+    let recovered = <DiskStorage as jotun::Storage<Vec<u8>>>::recover(&mut storage)
+        .await
+        .unwrap();
+
+    let hs = recovered.hard_state.expect("hard state was persisted");
+    assert_eq!(hs.current_term.get(), 7);
+    assert_eq!(hs.voted_for, Some(nid(2)));
+
+    let env: Box<dyn jotun_core::Env> = Box::new(StaticEnv(10));
+    let mut engine: jotun_core::Engine<Vec<u8>> =
+        jotun_core::Engine::new(nid(1), vec![nid(2), nid(3)], env, 3);
+
+    engine.recover_from(RecoveredHardState {
+        current_term: hs.current_term,
+        voted_for: hs.voted_for,
+        snapshot: recovered.snapshot.map(|s| RecoveredSnapshot {
+            last_included_index: s.last_included_index,
+            last_included_term: s.last_included_term,
+            bytes: s.bytes,
+        }),
+        post_snapshot_log: recovered.log,
+    });
+
+    assert_eq!(engine.current_term().get(), 7);
+    assert_eq!(
+        engine.voted_for(),
+        Some(nid(2)),
+        "voted_for must survive across crash/recover for §5.1 safety",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Fatal error propagation: a StateMachine whose decode_command rejects
 // every input triggers the fatal path as soon as a committed entry
 // reaches Apply. Any in-flight proposal on the same driver fails with

@@ -33,7 +33,7 @@ pub mod types;
 // memorising the internal module layout.
 
 pub use engine::action::Action;
-pub use engine::engine::Engine;
+pub use engine::engine::{Engine, RecoveredHardState, RecoveredSnapshot};
 pub use engine::env::{Env, RandomizedEnv, StaticEnv};
 pub use engine::event::Event;
 pub use engine::incoming::Incoming;

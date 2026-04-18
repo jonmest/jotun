@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use jotun_core::{
-    Action, ConfigChange, Engine, Env, Event, Incoming, LogEntry, LogIndex, LogPayload, Message,
-    NodeId, RandomizedEnv, RoleState, Term,
+    Action, ConfigChange, Engine, Env, Event, LogEntry, LogIndex, LogPayload, NodeId,
+    RandomizedEnv, RoleState, Term,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -506,7 +506,7 @@ where
 {
     // Re-hydrate the engine from persisted state by feeding synthetic
     // RPCs. Same approach the sim harness uses for crash-recover.
-    hydrate_engine(&mut d, &recovered);
+    hydrate_engine(&mut d, recovered);
 
     loop {
         let result: Result<(), Fatal> = tokio::select! {
@@ -546,71 +546,50 @@ where
     }
 }
 
-fn hydrate_engine<S, St, Tr>(d: &mut Driver<S, St, Tr>, recovered: &RecoveredState<Vec<u8>>)
+fn hydrate_engine<S, St, Tr>(d: &mut Driver<S, St, Tr>, recovered: RecoveredState<Vec<u8>>)
 where
     S: StateMachine,
     St: Storage<Vec<u8>>,
     Tr: Transport<Vec<u8>>,
 {
-    if recovered.hard_state.is_none() && recovered.snapshot.is_none() && recovered.log.is_empty() {
+    use jotun_core::{RecoveredHardState, RecoveredSnapshot};
+
+    let RecoveredState {
+        hard_state,
+        snapshot,
+        log,
+    } = recovered;
+    if hard_state.is_none() && snapshot.is_none() && log.is_empty() {
         return;
     }
-    // Pick any peer as the synthetic source; peers() returns the
-    // initial set passed at construction. For a single-node cluster
-    // there are no peers and nothing to hydrate against — that case
-    // can only have empty persisted state anyway, handled above.
-    let Some(&peer) = d.engine.peers().iter().next() else {
-        return;
+
+    let snapshot_bytes_for_sm = snapshot.as_ref().map(|s| s.bytes.clone());
+
+    let (current_term, voted_for) =
+        hard_state.map_or((Term::ZERO, None), |hs| (hs.current_term, hs.voted_for));
+
+    let recovered = RecoveredHardState {
+        current_term,
+        voted_for,
+        snapshot: snapshot.map(|s| RecoveredSnapshot {
+            last_included_index: s.last_included_index,
+            last_included_term: s.last_included_term,
+            bytes: s.bytes,
+        }),
+        post_snapshot_log: log,
     };
+    d.engine.recover_from(recovered);
 
-    if let Some(snap) = &recovered.snapshot {
-        use jotun_core::RequestInstallSnapshot;
-        use jotun_core::types::log::LogId;
-        let term = recovered
-            .hard_state
-            .as_ref()
-            .map_or(snap.last_included_term, |hs| hs.current_term);
-        let _ = d.engine.step(Event::Incoming(Incoming {
-            from: peer,
-            message: Message::InstallSnapshotRequest(RequestInstallSnapshot {
-                term,
-                leader_id: peer,
-                last_included: LogId::new(snap.last_included_index, snap.last_included_term),
-                data: snap.bytes.clone(),
-                leader_commit: snap.last_included_index,
-            }),
-        }));
-        // Hand the snapshot bytes to the state machine.
-        d.state_machine.restore(snap.bytes.clone());
+    // Hand the snapshot bytes to the state machine exactly once on
+    // boot so it can rebuild its in-memory state. Everything past the
+    // snapshot floor is uncommitted until a current-term leader
+    // tells us otherwise, so there's nothing else to apply here.
+    if let Some(bytes) = snapshot_bytes_for_sm {
+        d.state_machine.restore(bytes);
     }
-
-    if !recovered.log.is_empty() {
-        use jotun_core::RequestAppendEntries;
-        use jotun_core::types::log::LogId;
-        let prev_log_id = recovered
-            .snapshot
-            .as_ref()
-            .map(|s| LogId::new(s.last_included_index, s.last_included_term));
-        let term = recovered.hard_state.as_ref().map_or_else(
-            || {
-                recovered
-                    .log
-                    .last()
-                    .map_or(Term::ZERO, |e| e.id.term)
-            },
-            |hs| hs.current_term,
-        );
-        let _ = d.engine.step(Event::Incoming(Incoming {
-            from: peer,
-            message: Message::AppendEntriesRequest(RequestAppendEntries {
-                term,
-                leader_id: peer,
-                prev_log_id,
-                entries: recovered.log.clone(),
-                leader_commit: LogIndex::ZERO,
-            }),
-        }));
-    }
+    // Mirror the engine's restored last_applied onto the driver's
+    // NodeStatus cache.
+    d.last_applied = d.engine.commit_index();
 }
 
 async fn handle_propose<S, St, Tr>(
