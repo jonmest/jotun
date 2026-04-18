@@ -209,9 +209,11 @@ impl<C: Clone + PartialEq> SafetyChecker<C> {
         &self,
         nodes: &BTreeMap<NodeId, NodeHarness<C>>,
     ) -> Result<(), SafetyViolation> {
-        // Canonicalize: for each index, collect (term, node) across all
-        // live engines. Anywhere two nodes agree on (term, index),
-        // every earlier entry must match.
+        // Compare in absolute index space. Once either node has
+        // snapshotted a prefix, indices below the higher floor are no
+        // longer individually readable; we trust the snapshot contract
+        // there and resume comparison at the first index still
+        // inspectable by at least one side.
         let ids: Vec<NodeId> = nodes.keys().copied().collect();
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
@@ -221,34 +223,45 @@ impl<C: Clone + PartialEq> SafetyChecker<C> {
                 let Some(b) = nodes.get(&ids[j]).and_then(|h| h.engine.as_ref()) else {
                     continue;
                 };
-                let a_len = a.log().len();
-                let b_len = b.log().len();
-                let max_shared = a_len.min(b_len) as u64;
+
+                let compare_from = a
+                    .log()
+                    .snapshot_last()
+                    .index
+                    .max(b.log().snapshot_last().index)
+                    .max(LogIndex::new(1));
+                let max_shared = a
+                    .log()
+                    .last_log_id()
+                    .map_or(LogIndex::ZERO, |id| id.index)
+                    .min(b.log().last_log_id().map_or(LogIndex::ZERO, |id| id.index));
+                if max_shared < compare_from {
+                    continue;
+                }
+
                 // Walk from the highest shared index backward; find the
                 // most recent (term, index) agreement, then verify the
                 // entire prefix matches.
-                let mut agreement: Option<u64> = None;
-                for k in (1..=max_shared).rev() {
-                    let ai = LogIndex::new(k);
-                    let bi = LogIndex::new(k);
-                    let (Some(ea), Some(eb)) = (a.log().entry_at(ai), b.log().entry_at(bi)) else {
-                        continue;
-                    };
-                    if ea.id.term == eb.id.term {
-                        agreement = Some(k);
+                let mut agreement: Option<LogIndex> = None;
+                for k in (compare_from.get()..=max_shared.get()).rev() {
+                    let idx = LogIndex::new(k);
+                    if let (Some(a_term), Some(b_term)) = (a.log().term_at(idx), b.log().term_at(idx))
+                        && a_term == b_term
+                    {
+                        agreement = Some(idx);
                         break;
                     }
                 }
                 if let Some(k) = agreement {
-                    for step in 1..=k {
-                        let ei = LogIndex::new(step);
-                        let (Some(ea), Some(eb)) = (a.log().entry_at(ei), b.log().entry_at(ei))
-                        else {
-                            continue;
+                    for step in compare_from.get()..=k.get() {
+                        let idx = LogIndex::new(step);
+                        let matches = match (a.log().entry_at(idx), b.log().entry_at(idx)) {
+                            (Some(ea), Some(eb)) => ea.id == eb.id && ea.payload == eb.payload,
+                            _ => a.log().term_at(idx) == b.log().term_at(idx),
                         };
-                        if ea.id != eb.id || ea.payload != eb.payload {
+                        if !matches {
                             return Err(SafetyViolation::LogMismatch {
-                                index: ei,
+                                index: idx,
                                 a: a.id(),
                                 b: b.id(),
                             });

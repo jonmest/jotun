@@ -6,12 +6,12 @@
 //! we know the harness catches real violations, not just that
 //! passing cases pass.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jotun_core::{LogEntry, LogId, LogIndex, LogPayload, NodeId, Term};
 
 use crate::cluster::Policy;
-use crate::harness::NodeHarness;
+use crate::harness::{NodeHarness, PersistedSnapshot, PersistedState};
 use crate::invariants::{SafetyChecker, SafetyViolation};
 use crate::{Cluster, env::SharedRng};
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,18 @@ fn cmd_entry(index: u64, term: u64, cmd: u64) -> LogEntry<u64> {
         id: LogId::new(LogIndex::new(index), Term::new(term)),
         payload: LogPayload::Command(cmd),
     }
+}
+
+fn recovered_node(
+    id: u64,
+    peers: Vec<NodeId>,
+    persisted: PersistedState<u64>,
+) -> NodeHarness<u64> {
+    let mut harness = NodeHarness::new(node(id), peers, 3, rng());
+    harness.persisted = persisted;
+    harness.crash();
+    harness.recover(rng());
+    harness
 }
 
 /// Handcrafted: node 1 applied `42` at index 1, node 2 applied `99` at
@@ -101,6 +113,55 @@ fn happy_run_accumulates_committed_and_applied_without_violation() {
     // If we got here without panicking, the checker never saw a
     // violation across hundreds of steps.
     assert!(cluster.max_commit_index() >= 2);
+}
+
+#[test]
+fn log_matching_checks_post_snapshot_disagreement_above_snapshot_floor() {
+    let peers = BTreeSet::from([node(1), node(2)]);
+    let mut nodes: BTreeMap<NodeId, NodeHarness<u64>> = BTreeMap::new();
+    nodes.insert(
+        node(1),
+        recovered_node(
+            1,
+            vec![node(2)],
+            PersistedState {
+                current_term: Term::new(3),
+                voted_for: None,
+                log: vec![cmd_entry(4, 2, 40), cmd_entry(5, 3, 50)],
+                snapshot: Some(PersistedSnapshot {
+                    last_included_index: LogIndex::new(3),
+                    last_included_term: Term::new(1),
+                    peers: peers.clone(),
+                    bytes: b"a".to_vec(),
+                }),
+            },
+        ),
+    );
+    nodes.insert(
+        node(2),
+        recovered_node(
+            2,
+            vec![node(1)],
+            PersistedState {
+                current_term: Term::new(3),
+                voted_for: None,
+                log: vec![cmd_entry(3, 1, 30), cmd_entry(4, 2, 99), cmd_entry(5, 3, 50)],
+                snapshot: Some(PersistedSnapshot {
+                    last_included_index: LogIndex::new(2),
+                    last_included_term: Term::new(1),
+                    peers,
+                    bytes: b"b".to_vec(),
+                }),
+            },
+        ),
+    );
+
+    let mut checker: SafetyChecker<u64> = SafetyChecker::new();
+    let err = checker.check(&nodes).expect_err("must detect mismatch above the floor");
+    assert!(
+        matches!(err, SafetyViolation::LogMismatch { index, .. } if index == LogIndex::new(4)),
+        "wrong variant: {err:?}",
+    );
 }
 
 // Log Matching / Leader Completeness / Two-Leaders are harder to
