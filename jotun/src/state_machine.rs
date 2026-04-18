@@ -6,7 +6,8 @@
 //!    return the response. Synchronous, infallible, deterministic.
 //!  - [`StateMachine::snapshot`] — produce a snapshot of state. Default
 //!    is "no snapshot" (returns empty bytes); only override if your
-//!    state machine wants periodic compaction.
+//!    application intends to drive compaction itself. The runtime does
+//!    not currently call this automatically.
 //!  - [`StateMachine::restore`] — rebuild state from snapshot bytes.
 //!    Default panics; only override if you also override `snapshot`.
 //!
@@ -59,8 +60,9 @@ pub trait StateMachine: Send + 'static {
 
     /// Serialize the entire state into bytes. Default: empty bytes,
     /// signalling "no snapshot" — the runtime never invokes
-    /// [`Self::restore`] in that case. Override if you want periodic
-    /// log compaction.
+    /// [`Self::restore`] in that case. Override if your host
+    /// application plans to cut snapshots itself; automatic runtime-
+    /// driven compaction is deferred for now.
     fn snapshot(&self) -> Vec<u8> {
         Vec::new()
     }
@@ -68,7 +70,7 @@ pub trait StateMachine: Send + 'static {
     /// Rebuild state from a previously-emitted snapshot. Default panics
     /// — only override if you also override [`Self::snapshot`].
     /// Called when the runtime recovers from disk after a crash, or
-    /// when a leader's `InstallSnapshot` arrives at this node.
+    /// when an incoming leader `InstallSnapshot` arrives at this node.
     fn restore(&mut self, _bytes: Vec<u8>) {
         panic!(
             "StateMachine::restore not implemented; override it if your \

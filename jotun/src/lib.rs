@@ -3,12 +3,13 @@
 //!
 //! This crate is the answer for users who want a clustered service
 //! without writing the engine integration themselves. You implement
-//! [`StateMachine`] (your application's apply/restore logic; snapshot
-//! creation is application-driven for now) and call [`Node::start`];
-//! the runtime owns the engine, the network transport, the on-disk
-//! persistence, the tick driver, and the action dispatcher. Incoming
-//! snapshots are installed and restored automatically; deciding when
-//! to cut a new snapshot is still left to the host application.
+//! [`StateMachine`] (your application's apply/restore logic) and call
+//! [`Node::start`]; the runtime owns the engine, the network
+//! transport, the on-disk persistence, the tick driver, and the
+//! action dispatcher. Incoming snapshots are installed and restored
+//! automatically, but the runtime does not currently initiate
+//! compaction or call [`StateMachine::snapshot`] on its own; host-
+//! initiated snapshot support is deferred for now.
 //!
 //! For users who want different transport, storage, or concurrency,
 //! [`Storage`] and [`Transport`] are traits — the defaults are

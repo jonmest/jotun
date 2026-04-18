@@ -18,7 +18,11 @@
 //! the `StateMachine` (with replies to pending [`Node::propose`] futures),
 //! Redirects fail any matching pending propose with `NotLeader`. On
 //! explicit shutdown the driver also asks the transport to stop any
-//! background tasks it owns before exiting.
+//! background tasks it owns before exiting. The runtime restores and
+//! installs incoming snapshots during recovery / `InstallSnapshot`,
+//! but it does not currently decide when to cut a snapshot or invoke
+//! [`StateMachine::snapshot`] on its own; host-driven compaction is
+//! deferred.
 //!
 //! The driver is the only mutator of any shared state; no locks.
 
