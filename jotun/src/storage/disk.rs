@@ -11,22 +11,31 @@
 //!
 //! ```text
 //! data_dir/
-//!   hard_state.bin      // current_term + voted_for, ~16 bytes
-//!   log.bin             // append-only stream of length-prefixed
-//!                       // protobuf-encoded LogEntry frames
-//!   snapshot.bin        // raw snapshot bytes (the host's
-//!                       // state-machine output)
-//!   snapshot_meta.bin   // last_included_index + last_included_term
+//!   hard_state.bin          // current_term + voted_for, ~17 bytes
+//!   snapshot.bin            // raw snapshot bytes
+//!   snapshot_meta.bin       // last_included_index + last_included_term
+//!   log/
+//!     000000000000001.log   // segment starting at log index 1
+//!     000000001000001.log   // segment starting at log index 1000001
+//!     ...
 //! ```
 //!
-//! All atomic-replace writes go via a `*.tmp` sibling + rename, with
-//! an fsync on the file then an fsync on the directory. Append-only
-//! writes to `log.bin` flush + fsync per call.
+//! The log is sharded into segments. Each segment's filename is the
+//! 1-based log index of its first entry, zero-padded to 15 digits so
+//! lexicographic sort equals numeric sort. The on-disk frame format
+//! inside a segment is `[u32 LE length][prost-encoded LogEntry]`,
+//! the same stream we used in the pre-segmented single-file layout.
 //!
-//! v1 is intentionally simple: one log file, no segments, no
-//! compaction beyond what snapshots provide. The trait shape lets
-//! users drop in something fancier (sled, rocksdb) without engine
-//! changes.
+//! Segmentation buys us cheap compaction: [`truncate_log`] and
+//! [`persist_snapshot`] can drop whole segment files instead of
+//! rewriting the entire log. Only the segment that straddles the cut
+//! gets rewritten.
+//!
+//! All atomic-replace writes (hard state, snapshot, snapshot meta, and
+//! segment rewrites/creations) go via a `*.tmp` sibling + rename, with
+//! an fsync on the file then an fsync on the directory. The active tail
+//! segment is fsynced after every `append_log` call — same durability
+//! story as the pre-segmented impl.
 
 use std::path::{Path, PathBuf};
 
@@ -39,9 +48,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use crate::storage::{RecoveredState, Storage, StoredHardState, StoredSnapshot};
 
 const HARD_STATE_FILE: &str = "hard_state.bin";
-const LOG_FILE: &str = "log.bin";
 const SNAPSHOT_FILE: &str = "snapshot.bin";
 const SNAPSHOT_META_FILE: &str = "snapshot_meta.bin";
+const LOG_DIR: &str = "log";
+const SEGMENT_EXT: &str = "log";
+/// Width of the zero-padded starting-index in segment filenames.
+/// 15 digits covers `u64::MAX / 1000` starting indices, which is more
+/// than enough headroom for any realistic deployment.
+const SEGMENT_INDEX_WIDTH: usize = 15;
+/// Default rollover target. Segments grow past this by at most one
+/// entry — we only check after appending a batch.
+const DEFAULT_SEGMENT_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A single log segment on disk.
+#[derive(Debug, Clone)]
+struct Segment {
+    /// The 1-based index of the first entry in this segment.
+    start_index: LogIndex,
+    /// Absolute path to the segment file.
+    path: PathBuf,
+    /// Current size of the segment file in bytes. Updated as we append.
+    size_bytes: u64,
+}
 
 /// Filesystem-backed [`Storage`].
 ///
@@ -53,23 +81,43 @@ const SNAPSHOT_META_FILE: &str = "snapshot_meta.bin";
 #[derive(Debug)]
 pub struct DiskStorage {
     data_dir: PathBuf,
-    log_file: Option<File>,
-    /// Cached snapshot floor so append/truncate can compute physical
-    /// log positions without re-reading the meta file.
+    /// In-memory segment index, sorted by `start_index` ascending. The
+    /// last element (if any) is the open tail segment.
+    segments: Vec<Segment>,
+    /// Cached handle to the tail segment, opened lazily for append.
+    tail_file: Option<File>,
+    /// Cached snapshot floor so recovery / append can filter stale
+    /// entries without re-reading the meta file.
     snapshot_floor: LogIndex,
+    /// Target segment size; once a tail segment exceeds this after a
+    /// write it gets rolled over.
+    segment_target_bytes: u64,
 }
 
 impl DiskStorage {
-    /// Open or create a `DiskStorage` in `data_dir`. Creates the
-    /// directory if missing. The actual log file is opened lazily
-    /// on first write or by [`Self::recover`].
+    /// Open or create a `DiskStorage` in `data_dir`. Creates the data
+    /// directory (and its `log/` subdirectory) if missing. Segment
+    /// files are opened lazily on first write or by [`Self::recover`].
     pub async fn open(data_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        Self::open_with_segment_target(data_dir, DEFAULT_SEGMENT_TARGET_BYTES).await
+    }
+
+    /// Open or create a `DiskStorage` in `data_dir` with a custom
+    /// segment rollover target. Intended for tests that want to
+    /// exercise segmentation without writing 64 MiB of log.
+    pub async fn open_with_segment_target(
+        data_dir: impl Into<PathBuf>,
+        segment_target_bytes: u64,
+    ) -> std::io::Result<Self> {
         let data_dir = data_dir.into();
         tokio::fs::create_dir_all(&data_dir).await?;
+        tokio::fs::create_dir_all(data_dir.join(LOG_DIR)).await?;
         Ok(Self {
             data_dir,
-            log_file: None,
+            segments: Vec::new(),
+            tail_file: None,
             snapshot_floor: LogIndex::ZERO,
+            segment_target_bytes: segment_target_bytes.max(1),
         })
     }
 
@@ -77,46 +125,180 @@ impl DiskStorage {
         self.data_dir.join(name)
     }
 
-    async fn open_log_for_append(&mut self) -> std::io::Result<()> {
-        if self.log_file.is_some() {
-            return Ok(());
-        }
-        let f = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(self.path(LOG_FILE))
-            .await?;
-        self.log_file = Some(f);
-        Ok(())
+    fn log_dir(&self) -> PathBuf {
+        self.data_dir.join(LOG_DIR)
+    }
+
+    fn segment_path(&self, start_index: LogIndex) -> PathBuf {
+        self.log_dir().join(segment_filename(start_index))
     }
 
     /// fsync the data dir so an atomic-rename inside it is durable.
-    async fn fsync_data_dir(&self) -> std::io::Result<()> {
-        let dir = File::open(&self.data_dir).await?;
+    async fn fsync_dir(path: &Path) -> std::io::Result<()> {
+        let dir = File::open(path).await?;
         dir.sync_all().await?;
         Ok(())
     }
 
-    /// Atomic-replace `name` with `bytes`: write to `name.tmp`,
-    /// fsync, rename, fsync the dir.
-    async fn atomic_write(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let final_path = self.path(name);
-        let tmp_path = self.path(&format!("{name}.tmp"));
+    /// Atomic-replace `path` with `bytes`: write to `path.tmp`, fsync,
+    /// rename, fsync the parent dir.
+    async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let tmp = tmp_sibling(path);
         {
             let mut f = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&tmp_path)
+                .open(&tmp)
                 .await?;
             f.write_all(bytes).await?;
             f.sync_all().await?;
         }
-        tokio::fs::rename(&tmp_path, &final_path).await?;
-        self.fsync_data_dir().await?;
+        tokio::fs::rename(&tmp, path).await?;
+        if let Some(parent) = path.parent() {
+            Self::fsync_dir(parent).await?;
+        }
         Ok(())
     }
+
+    /// Rescan `log/`, rebuild the in-memory segment index. Does not
+    /// touch `tail_file`; caller is responsible for dropping any cached
+    /// handle before this is called.
+    async fn rescan_segments(&mut self) -> std::io::Result<()> {
+        self.segments.clear();
+        let dir = self.log_dir();
+        let mut read = match tokio::fs::read_dir(&dir).await {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir_all(&dir).await?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut found: Vec<Segment> = Vec::new();
+        while let Some(entry) = read.next_entry().await? {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Ignore stray temp files from a mid-rename crash.
+            if Path::new(name).extension().is_some_and(|e| e == "tmp") {
+                let _ = tokio::fs::remove_file(&path).await;
+                continue;
+            }
+            let Some(start_index) = parse_segment_filename(name) else {
+                continue;
+            };
+            let size_bytes = entry.metadata().await?.len();
+            found.push(Segment {
+                start_index,
+                path,
+                size_bytes,
+            });
+        }
+        found.sort_by_key(|s| s.start_index);
+        self.segments = found;
+        Ok(())
+    }
+
+    /// Open (or create) the tail segment for append, caching the handle.
+    /// Caller must ensure `self.segments` is non-empty.
+    async fn open_tail_for_append(&mut self) -> std::io::Result<()> {
+        if self.tail_file.is_some() {
+            return Ok(());
+        }
+        let tail = self
+            .segments
+            .last()
+            .expect("open_tail_for_append requires a tail segment");
+        let f = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&tail.path)
+            .await?;
+        self.tail_file = Some(f);
+        Ok(())
+    }
+
+    /// Ensure there is a tail segment starting at `start_index`. If the
+    /// segment list is empty, creates the segment file on disk.
+    async fn ensure_tail_segment(&mut self, start_index: LogIndex) -> std::io::Result<()> {
+        if !self.segments.is_empty() {
+            return Ok(());
+        }
+        let path = self.segment_path(start_index);
+        // Touch the segment file so it shows up in `log/` even if the
+        // first append is empty.
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .await?;
+        f.sync_all().await?;
+        drop(f);
+        Self::fsync_dir(&self.log_dir()).await?;
+        self.segments.push(Segment {
+            start_index,
+            path,
+            size_bytes: 0,
+        });
+        Ok(())
+    }
+
+    /// Roll over to a fresh tail segment starting at `start_index`.
+    /// fsyncs and closes the previous tail, creates the new segment
+    /// file, fsyncs the log dir so the new file is durable.
+    async fn roll_new_segment(&mut self, start_index: LogIndex) -> std::io::Result<()> {
+        if let Some(f) = self.tail_file.take() {
+            f.sync_all().await?;
+        }
+        let path = self.segment_path(start_index);
+        let f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        f.sync_all().await?;
+        drop(f);
+        Self::fsync_dir(&self.log_dir()).await?;
+        self.segments.push(Segment {
+            start_index,
+            path,
+            size_bytes: 0,
+        });
+        Ok(())
+    }
+
+}
+
+/// Format a segment's filename from its starting index: zero-padded
+/// so lexicographic sort matches numeric sort.
+fn segment_filename(start_index: LogIndex) -> String {
+    format!(
+        "{:0width$}.{ext}",
+        start_index.get(),
+        width = SEGMENT_INDEX_WIDTH,
+        ext = SEGMENT_EXT,
+    )
+}
+
+/// Inverse of [`segment_filename`]. Returns `None` for names that do
+/// not match the expected pattern.
+fn parse_segment_filename(name: &str) -> Option<LogIndex> {
+    let stem = name.strip_suffix(&format!(".{SEGMENT_EXT}"))?;
+    if stem.len() != SEGMENT_INDEX_WIDTH {
+        return None;
+    }
+    let n: u64 = stem.parse().ok()?;
+    Some(LogIndex::new(n))
+}
+
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
 }
 
 /// Errors returned by [`DiskStorage`].
@@ -173,7 +355,24 @@ where
         if let Some(snap) = &snapshot {
             self.snapshot_floor = snap.last_included_index;
         }
-        let log = read_log::<C>(&self.path(LOG_FILE), self.snapshot_floor).await?;
+
+        // Rebuild the in-memory segment index from whatever's on disk.
+        self.tail_file = None;
+        self.rescan_segments().await?;
+
+        // Collect entries from every segment. `read_segment` tolerates
+        // a torn tail-frame (from a mid-write crash) by stopping at the
+        // last fully-decodable frame.
+        let mut log = Vec::new();
+        for seg in &self.segments {
+            let entries = read_segment::<C>(&seg.path).await?;
+            for e in entries {
+                if e.id.index > self.snapshot_floor {
+                    log.push(e);
+                }
+            }
+        }
+
         Ok(RecoveredState {
             hard_state,
             snapshot,
@@ -195,7 +394,7 @@ where
                 buf.extend_from_slice(&0u64.to_le_bytes());
             }
         }
-        self.atomic_write(HARD_STATE_FILE, &buf).await?;
+        Self::atomic_write(&self.path(HARD_STATE_FILE), &buf).await?;
         Ok(())
     }
 
@@ -203,38 +402,107 @@ where
         if entries.is_empty() {
             return Ok(());
         }
-        self.open_log_for_append().await?;
-        let f = self.log_file.as_mut().expect("opened above");
-        for entry in entries {
-            let proto_entry: proto::LogEntry = entry.into();
-            let bytes = proto_entry.encode_to_vec();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| DiskStorageError::Malformed("log entry exceeds 4 GiB"))?;
-            f.write_all(&len.to_le_bytes()).await?;
-            f.write_all(&bytes).await?;
+
+        // If we've never written before, seed the first segment with
+        // the index of the first entry being appended.
+        if self.segments.is_empty() {
+            self.ensure_tail_segment(entries[0].id.index).await?;
         }
+        self.open_tail_for_append().await?;
+
+        // Pre-encode so we know each frame's size up-front; that makes
+        // the rollover bookkeeping cleaner.
+        let mut encoded: Vec<(LogIndex, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for e in entries {
+            let idx = e.id.index;
+            let proto_entry: proto::LogEntry = e.into();
+            encoded.push((idx, proto_entry.encode_to_vec()));
+        }
+
+        for (idx, frame) in encoded {
+            let len = u32::try_from(frame.len())
+                .map_err(|_| DiskStorageError::Malformed("log entry exceeds 4 GiB"))?;
+            let frame_size = u64::from(len) + 4;
+
+            // Roll over if the current tail would cross the target
+            // *and* it already has at least one entry. We never create
+            // an empty segment just to hold one oversized frame.
+            let needs_roll = {
+                let tail = self
+                    .segments
+                    .last()
+                    .expect("tail seeded by ensure_tail_segment above");
+                tail.size_bytes > 0 && tail.size_bytes >= self.segment_target_bytes
+            };
+            if needs_roll {
+                self.roll_new_segment(idx).await?;
+                self.open_tail_for_append().await?;
+            }
+
+            let f = self.tail_file.as_mut().expect("opened above");
+            f.write_all(&len.to_le_bytes()).await?;
+            f.write_all(&frame).await?;
+            let tail = self
+                .segments
+                .last_mut()
+                .expect("tail present after rollover check");
+            tail.size_bytes += frame_size;
+        }
+
+        // One fsync per append_log call, same cadence as the pre-
+        // segmented impl.
+        let f = self.tail_file.as_mut().expect("tail open");
         f.sync_all().await?;
         Ok(())
     }
 
     async fn truncate_log(&mut self, from: LogIndex) -> Result<(), Self::Error> {
-        // Easiest correct path: re-read the log, drop entries with
-        // index >= from, rewrite atomically. Slow for big logs;
-        // segments would fix it, but those come post-0.1.
-        let entries = read_log::<C>(&self.path(LOG_FILE), self.snapshot_floor).await?;
-        let kept: Vec<LogEntry<C>> = entries.into_iter().filter(|e| e.id.index < from).collect();
-        let mut bytes = Vec::new();
-        for entry in kept {
-            let proto_entry: proto::LogEntry = entry.into();
-            let frame = proto_entry.encode_to_vec();
-            let len = u32::try_from(frame.len())
-                .map_err(|_| DiskStorageError::Malformed("log entry exceeds 4 GiB"))?;
-            bytes.extend_from_slice(&len.to_le_bytes());
-            bytes.extend_from_slice(&frame);
+        // Fast path: drop whole segments whose start_index >= from.
+        // If `from` lands inside the segment that survives, rewrite
+        // that one segment with the entries strictly less than `from`.
+        if self.segments.is_empty() {
+            return Ok(());
         }
-        // Drop the cached file handle so the rename below replaces it.
-        self.log_file = None;
-        self.atomic_write(LOG_FILE, &bytes).await?;
+
+        // Find the segment that would contain `from`. `straddler_pos`
+        // points at the last segment with `start_index < from` (i.e.,
+        // the one that might need a rewrite). Every segment after it
+        // is dropped wholesale.
+        let drop_from_idx = self
+            .segments
+            .iter()
+            .position(|s| s.start_index >= from)
+            .unwrap_or(self.segments.len());
+
+        // Drop the whole-segment tail.
+        self.tail_file = None;
+        let to_remove: Vec<Segment> = self.segments.drain(drop_from_idx..).collect();
+        for s in to_remove {
+            match tokio::fs::remove_file(&s.path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Rewrite the straddler (now the new tail, if any) keeping only
+        // entries < `from`. Skip this if the straddler is empty or every
+        // entry in it already survives.
+        if let Some(last) = self.segments.last().cloned() {
+            let kept = read_segment::<C>(&last.path)
+                .await?
+                .into_iter()
+                .filter(|e| e.id.index < from)
+                .collect::<Vec<_>>();
+            let bytes = encode_frames(&kept)?;
+            let new_size = bytes.len() as u64;
+            Self::atomic_write(&last.path, &bytes).await?;
+            if let Some(tail) = self.segments.last_mut() {
+                tail.size_bytes = new_size;
+            }
+        }
+
+        Self::fsync_dir(&self.log_dir()).await?;
         Ok(())
     }
 
@@ -244,34 +512,143 @@ where
         meta.extend_from_slice(&snap.last_included_index.get().to_le_bytes());
         meta.extend_from_slice(&snap.last_included_term.get().to_le_bytes());
 
-        // Order matters: write the bytes first (large), then the
-        // meta file (small) — recovery treats meta as the
-        // commit-pointer. If a crash happens between the two writes
-        // we'll see snapshot bytes with no meta and ignore them.
-        self.atomic_write(SNAPSHOT_FILE, &snap.bytes).await?;
-        self.atomic_write(SNAPSHOT_META_FILE, &meta).await?;
-
-        // Drop log entries up to and including the snapshot's tail.
-        // Easiest: re-read, filter, rewrite. Same approach as truncate.
+        // Order: bytes first (large), meta second (small). Meta is the
+        // commit-pointer. A crash between the two leaves orphan bytes
+        // that recovery ignores.
+        Self::atomic_write(&self.path(SNAPSHOT_FILE), &snap.bytes).await?;
+        Self::atomic_write(&self.path(SNAPSHOT_META_FILE), &meta).await?;
         self.snapshot_floor = snap.last_included_index;
-        let entries = read_log::<C>(&self.path(LOG_FILE), LogIndex::ZERO).await?;
-        let kept: Vec<LogEntry<C>> = entries
-            .into_iter()
-            .filter(|e| e.id.index > snap.last_included_index)
-            .collect();
-        let mut bytes = Vec::new();
-        for entry in kept {
-            let proto_entry: proto::LogEntry = entry.into();
-            let frame = proto_entry.encode_to_vec();
-            let len = u32::try_from(frame.len())
-                .map_err(|_| DiskStorageError::Malformed("log entry exceeds 4 GiB"))?;
-            bytes.extend_from_slice(&len.to_le_bytes());
-            bytes.extend_from_slice(&frame);
+
+        // Drop every segment whose entire span is <= last_included_index.
+        // A segment spans [start_index, next_start_index - 1]; for the
+        // tail, we don't know the upper bound, so we only drop it if
+        // start_index is fully below the floor AND there's a newer
+        // segment above it (handled implicitly: only non-tail segments
+        // have a known upper bound).
+        //
+        // Concrete rule used here:
+        //   - If segment[i+1].start_index - 1 <= floor, segment[i] is
+        //     fully covered -> drop it.
+        //   - If segment[i] is the tail, we rewrite it in the straddle
+        //     step below (cheap when tail is small; the tail IS the
+        //     active write path).
+        let floor = snap.last_included_index;
+        let mut keep_from = 0usize;
+        for i in 0..self.segments.len() {
+            let next_start = self.segments.get(i + 1).map(|s| s.start_index);
+            match next_start {
+                Some(ns) => {
+                    // segment i covers [start_index, ns.get() - 1]
+                    if ns.get() > 0 && LogIndex::new(ns.get() - 1) <= floor {
+                        keep_from = i + 1;
+                    }
+                }
+                None => {
+                    // tail — never dropped as a whole here; handled by
+                    // straddle rewrite below. Break either way.
+                    break;
+                }
+            }
         }
-        self.log_file = None;
-        self.atomic_write(LOG_FILE, &bytes).await?;
+        if keep_from > 0 {
+            self.tail_file = None;
+            let to_remove: Vec<Segment> = self.segments.drain(..keep_from).collect();
+            for s in to_remove {
+                match tokio::fs::remove_file(&s.path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        // Straddle rewrite: the first surviving segment may contain
+        // entries at or below the floor that need to go. We also need
+        // to rename the file since its start_index changes.
+        if let Some(first) = self.segments.first().cloned() {
+            let kept: Vec<LogEntry<C>> = read_segment::<C>(&first.path)
+                .await?
+                .into_iter()
+                .filter(|e| e.id.index > floor)
+                .collect();
+
+            let new_start = kept.first().map(|e| e.id.index);
+            match new_start {
+                Some(new_start_idx) if new_start_idx == first.start_index => {
+                    // Nothing below the floor in this segment and
+                    // start_index is unchanged — no rewrite needed.
+                }
+                Some(new_start_idx) => {
+                    // Some prefix was dropped; write a new segment file
+                    // with the new starting index and remove the old.
+                    let bytes = encode_frames(&kept)?;
+                    let new_path = self.segment_path(new_start_idx);
+                    Self::atomic_write(&new_path, &bytes).await?;
+                    // Remove the old file (different name).
+                    if new_path != first.path {
+                        match tokio::fs::remove_file(&first.path).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    // Drop any cached tail handle — if this was the
+                    // tail, its path just changed.
+                    self.tail_file = None;
+                    if let Some(s) = self.segments.first_mut() {
+                        s.start_index = new_start_idx;
+                        s.path = new_path;
+                        s.size_bytes = bytes.len() as u64;
+                    }
+                }
+                None => {
+                    // Every entry in the segment is covered by the
+                    // snapshot. If it's a non-tail segment, remove it
+                    // outright — we don't need empty placeholders.
+                    // If it's the tail AND the only segment, leave an
+                    // empty file in place so appends can resume.
+                    let is_only = self.segments.len() == 1;
+                    if is_only {
+                        // Rewrite empty. Keep the filename as-is; the
+                        // next append will treat this as the tail.
+                        Self::atomic_write(&first.path, &[]).await?;
+                        self.tail_file = None;
+                        if let Some(s) = self.segments.first_mut() {
+                            s.size_bytes = 0;
+                        }
+                    } else {
+                        match tokio::fs::remove_file(&first.path).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                        self.segments.remove(0);
+                        self.tail_file = None;
+                    }
+                }
+            }
+        }
+
+        Self::fsync_dir(&self.log_dir()).await?;
         Ok(())
     }
+}
+
+/// Encode a slice of log entries into a length-prefixed byte stream.
+fn encode_frames<C>(entries: &[LogEntry<C>]) -> Result<Vec<u8>, DiskStorageError>
+where
+    C: Clone + Into<Vec<u8>>,
+{
+    let mut out = Vec::new();
+    for e in entries {
+        let proto_entry: proto::LogEntry = e.clone().into();
+        let frame = proto_entry.encode_to_vec();
+        let len = u32::try_from(frame.len())
+            .map_err(|_| DiskStorageError::Malformed("log entry exceeds 4 GiB"))?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
 }
 
 async fn read_hard_state(path: &Path) -> Result<Option<StoredHardState>, DiskStorageError> {
@@ -327,10 +704,11 @@ async fn read_snapshot(
     }))
 }
 
-async fn read_log<C>(
-    path: &Path,
-    snapshot_floor: LogIndex,
-) -> Result<Vec<LogEntry<C>>, DiskStorageError>
+/// Read every fully-decodable frame from one segment file. A torn
+/// trailing frame (either an incomplete length prefix or an incomplete
+/// body) is treated as EOF — recovery then returns the frames up to
+/// that point. Matches the implicit behavior of the single-file impl.
+async fn read_segment<C>(path: &Path) -> Result<Vec<LogEntry<C>>, DiskStorageError>
 where
     C: From<Vec<u8>>,
 {
@@ -350,14 +728,40 @@ where
         }
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut frame = vec![0u8; len];
-        r.read_exact(&mut frame).await?;
+        match r.read_exact(&mut frame).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Torn frame: keep everything we already decoded.
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
         let proto_entry = proto::LogEntry::decode(frame.as_slice())?;
         let entry: LogEntry<C> = proto_entry
             .try_into()
             .map_err(|_| DiskStorageError::Malformed("log entry failed validation"))?;
-        if entry.id.index > snapshot_floor {
-            entries.push(entry);
-        }
+        entries.push(entry);
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_filename_round_trip() {
+        let name = segment_filename(LogIndex::new(1));
+        assert_eq!(name, "000000000000001.log");
+        assert_eq!(parse_segment_filename(&name), Some(LogIndex::new(1)));
+    }
+
+    #[test]
+    fn parse_rejects_non_segment_names() {
+        assert!(parse_segment_filename("log.bin").is_none());
+        assert!(parse_segment_filename("000000000000001.tmp").is_none());
+        assert!(parse_segment_filename("not-a-number.log").is_none());
+        // Wrong width.
+        assert!(parse_segment_filename("1.log").is_none());
+    }
 }
