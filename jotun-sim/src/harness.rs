@@ -419,6 +419,7 @@ fn check_send_ordering<C>(
         M::AppendEntriesResponse(r) => r.term,
         M::InstallSnapshotRequest(r) => r.term,
         M::InstallSnapshotResponse(r) => r.term,
+        M::TimeoutNow(r) => r.term,
     };
 
     // The engine must have persisted this term (or a later one) before

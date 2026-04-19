@@ -6,6 +6,7 @@ use crate::records::{
     install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot},
     log_entry::{LogEntry, LogPayload},
     message::Message,
+    timeout_now::TimeoutNow,
     vote::{RequestVote, VoteResponse, VoteResult},
 };
 use crate::types::{index::LogIndex, log::LogId, node::NodeId, term::Term};
@@ -135,6 +136,10 @@ pub(super) fn install_snapshot_response() -> impl Strategy<Value = InstallSnapsh
     )
 }
 
+pub(super) fn timeout_now() -> impl Strategy<Value = TimeoutNow> {
+    (term(), node_id()).prop_map(|(term, leader_id)| TimeoutNow { term, leader_id })
+}
+
 pub(super) fn message() -> impl Strategy<Value = Message<Vec<u8>>> {
     prop_oneof![
         request_vote().prop_map(Message::VoteRequest),
@@ -143,5 +148,6 @@ pub(super) fn message() -> impl Strategy<Value = Message<Vec<u8>>> {
         append_entries_response().prop_map(Message::AppendEntriesResponse),
         request_install_snapshot().prop_map(Message::InstallSnapshotRequest),
         install_snapshot_response().prop_map(Message::InstallSnapshotResponse),
+        timeout_now().prop_map(Message::TimeoutNow),
     ]
 }

@@ -4,7 +4,8 @@
 //! Architecture: a single owner task ("the driver") holds the
 //! [`jotun_core::Engine`], the user's [`StateMachine`], the
 //! [`Storage`] handle, and the [`Transport`]. Public methods on
-//! [`Node`] (`propose`, `add_peer`, `remove_peer`, `shutdown`)
+//! [`Node`] (`propose`, `add_peer`, `remove_peer`,
+//! `transfer_leadership_to`, `shutdown`)
 //! package a [`DriverInput`] into a channel and `await` a oneshot
 //! reply. The driver's loop multiplexes:
 //!
@@ -15,11 +16,14 @@
 //! Each of those becomes a `jotun_core::Event`; the driver calls
 //! `engine.step` and dispatches every emitted [`Action`] in order:
 //! Persists go to Storage, Sends go to Transport, Applies go to
-//! the `StateMachine` (with replies to pending [`Node::propose`] futures),
-//! Redirects fail any matching pending propose with `NotLeader`. On
-//! explicit shutdown the driver also asks the transport to stop any
-//! background tasks it owns before exiting. The runtime restores and
-//! installs incoming snapshots during recovery / `InstallSnapshot`.
+//! the `StateMachine` (with replies to pending [`Node::propose`]
+//! futures), Redirects fail any matching pending propose with
+//! `NotLeader`. Leadership-transfer requests are validated against the
+//! driver's current role and peer set, then handed to the engine as
+//! `Event::TransferLeadership`. On explicit shutdown the driver also
+//! asks the transport to stop any background tasks it owns before
+//! exiting. The runtime restores and installs incoming snapshots
+//! during recovery / `InstallSnapshot`.
 //! By default it also reacts to `Action::SnapshotHint` by calling
 //! [`StateMachine::snapshot`] and feeding the resulting bytes back into
 //! the engine; set [`Config::snapshot_hint_threshold_entries`] to `0`
@@ -366,6 +370,35 @@ impl std::fmt::Display for ProposeError {
 
 impl std::error::Error for ProposeError {}
 
+/// Errors from [`Node::transfer_leadership_to`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum TransferLeadershipError {
+    NotLeader { leader_hint: NodeId },
+    NoLeader,
+    InvalidTarget { target: NodeId },
+    Shutdown,
+    DriverDead,
+    Fatal {
+        reason: &'static str,
+    },
+}
+
+impl std::fmt::Display for TransferLeadershipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader { leader_hint } => write!(f, "not leader; try {leader_hint}"),
+            Self::NoLeader => write!(f, "no leader known yet"),
+            Self::InvalidTarget { target } => write!(f, "invalid transfer target: {target}"),
+            Self::Shutdown => write!(f, "node is shutting down"),
+            Self::DriverDead => write!(f, "node driver task died"),
+            Self::Fatal { reason } => write!(f, "fatal runtime error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for TransferLeadershipError {}
+
 /// Errors from [`Node::start`].
 #[non_exhaustive]
 #[derive(Debug)]
@@ -521,6 +554,33 @@ impl<S: StateMachine> Node<S> {
         self.config_change(ConfigChange::RemovePeer(peer)).await
     }
 
+    /// Ask the current leader to transfer leadership to `peer`.
+    ///
+    /// Returns once the local driver has accepted the request and
+    /// dispatched the engine actions needed to start the transfer. It
+    /// does not wait for the new leader to be elected.
+    pub async fn transfer_leadership_to(
+        &self,
+        peer: NodeId,
+    ) -> Result<(), TransferLeadershipError> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .inputs
+            .send(DriverInput::TransferLeadership {
+                target: peer,
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(TransferLeadershipError::Shutdown);
+        }
+        match rx.await {
+            Ok(r) => r,
+            Err(_) => Err(TransferLeadershipError::DriverDead),
+        }
+    }
+
     async fn config_change(&self, change: ConfigChange) -> Result<(), ProposeError> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -639,6 +699,10 @@ enum DriverInput<S: StateMachine> {
         change: ConfigChange,
         reply: oneshot::Sender<Result<(), ProposeError>>,
     },
+    TransferLeadership {
+        target: NodeId,
+        reply: oneshot::Sender<Result<(), TransferLeadershipError>>,
+    },
     Status {
         reply: oneshot::Sender<NodeStatus>,
     },
@@ -668,6 +732,9 @@ where
                     }
                     DriverInput::ConfigChange { change, reply } => {
                         handle_config_change(&mut d, change, reply).await
+                    }
+                    DriverInput::TransferLeadership { target, reply } => {
+                        handle_transfer_leadership(&mut d, target, reply).await
                     }
                     DriverInput::Status { reply } => {
                         let _ = reply.send(build_status(&d));
@@ -833,6 +900,52 @@ where
         let _ = reply.send(Err(err));
     }
     dispatch_actions(d, actions).await
+}
+
+async fn handle_transfer_leadership<S, St, Tr>(
+    d: &mut Driver<S, St, Tr>,
+    target: NodeId,
+    reply: oneshot::Sender<Result<(), TransferLeadershipError>>,
+) -> Result<(), Fatal>
+where
+    S: StateMachine,
+    St: Storage<Vec<u8>>,
+    Tr: Transport<Vec<u8>>,
+{
+    match d.engine.role() {
+        RoleState::Leader(_) => {}
+        RoleState::Follower(f) => {
+            let err = f.leader_id().map_or(
+                TransferLeadershipError::NoLeader,
+                |leader_hint| TransferLeadershipError::NotLeader { leader_hint },
+            );
+            let _ = reply.send(Err(err));
+            return Ok(());
+        }
+        RoleState::Candidate(_) => {
+            let _ = reply.send(Err(TransferLeadershipError::NoLeader));
+            return Ok(());
+        }
+    }
+
+    if target == d.node_id || !d.engine.peers().contains(&target) {
+        let _ = reply.send(Err(TransferLeadershipError::InvalidTarget { target }));
+        return Ok(());
+    }
+
+    let actions = d.engine.step(Event::TransferLeadership { target });
+    match dispatch_actions(d, actions).await {
+        Ok(()) => {
+            let _ = reply.send(Ok(()));
+            Ok(())
+        }
+        Err(fatal) => {
+            let _ = reply.send(Err(TransferLeadershipError::Fatal {
+                reason: fatal.reason,
+            }));
+            Err(fatal)
+        }
+    }
 }
 
 /// A non-recoverable runtime error. Caught at every layer above

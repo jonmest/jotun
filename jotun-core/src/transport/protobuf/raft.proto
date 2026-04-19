@@ -118,6 +118,11 @@ message InstallSnapshotResponse {
   bool done = 4;
 }
 
+message TimeoutNow {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+}
+
 message Message {
   oneof kind {
     RequestVote vote_request = 1;
@@ -126,5 +131,6 @@ message Message {
     AppendEntriesResponse append_entries_response = 4;
     RequestInstallSnapshot install_snapshot_request = 5;
     InstallSnapshotResponse install_snapshot_response = 6;
+    TimeoutNow timeout_now = 7;
   }
 }

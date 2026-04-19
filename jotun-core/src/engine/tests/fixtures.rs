@@ -11,6 +11,7 @@ use crate::records::append_entries::{
 };
 use crate::records::log_entry::{LogEntry, LogPayload};
 use crate::records::message::Message;
+use crate::records::timeout_now::TimeoutNow;
 use crate::records::vote::{RequestVote, VoteResponse};
 use crate::types::{index::LogIndex, log::LogId, node::NodeId, term::Term};
 
@@ -379,6 +380,19 @@ pub(super) fn collect_install_snapshots(
         .collect()
 }
 
+pub(super) fn collect_timeout_now(actions: &[Action<Vec<u8>>]) -> Vec<NodeId> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                to,
+                message: Message::TimeoutNow(_),
+            } => Some(*to),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(super) fn collect_snapshot_hints(actions: &[Action<Vec<u8>>]) -> Vec<LogIndex> {
     actions
         .iter()
@@ -403,6 +417,20 @@ pub(super) fn propose_remove_peer(id: u64) -> Event<Vec<u8>> {
 
 pub(super) fn client_proposal(command: &[u8]) -> Event<Vec<u8>> {
     Event::ClientProposal(command.to_vec())
+}
+
+pub(super) fn transfer_leadership(target: u64) -> Event<Vec<u8>> {
+    Event::TransferLeadership { target: node(target) }
+}
+
+pub(super) fn timeout_now_from(from: u64, term_n: u64) -> Event<Vec<u8>> {
+    Event::Incoming(Incoming {
+        from: node(from),
+        message: Message::TimeoutNow(TimeoutNow {
+            term: term(term_n),
+            leader_id: node(from),
+        }),
+    })
 }
 
 /// Wrap a `VoteResponse` into the Event envelope the engine accepts.

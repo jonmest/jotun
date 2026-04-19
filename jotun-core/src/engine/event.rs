@@ -1,6 +1,6 @@
 use crate::engine::incoming::Incoming;
 use crate::records::log_entry::ConfigChange;
-use crate::types::index::LogIndex;
+use crate::types::{index::LogIndex, node::NodeId};
 
 /// The single input type the engine accepts via
 /// [`crate::engine::engine::Engine::step`].
@@ -8,7 +8,8 @@ use crate::types::index::LogIndex;
 /// The four sources of forward motion in Raft, funneled through one
 /// dispatch: the abstract clock fires (`Tick`), a peer's RPC arrives
 /// (`Incoming`), the application submits a command (`ClientProposal`),
-/// or an operator asks for a membership change (`ProposeConfigChange`).
+/// or an operator asks for a membership change
+/// (`ProposeConfigChange`) / leadership transfer (`TransferLeadership`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event<C> {
     /// One unit of abstract time has elapsed. Drives the election timer
@@ -38,6 +39,16 @@ pub enum Event<C> {
     /// an existing member, removing a non-member). On accept, the
     /// active config mutates immediately (pre-commit) per §4.3.
     ProposeConfigChange(ConfigChange),
+    /// Operator-initiated leadership transfer to `target`.
+    ///
+    /// Leaders replicate to `target` until it is caught up to the
+    /// leader's current log tail, then send `TimeoutNow` so the target
+    /// starts an election immediately. Followers with a known leader
+    /// emit [`crate::engine::action::Action::Redirect`]; followers
+    /// without a known leader and candidates drop silently.
+    TransferLeadership {
+        target: NodeId,
+    },
     /// The host has just produced a snapshot of the application state
     /// machine that captures everything applied up to
     /// `last_included_index`. The engine truncates its in-memory log

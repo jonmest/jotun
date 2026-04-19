@@ -9,6 +9,7 @@ use crate::records::append_entries::{
 };
 use crate::records::install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot};
 use crate::records::log_entry::{ConfigChange, LogEntry, LogPayload};
+use crate::records::timeout_now::TimeoutNow;
 #[allow(clippy::enum_glob_use)] // match-heavy file; variants are used unqualified throughout
 use crate::records::message::Message::*;
 use crate::records::vote::{RequestVote, VoteResponse, VoteResult};
@@ -469,6 +470,7 @@ impl<C: Clone> Engine<C> {
             Event::Incoming(incoming) => self.on_incoming(incoming),
             Event::ClientProposal(command) => self.on_client_proposal(command),
             Event::ProposeConfigChange(change) => self.on_propose_config_change(change),
+            Event::TransferLeadership { target } => self.on_transfer_leadership(target),
             Event::SnapshotTaken {
                 last_included_index,
                 bytes,
@@ -597,6 +599,12 @@ impl<C: Clone> Engine<C> {
             InstallSnapshotResponse(response) => {
                 self.on_install_snapshot_response(incoming.from, response)
             }
+            TimeoutNow(request) => {
+                if request.leader_id != incoming.from {
+                    return vec![];
+                }
+                self.on_timeout_now(request)
+            }
         }
     }
 
@@ -697,6 +705,42 @@ impl<C: Clone> Engine<C> {
         out.extend(self.broadcast_append_entries());
         out.extend(self.try_advance_commit_as_leader());
         out
+    }
+
+    /// Operator-initiated leadership transfer to `target`.
+    ///
+    /// Leaders either send `TimeoutNow` immediately if `target` is
+    /// already caught up, or remember `target` and keep driving normal
+    /// replication until it is. Followers redirect if they know the
+    /// current leader; candidates and leaderless followers drop.
+    #[instrument(target = "jotun::engine", skip_all)]
+    fn on_transfer_leadership(&mut self, target: NodeId) -> Vec<Action<C>> {
+        match &self.state.role {
+            RoleState::Leader(_) => {}
+            RoleState::Follower(f) => {
+                return match f.leader_id {
+                    Some(leader) => vec![Action::Redirect {
+                        leader_hint: leader,
+                    }],
+                    None => vec![],
+                };
+            }
+            RoleState::Candidate(_) => return vec![],
+        }
+
+        if !self.state.peers.contains(&target) {
+            return vec![];
+        }
+        if let RoleState::Leader(leader) = &mut self.state.role {
+            leader.transfer_target = Some(target);
+        }
+        if self.transfer_target_is_caught_up(target) {
+            if let RoleState::Leader(leader) = &mut self.state.role {
+                leader.transfer_target = None;
+            }
+            return vec![self.timeout_now(target)];
+        }
+        vec![self.append_entries_to(target)]
     }
 
     // =========================================================================
@@ -827,6 +871,9 @@ impl<C: Clone> Engine<C> {
                     if let RoleState::Leader(l) = &mut self.state.role {
                         l.progress.remove_peer(id);
                         l.snapshot_transfers.remove(&id);
+                        if l.transfer_target == Some(id) {
+                            l.transfer_target = None;
+                        }
                     }
                 }
             }
@@ -907,6 +954,9 @@ impl<C: Clone> Engine<C> {
             for id in tracked.difference(&self.state.peers).copied() {
                 l.progress.remove_peer(id);
                 l.snapshot_transfers.remove(&id);
+                if l.transfer_target == Some(id) {
+                    l.transfer_target = None;
+                }
             }
         }
     }
@@ -1219,7 +1269,9 @@ impl<C: Clone> Engine<C> {
                 if last_appended >= snapshot_floor {
                     leader.snapshot_transfers.remove(&peer);
                 }
-                self.try_advance_commit_as_leader()
+                let mut out = self.try_advance_commit_as_leader();
+                out.extend(self.maybe_complete_leadership_transfer(peer));
+                out
             }
             AppendEntriesResult::Conflict { next_index_hint } => {
                 // Clamp the hint to our own log: nextIndex must never point
@@ -1479,7 +1531,7 @@ impl<C: Clone> Engine<C> {
             {
                 leader.snapshot_transfers.remove(&peer);
             }
-            return vec![];
+            return self.maybe_complete_leadership_transfer(peer);
         }
 
         let Some(transfer) = leader.snapshot_transfers.get_mut(&peer) else {
@@ -1707,6 +1759,67 @@ impl<C: Clone> Engine<C> {
         }
     }
 
+    /// Build a `TimeoutNow` message for a leadership-transfer target.
+    fn timeout_now(&self, target: NodeId) -> Action<C> {
+        Action::Send {
+            to: target,
+            message: TimeoutNow(TimeoutNow {
+                term: self.current_term(),
+                leader_id: self.id,
+            }),
+        }
+    }
+
+    /// True once `target` has replicated through the leader's current
+    /// log tail and can win a fresh election on log freshness.
+    fn transfer_target_is_caught_up(&self, target: NodeId) -> bool {
+        let leader_last = self
+            .state
+            .log
+            .last_log_id()
+            .map_or(LogIndex::ZERO, |l| l.index);
+        let RoleState::Leader(leader) = &self.state.role else {
+            return false;
+        };
+        leader.progress.match_for(target).is_some_and(|matched| matched >= leader_last)
+    }
+
+    /// If `peer` is the in-flight transfer target and is now fully
+    /// caught up, send `TimeoutNow` and clear the transfer request.
+    fn maybe_complete_leadership_transfer(&mut self, peer: NodeId) -> Vec<Action<C>> {
+        let RoleState::Leader(leader) = &self.state.role else {
+            return vec![];
+        };
+        if leader.transfer_target != Some(peer) || !self.transfer_target_is_caught_up(peer) {
+            return vec![];
+        }
+        if let RoleState::Leader(leader) = &mut self.state.role {
+            leader.transfer_target = None;
+        }
+        vec![self.timeout_now(peer)]
+    }
+
+    /// Handle an incoming `TimeoutNow` by starting an immediate
+    /// election if the request came from the leader we currently trust
+    /// for this term, or from a higher-term leader we just stepped
+    /// down for.
+    fn on_timeout_now(&mut self, request: TimeoutNow) -> Vec<Action<C>> {
+        // Only accept TimeoutNow from a node we already trust as leader
+        // for our current term. A stale/higher-term or unknown-source
+        // request must not force us to start an election — otherwise any
+        // node could dictate our term or disrupt the cluster.
+        if request.term != self.state.current_term {
+            return vec![];
+        }
+        let RoleState::Follower(follower) = &self.state.role else {
+            return vec![];
+        };
+        if follower.leader_id != Some(request.leader_id) {
+            return vec![];
+        }
+        self.start_election()
+    }
+
     // =========================================================================
     // Role transitions and the timer reset they delegate to
     // =========================================================================
@@ -1778,6 +1891,7 @@ impl<C: Clone> Engine<C> {
         self.state.role = RoleState::Leader(LeaderState {
             progress,
             snapshot_transfers: std::collections::BTreeMap::default(),
+            transfer_target: None,
         });
         telemetry::became_leader(self.id, self.state.current_term);
 

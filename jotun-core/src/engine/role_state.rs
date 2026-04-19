@@ -62,6 +62,9 @@ pub struct LeaderState {
     /// the first byte the follower has not yet acknowledged for the
     /// snapshot at `last_included`.
     pub(crate) snapshot_transfers: BTreeMap<NodeId, SnapshotTransfer>,
+    /// Leadership transfer target, if the current leader is trying to
+    /// hand off authority.
+    pub(crate) transfer_target: Option<NodeId>,
 }
 
 impl LeaderState {

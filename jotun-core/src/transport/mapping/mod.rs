@@ -1,5 +1,6 @@
 pub mod append_entries;
 pub mod install_snapshot;
+pub mod timeout_now;
 pub mod vote;
 
 #[cfg(test)]
@@ -66,6 +67,7 @@ impl<C: Into<Vec<u8>>> From<Message<C>> for proto::Message {
             Message::AppendEntriesResponse(m) => Kind::AppendEntriesResponse(m.into()),
             Message::InstallSnapshotRequest(m) => Kind::InstallSnapshotRequest(m.into()),
             Message::InstallSnapshotResponse(m) => Kind::InstallSnapshotResponse(m.into()),
+            Message::TimeoutNow(m) => Kind::TimeoutNow(m.into()),
         };
         Self { kind: Some(kind) }
     }
@@ -83,6 +85,7 @@ impl<C: From<Vec<u8>>> TryFrom<proto::Message> for Message<C> {
             Kind::AppendEntriesResponse(m) => Ok(Message::AppendEntriesResponse(m.try_into()?)),
             Kind::InstallSnapshotRequest(m) => Ok(Message::InstallSnapshotRequest(m.try_into()?)),
             Kind::InstallSnapshotResponse(m) => Ok(Message::InstallSnapshotResponse(m.try_into()?)),
+            Kind::TimeoutNow(m) => Ok(Message::TimeoutNow(m.try_into()?)),
         }
     }
 }

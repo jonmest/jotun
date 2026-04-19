@@ -45,6 +45,7 @@ pub use records::append_entries::{
 pub use records::install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot};
 pub use records::log_entry::{ConfigChange, LogEntry, LogPayload};
 pub use records::message::Message;
+pub use records::timeout_now::TimeoutNow;
 pub use records::vote::{RequestVote, VoteResponse, VoteResult};
 
 pub use types::index::LogIndex;
