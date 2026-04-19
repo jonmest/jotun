@@ -93,11 +93,8 @@ where
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
         let readers = Arc::new(StdMutex::new(Vec::new()));
 
-        let listener_task = tokio::spawn(accept_loop::<C>(
-            listener,
-            inbound_tx,
-            Arc::clone(&readers),
-        ));
+        let listener_task =
+            tokio::spawn(accept_loop::<C>(listener, inbound_tx, Arc::clone(&readers)));
 
         let mut peer_map: BTreeMap<NodeId, PeerLink> = BTreeMap::new();
         let mut writers = Vec::new();
@@ -147,7 +144,9 @@ async fn abort_and_join(handle: JoinHandle<()>) {
     match handle.await {
         Ok(()) => {}
         Err(e) if e.is_cancelled() => {}
-        Err(e) => debug!(target = "jotun::transport", error = %e, "background task exited with error during shutdown"),
+        Err(e) => {
+            debug!(target = "jotun::transport", error = %e, "background task exited with error during shutdown")
+        }
     }
 }
 
@@ -208,8 +207,7 @@ async fn accept_loop<C>(
     listener: TcpListener,
     inbound: mpsc::Sender<Incoming<C>>,
     readers: Arc<StdMutex<Vec<JoinHandle<()>>>>,
-)
-where
+) where
     C: Send + From<Vec<u8>> + 'static,
 {
     loop {

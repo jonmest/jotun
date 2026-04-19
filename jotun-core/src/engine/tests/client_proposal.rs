@@ -361,7 +361,15 @@ fn batch_appends_all_commands_in_one_persist() {
     // One AppendEntries send per peer (2 peers, so 2 sends).
     let sends: Vec<_> = actions
         .iter()
-        .filter(|a| matches!(a, Action::Send { message: Message::AppendEntriesRequest(_), .. }))
+        .filter(|a| {
+            matches!(
+                a,
+                Action::Send {
+                    message: Message::AppendEntriesRequest(_),
+                    ..
+                }
+            )
+        })
         .collect();
     assert_eq!(sends.len(), 2);
 }

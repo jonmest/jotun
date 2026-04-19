@@ -5,8 +5,8 @@ use super::fixtures::{
     append_entries_from, append_entries_request, append_entries_success_from,
     collect_append_entries, collect_apply_snapshots, collect_install_snapshots,
     collect_persist_snapshots, collect_snapshot_hints, follower, follower_with_env,
-    install_snapshot_from, install_snapshot_response_from, log_id, node, seed_log,
-    snapshot_taken, term, vote_response_from,
+    install_snapshot_from, install_snapshot_response_from, log_id, node, seed_log, snapshot_taken,
+    term, vote_response_from,
 };
 use crate::engine::action::Action;
 use crate::engine::engine::{Engine, EngineConfig};
@@ -14,8 +14,8 @@ use crate::engine::env::StaticEnv;
 use crate::engine::event::Event;
 use crate::engine::role_state::RoleState;
 use crate::records::log_entry::{LogEntry, LogPayload};
-use crate::types::log::LogId;
 use crate::types::index::LogIndex;
+use crate::types::log::LogId;
 use crate::types::term::Term;
 
 // ---------------------------------------------------------------------------
@@ -323,7 +323,14 @@ fn install_snapshot_response_advances_match_index_to_snapshot_floor() {
 fn higher_term_install_snapshot_response_demotes_leader() {
     let mut engine = leader_with_snapshot();
     let term_before = engine.current_term();
-    engine.step(install_snapshot_response_from(2, term_before.next().get(), 1, 1, 0, false));
+    engine.step(install_snapshot_response_from(
+        2,
+        term_before.next().get(),
+        1,
+        1,
+        0,
+        false,
+    ));
     assert!(matches!(engine.role(), RoleState::Follower(_)));
     assert_eq!(engine.current_term(), term_before.next());
 }
@@ -485,7 +492,16 @@ fn follower_install_snapshot_keeps_consistent_log_tail() {
     let mut engine = follower(1);
     seed_log(&mut engine, &[1, 1, 1, 1]);
 
-    engine.step(install_snapshot_from(2, 1, 2, 1, 2, 0, true, b"snap".to_vec()));
+    engine.step(install_snapshot_from(
+        2,
+        1,
+        2,
+        1,
+        2,
+        0,
+        true,
+        b"snap".to_vec(),
+    ));
 
     assert_eq!(engine.log().snapshot_last().index, LogIndex::new(2));
     // Entries 3, 4 still in memory.
@@ -509,7 +525,16 @@ fn follower_install_snapshot_below_existing_floor_is_a_noop() {
     assert_eq!(engine.log().snapshot_last().index, LogIndex::new(5));
 
     // Stale snapshot at 3.
-    let actions = engine.step(install_snapshot_from(2, 1, 3, 1, 3, 0, true, b"stale".to_vec()));
+    let actions = engine.step(install_snapshot_from(
+        2,
+        1,
+        3,
+        1,
+        3,
+        0,
+        true,
+        b"stale".to_vec(),
+    ));
     assert_eq!(
         engine.log().snapshot_last().index,
         LogIndex::new(5),
@@ -565,7 +590,16 @@ fn install_snapshot_at_higher_term_demotes_candidate_then_accepts() {
     engine.step(Event::Tick); // → Candidate at term 1
     assert!(matches!(engine.role(), RoleState::Candidate(_)));
 
-    engine.step(install_snapshot_from(2, 5, 1, 5, 1, 0, true, b"new".to_vec()));
+    engine.step(install_snapshot_from(
+        2,
+        5,
+        1,
+        5,
+        1,
+        0,
+        true,
+        b"new".to_vec(),
+    ));
 
     assert!(matches!(engine.role(), RoleState::Follower(_)));
     assert_eq!(engine.current_term(), term(5));
@@ -577,7 +611,16 @@ fn follower_buffers_chunked_snapshot_until_final_chunk() {
     let mut engine = follower(1);
     seed_log(&mut engine, &[1, 1]);
 
-    let first = engine.step(install_snapshot_from(2, 1, 5, 1, 5, 0, false, b"chunk-1".to_vec()));
+    let first = engine.step(install_snapshot_from(
+        2,
+        1,
+        5,
+        1,
+        5,
+        0,
+        false,
+        b"chunk-1".to_vec(),
+    ));
     assert!(
         collect_persist_snapshots(&first).is_empty(),
         "partial chunks must not be persisted as a complete snapshot",
@@ -600,7 +643,16 @@ fn follower_buffers_chunked_snapshot_until_final_chunk() {
     assert!(!response.done);
     assert_eq!(engine.log().snapshot_last().index, LogIndex::ZERO);
 
-    let second = engine.step(install_snapshot_from(2, 1, 5, 1, 5, 7, true, b"-done".to_vec()));
+    let second = engine.step(install_snapshot_from(
+        2,
+        1,
+        5,
+        1,
+        5,
+        7,
+        true,
+        b"-done".to_vec(),
+    ));
     assert_eq!(engine.log().snapshot_last().index, LogIndex::new(5));
     let persists = collect_persist_snapshots(&second);
     assert_eq!(persists.len(), 1);
@@ -613,7 +665,16 @@ fn follower_buffers_chunked_snapshot_until_final_chunk() {
 fn follower_reports_resume_offset_for_out_of_order_snapshot_chunk() {
     let mut engine = follower(1);
 
-    let actions = engine.step(install_snapshot_from(2, 1, 5, 1, 5, 4, false, b"tail".to_vec()));
+    let actions = engine.step(install_snapshot_from(
+        2,
+        1,
+        5,
+        1,
+        5,
+        4,
+        false,
+        b"tail".to_vec(),
+    ));
     let response = actions
         .iter()
         .find_map(|action| match action {

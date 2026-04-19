@@ -24,7 +24,11 @@ fn follower_with_known_leader_redirects_transfer_request() {
         2,
         append_entries_request(1, 2, None, vec![], 0),
     ));
-    assert!(actions.iter().any(|action| matches!(action, crate::engine::action::Action::Send { .. })));
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, crate::engine::action::Action::Send { .. }))
+    );
 
     let actions = engine.step(transfer_leadership(3));
     assert_eq!(collect_redirects(&actions), vec![node(2)]);

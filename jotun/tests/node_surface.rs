@@ -1,11 +1,7 @@
 //! Coverage for the newer runtime-facing `Node` surface: bootstrap
 //! semantics, `status()`, and proposal/config-change backpressure.
 
-#![allow(
-    clippy::expect_used,
-    clippy::missing_const_for_fn,
-    clippy::unwrap_used
-)]
+#![allow(clippy::expect_used, clippy::missing_const_for_fn, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -16,11 +12,10 @@ use std::time::Duration;
 use jotun::{
     Bootstrap, Config, ConfigError, DecodeError, Node, NodeId, NodeStartError, NodeStatus,
     ProposeError, ReadError, StateMachine, Storage, StoredHardState, StoredSnapshot,
-    Transport, TransferLeadershipError,
+    TransferLeadershipError, Transport,
 };
 use jotun_core::{
-    Incoming, LogEntry, LogIndex, LogPayload, Message, Term,
-    VoteResponse, VoteResult,
+    Incoming, LogEntry, LogIndex, LogPayload, Message, Term, VoteResponse, VoteResult,
 };
 use tokio::sync::mpsc;
 
@@ -286,7 +281,10 @@ impl TestTransport {
 
 impl TestTransportHandle {
     async fn inject(&self, incoming: Incoming<Vec<u8>>) {
-        self.inbound.send(incoming).await.expect("driver still alive");
+        self.inbound
+            .send(incoming)
+            .await
+            .expect("driver still alive");
     }
 
     fn sent(&self) -> Vec<(NodeId, Message<Vec<u8>>)> {
@@ -404,7 +402,10 @@ where
         if predicate(&status) {
             return status;
         }
-        assert!(start.elapsed() < deadline, "status predicate timed out: {status:?}");
+        assert!(
+            start.elapsed() < deadline,
+            "status predicate timed out: {status:?}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -426,23 +427,28 @@ async fn wait_for_replicated_payload<F>(
     handle: &TestTransportHandle,
     deadline: Duration,
     mut predicate: F,
-)
-where
+) where
     F: FnMut(&LogPayload<Vec<u8>>) -> bool,
 {
     let start = tokio::time::Instant::now();
     loop {
-        let seen = handle.sent().into_iter().any(|(_to, message)| match message {
-            Message::AppendEntriesRequest(request) => request
-                .entries
-                .iter()
-                .any(|entry| predicate(&entry.payload)),
-            _ => false,
-        });
+        let seen = handle
+            .sent()
+            .into_iter()
+            .any(|(_to, message)| match message {
+                Message::AppendEntriesRequest(request) => request
+                    .entries
+                    .iter()
+                    .any(|entry| predicate(&entry.payload)),
+                _ => false,
+            });
         if seen {
             return;
         }
-        assert!(start.elapsed() < deadline, "expected append payload was never sent");
+        assert!(
+            start.elapsed() < deadline,
+            "expected append payload was never sent"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -471,8 +477,10 @@ async fn start_three_node_leader(
         })
         .await;
 
-    let _ = wait_for_status(&node, Duration::from_secs(1), |status| status.role.to_string() == "leader")
-        .await;
+    let _ = wait_for_status(&node, Duration::from_secs(1), |status| {
+        status.role.to_string() == "leader"
+    })
+    .await;
 
     (node, handle)
 }
@@ -484,9 +492,14 @@ async fn bootstrap_new_cluster_uses_config_peers_authoritatively() {
     config.bootstrap = Bootstrap::NewCluster {
         members: vec![nid(1), nid(9)],
     };
-    let node = Node::start(config, Counter::default(), MemoryStorage::<Vec<u8>>::default(), transport)
-        .await
-        .unwrap();
+    let node = Node::start(
+        config,
+        Counter::default(),
+        MemoryStorage::<Vec<u8>>::default(),
+        transport,
+    )
+    .await
+    .unwrap();
 
     let status = node.status().await.unwrap();
     assert_eq!(status.peers, vec![nid(2), nid(3)]);
@@ -524,9 +537,14 @@ async fn bootstrap_join_starts_with_empty_peers() {
     let (transport, _handle) = TestTransport::new();
     let mut config = quiet_config(nid(1), [nid(2), nid(3)]);
     config.bootstrap = Bootstrap::Join;
-    let node = Node::start(config, Counter::default(), MemoryStorage::<Vec<u8>>::default(), transport)
-        .await
-        .unwrap();
+    let node = Node::start(
+        config,
+        Counter::default(),
+        MemoryStorage::<Vec<u8>>::default(),
+        transport,
+    )
+    .await
+    .unwrap();
 
     let status = node.status().await.unwrap();
     assert!(status.peers.is_empty());
@@ -640,7 +658,10 @@ async fn propose_returns_busy_when_pending_limit_is_reached() {
 
     node.shutdown().await.unwrap();
     let err = first.await.unwrap().unwrap_err();
-    assert!(matches!(err, ProposeError::DriverDead | ProposeError::Shutdown));
+    assert!(matches!(
+        err,
+        ProposeError::DriverDead | ProposeError::Shutdown
+    ));
 }
 
 #[tokio::test]
@@ -659,7 +680,10 @@ async fn config_change_returns_busy_when_pending_limit_is_reached() {
 
     node.shutdown().await.unwrap();
     let err = first.await.unwrap().unwrap_err();
-    assert!(matches!(err, ProposeError::DriverDead | ProposeError::Shutdown));
+    assert!(matches!(
+        err,
+        ProposeError::DriverDead | ProposeError::Shutdown
+    ));
 }
 
 #[tokio::test]
@@ -769,7 +793,9 @@ fn config_error_display_covers_every_variant() {
 #[test]
 fn propose_error_display_covers_every_variant() {
     let cases = [
-        ProposeError::NotLeader { leader_hint: nid(2) },
+        ProposeError::NotLeader {
+            leader_hint: nid(2),
+        },
         ProposeError::NoLeader,
         ProposeError::Shutdown,
         ProposeError::DriverDead,
@@ -780,22 +806,28 @@ fn propose_error_display_covers_every_variant() {
         assert!(!e.to_string().is_empty(), "empty display for {e:?}");
     }
     assert!(
-        ProposeError::NotLeader { leader_hint: nid(7) }
-            .to_string()
-            .contains('7'),
+        ProposeError::NotLeader {
+            leader_hint: nid(7)
+        }
+        .to_string()
+        .contains('7'),
         "leader_hint must surface in Display",
     );
     assert!(
-        ProposeError::Fatal { reason: "disk on fire" }
-            .to_string()
-            .contains("disk on fire"),
+        ProposeError::Fatal {
+            reason: "disk on fire"
+        }
+        .to_string()
+        .contains("disk on fire"),
     );
 }
 
 #[test]
 fn transfer_leadership_error_display_covers_every_variant() {
     let cases = [
-        TransferLeadershipError::NotLeader { leader_hint: nid(2) },
+        TransferLeadershipError::NotLeader {
+            leader_hint: nid(2),
+        },
         TransferLeadershipError::NoLeader,
         TransferLeadershipError::InvalidTarget { target: nid(9) },
         TransferLeadershipError::Shutdown,
@@ -815,7 +847,9 @@ fn transfer_leadership_error_display_covers_every_variant() {
 #[test]
 fn read_error_display_covers_every_variant() {
     let cases = [
-        ReadError::NotLeader { leader_hint: nid(2) },
+        ReadError::NotLeader {
+            leader_hint: nid(2),
+        },
         ReadError::NotReady,
         ReadError::SteppedDown,
         ReadError::Shutdown,
@@ -891,8 +925,7 @@ async fn transfer_leadership_from_follower_without_leader_returns_no_leader() {
     assert!(
         matches!(
             err,
-            TransferLeadershipError::NoLeader
-                | TransferLeadershipError::NotLeader { .. }
+            TransferLeadershipError::NoLeader | TransferLeadershipError::NotLeader { .. }
         ),
         "got {err:?}",
     );

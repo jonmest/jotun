@@ -9,9 +9,9 @@ use crate::records::append_entries::{
 };
 use crate::records::install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot};
 use crate::records::log_entry::{ConfigChange, LogEntry, LogPayload};
-use crate::records::timeout_now::TimeoutNow;
 #[allow(clippy::enum_glob_use)] // match-heavy file; variants are used unqualified throughout
 use crate::records::message::Message::*;
+use crate::records::timeout_now::TimeoutNow;
 use crate::records::vote::{RequestVote, VoteResponse, VoteResult};
 use crate::types::log::LogId;
 use crate::{
@@ -303,10 +303,10 @@ impl<C: Clone> Engine<C> {
                 .log
                 .install_snapshot(snap.last_included_index, snap.last_included_term);
             self.state.snapshot_bytes = Some(snap.bytes);
-        self.state.snapshot_peers = Some(snap.peers);
-        self.state.commit_index = snap.last_included_index;
-        self.state.last_applied = snap.last_included_index;
-    }
+            self.state.snapshot_peers = Some(snap.peers);
+            self.state.commit_index = snap.last_included_index;
+            self.state.last_applied = snap.last_included_index;
+        }
         if let Some(mut peers) = restored_peers {
             peers.remove(&self.id); // self is implicit
             self.state.peers = peers;
@@ -1456,7 +1456,9 @@ impl<C: Clone> Engine<C> {
         }
 
         let overlap = current_offset.saturating_sub(offset);
-        let overlap_len = usize::try_from(overlap).unwrap_or(usize::MAX).min(data.len());
+        let overlap_len = usize::try_from(overlap)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         let overlap_matches = start
             .checked_add(overlap_len)
@@ -1539,7 +1541,11 @@ impl<C: Clone> Engine<C> {
         out.push(Action::ApplySnapshot {
             bytes: pending.bytes,
         });
-        out.push(snapshot_ack(self.state.log.snapshot_last(), final_offset, true));
+        out.push(snapshot_ack(
+            self.state.log.snapshot_last(),
+            final_offset,
+            true,
+        ));
         out
     }
 
@@ -1777,7 +1783,9 @@ impl<C: Clone> Engine<C> {
         };
         let bytes = self.state.snapshot_bytes.as_deref().unwrap_or(&[]);
         let peers = self.state.snapshot_peers.clone().unwrap_or_default();
-        let start = usize::try_from(offset).unwrap_or(bytes.len()).min(bytes.len());
+        let start = usize::try_from(offset)
+            .unwrap_or(bytes.len())
+            .min(bytes.len());
         let end = start
             .saturating_add(self.snapshot_chunk_size_bytes)
             .min(bytes.len());
@@ -1853,7 +1861,10 @@ impl<C: Clone> Engine<C> {
         let RoleState::Leader(leader) = &self.state.role else {
             return false;
         };
-        leader.progress.match_for(target).is_some_and(|matched| matched >= leader_last)
+        leader
+            .progress
+            .match_for(target)
+            .is_some_and(|matched| matched >= leader_last)
     }
 
     /// If `peer` is the in-flight transfer target and is now fully

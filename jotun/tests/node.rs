@@ -512,11 +512,7 @@ async fn batched_concurrent_proposals_all_commit_in_order() {
         node.propose(CountCmd::Inc(20)),
         node.propose(CountCmd::Inc(30)),
     );
-    let results = [
-        a.expect("a"),
-        b.expect("b"),
-        c.expect("c"),
-    ];
+    let results = [a.expect("a"), b.expect("b"), c.expect("c")];
     let mut sorted = results;
     sorted.sort_unstable();
     assert_eq!(sorted, [10, 30, 60]);

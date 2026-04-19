@@ -245,7 +245,8 @@ impl<C: Clone + PartialEq> SafetyChecker<C> {
                 let mut agreement: Option<LogIndex> = None;
                 for k in (compare_from.get()..=max_shared.get()).rev() {
                     let idx = LogIndex::new(k);
-                    if let (Some(a_term), Some(b_term)) = (a.log().term_at(idx), b.log().term_at(idx))
+                    if let (Some(a_term), Some(b_term)) =
+                        (a.log().term_at(idx), b.log().term_at(idx))
                         && a_term == b_term
                     {
                         agreement = Some(idx);

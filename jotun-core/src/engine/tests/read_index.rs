@@ -85,7 +85,12 @@ fn follower_with_known_leader_redirects_read_request() {
     let actions = engine.step(propose_read(3));
     assert_eq!(
         collect_read_failed(&actions),
-        vec![(3, ReadFailure::NotLeader { leader_hint: node(2) })],
+        vec![(
+            3,
+            ReadFailure::NotLeader {
+                leader_hint: node(2)
+            }
+        )],
     );
 }
 

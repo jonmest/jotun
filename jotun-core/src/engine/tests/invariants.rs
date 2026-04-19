@@ -9,9 +9,9 @@
 use proptest::prelude::*;
 
 use super::fixtures::{
-    append_entries_from, append_entries_request, append_entries_success_from,
-    append_entries_conflict_from, client_proposal, follower_with_env, node,
-    vote_request, vote_request_from, vote_response_from,
+    append_entries_conflict_from, append_entries_from, append_entries_request,
+    append_entries_success_from, client_proposal, follower_with_env, node, vote_request,
+    vote_request_from, vote_response_from,
 };
 use crate::engine::env::{RandomizedEnv, StaticEnv};
 use crate::engine::event::Event;
@@ -25,11 +25,30 @@ use crate::types::{index::LogIndex, log::LogId, node::NodeId, term::Term};
 enum Input {
     Tick,
     Propose,
-    AppendEntriesFromPeer { peer: u64, term_n: u64, with_entry: bool },
-    AppendEntriesSuccess { peer: u64, term_n: u64, last_appended: u64 },
-    AppendEntriesConflict { peer: u64, term_n: u64, hint: u64 },
-    VoteRequestFrom { peer: u64, term_n: u64 },
-    VoteResponse { peer: u64, term_n: u64, granted: bool },
+    AppendEntriesFromPeer {
+        peer: u64,
+        term_n: u64,
+        with_entry: bool,
+    },
+    AppendEntriesSuccess {
+        peer: u64,
+        term_n: u64,
+        last_appended: u64,
+    },
+    AppendEntriesConflict {
+        peer: u64,
+        term_n: u64,
+        hint: u64,
+    },
+    VoteRequestFrom {
+        peer: u64,
+        term_n: u64,
+    },
+    VoteResponse {
+        peer: u64,
+        term_n: u64,
+        granted: bool,
+    },
 }
 
 fn input_strategy() -> impl Strategy<Value = Input> {
@@ -58,7 +77,11 @@ fn apply(engine: &mut crate::engine::engine::Engine<Vec<u8>>, input: &Input) {
     let event: Event<Vec<u8>> = match *input {
         Input::Tick => Event::Tick,
         Input::Propose => client_proposal(b"p"),
-        Input::AppendEntriesFromPeer { peer, term_n, with_entry } => {
+        Input::AppendEntriesFromPeer {
+            peer,
+            term_n,
+            with_entry,
+        } => {
             let entries = if with_entry {
                 vec![LogEntry {
                     id: LogId::new(LogIndex::new(1), Term::new(term_n.max(1))),
@@ -69,16 +92,22 @@ fn apply(engine: &mut crate::engine::engine::Engine<Vec<u8>>, input: &Input) {
             };
             append_entries_from(peer, append_entries_request(term_n, peer, None, entries, 0))
         }
-        Input::AppendEntriesSuccess { peer, term_n, last_appended } => {
-            append_entries_success_from(peer, term_n, last_appended)
-        }
+        Input::AppendEntriesSuccess {
+            peer,
+            term_n,
+            last_appended,
+        } => append_entries_success_from(peer, term_n, last_appended),
         Input::AppendEntriesConflict { peer, term_n, hint } => {
             append_entries_conflict_from(peer, term_n, hint)
         }
         Input::VoteRequestFrom { peer, term_n } => {
             vote_request_from(peer, vote_request(peer, term_n, None))
         }
-        Input::VoteResponse { peer, term_n, granted } => vote_response_from(peer, term_n, granted),
+        Input::VoteResponse {
+            peer,
+            term_n,
+            granted,
+        } => vote_response_from(peer, term_n, granted),
     };
     let _ = engine.step(event);
 }

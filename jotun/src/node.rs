@@ -36,8 +36,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jotun_core::{
-    Action, ConfigChange, Engine, EngineConfig, Env, Event, LogEntry, LogIndex, LogPayload,
-    NodeId, RandomizedEnv, RoleState, Term,
+    Action, ConfigChange, Engine, EngineConfig, Env, Event, LogEntry, LogIndex, LogPayload, NodeId,
+    RandomizedEnv, RoleState, Term,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -186,13 +186,9 @@ pub enum ConfigError {
         election_timeout_max_ticks: u64,
     },
     /// `peers` must exclude self; membership is always "other nodes".
-    PeersContainSelf {
-        node_id: NodeId,
-    },
+    PeersContainSelf { node_id: NodeId },
     /// Snapshot chunks must have a positive size.
-    InvalidSnapshotChunkSize {
-        snapshot_chunk_size_bytes: usize,
-    },
+    InvalidSnapshotChunkSize { snapshot_chunk_size_bytes: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -367,9 +363,7 @@ pub enum ProposeError {
     /// itself down after failing every in-flight proposal with
     /// this error — the caller's next call will see `Shutdown` or
     /// `DriverDead`.
-    Fatal {
-        reason: &'static str,
-    },
+    Fatal { reason: &'static str },
 }
 
 impl std::fmt::Display for ProposeError {
@@ -396,9 +390,7 @@ pub enum TransferLeadershipError {
     InvalidTarget { target: NodeId },
     Shutdown,
     DriverDead,
-    Fatal {
-        reason: &'static str,
-    },
+    Fatal { reason: &'static str },
 }
 
 impl std::fmt::Display for TransferLeadershipError {
@@ -582,7 +574,11 @@ impl<S: StateMachine> Node<S> {
 
         Ok(Self {
             inputs: inputs_tx,
-            background: Arc::new(Mutex::new(Some(BackgroundTasks { ticker, driver, apply }))),
+            background: Arc::new(Mutex::new(Some(BackgroundTasks {
+                ticker,
+                driver,
+                apply,
+            }))),
         })
     }
 
@@ -758,7 +754,11 @@ impl<S: StateMachine> Node<S> {
         let Some(background) = background else {
             return Ok(());
         };
-        let BackgroundTasks { ticker, driver, apply } = background;
+        let BackgroundTasks {
+            ticker,
+            driver,
+            apply,
+        } = background;
 
         ticker.abort();
         match ticker.await {
@@ -833,7 +833,10 @@ struct PendingRead<S: StateMachine> {
 /// One buffered proposal in the driver's batch: the encoded command
 /// bytes and the oneshot that will carry the apply response back to
 /// the user.
-type BatchEntry<S> = (Vec<u8>, oneshot::Sender<Result<<S as StateMachine>::Response, ProposeError>>);
+type BatchEntry<S> = (
+    Vec<u8>,
+    oneshot::Sender<Result<<S as StateMachine>::Response, ProposeError>>,
+);
 
 /// Unit of work the driver ships to the apply task. Every request
 /// mutates or observes the state machine in the order the driver
@@ -847,17 +850,13 @@ enum ApplyRequest<S: StateMachine> {
     },
     /// A linearizable read confirmed by the engine. Runs against the
     /// post-apply state machine.
-    Read {
-        reader: Box<dyn FnOnce(&S) + Send>,
-    },
+    Read { reader: Box<dyn FnOnce(&S) + Send> },
     /// Restore the state machine from snapshot bytes just installed.
     Restore { bytes: Vec<u8> },
     /// Produce a snapshot of current state. Reply carries the bytes.
     /// Ordered behind any preceding `Command` so the snapshot observes
     /// every applied entry up to this request.
-    TakeSnapshot {
-        reply: oneshot::Sender<Vec<u8>>,
-    },
+    TakeSnapshot { reply: oneshot::Sender<Vec<u8>> },
 }
 
 /// The apply task: owns the state machine, processes `ApplyRequest`s
@@ -1021,10 +1020,7 @@ where
     if let Some(bytes) = snapshot_bytes_for_sm {
         // Send.await won't fail: the apply task was spawned right
         // before driver_loop and hasn't had a reason to exit yet.
-        let _ = d
-            .apply_tx
-            .send(ApplyRequest::Restore { bytes })
-            .await;
+        let _ = d.apply_tx.send(ApplyRequest::Restore { bytes }).await;
     }
     // Mirror the engine's restored last_applied onto the driver's
     // NodeStatus cache.
@@ -1218,10 +1214,11 @@ where
     match d.engine.role() {
         RoleState::Leader(_) => {}
         RoleState::Follower(f) => {
-            let err = f.leader_id().map_or(
-                TransferLeadershipError::NoLeader,
-                |leader_hint| TransferLeadershipError::NotLeader { leader_hint },
-            );
+            let err = f
+                .leader_id()
+                .map_or(TransferLeadershipError::NoLeader, |leader_hint| {
+                    TransferLeadershipError::NotLeader { leader_hint }
+                });
             let _ = reply.send(Err(err));
             return Ok(());
         }
@@ -1263,13 +1260,16 @@ where
 {
     let id = d.next_read_id;
     d.next_read_id = d.next_read_id.wrapping_add(1);
-    d.pending_reads.insert(id, PendingRead { reader, on_failure });
+    d.pending_reads
+        .insert(id, PendingRead { reader, on_failure });
     let actions = d.engine.step(Event::ProposeRead { id });
     match dispatch_actions(d, actions).await {
         Ok(()) => Ok(()),
         Err(fatal) => {
             if let Some(pending) = d.pending_reads.remove(&id) {
-                (pending.on_failure)(ReadError::Fatal { reason: fatal.reason });
+                (pending.on_failure)(ReadError::Fatal {
+                    reason: fatal.reason,
+                });
             }
             Err(fatal)
         }
@@ -1527,7 +1527,10 @@ where
             };
             let reply = d.pending_proposals.remove(&entry.id.index);
             if d.apply_tx
-                .send(ApplyRequest::Command { command: cmd, reply })
+                .send(ApplyRequest::Command {
+                    command: cmd,
+                    reply,
+                })
                 .await
                 .is_err()
             {

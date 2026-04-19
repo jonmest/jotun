@@ -420,7 +420,9 @@ pub(super) fn client_proposal(command: &[u8]) -> Event<Vec<u8>> {
 }
 
 pub(super) fn transfer_leadership(target: u64) -> Event<Vec<u8>> {
-    Event::TransferLeadership { target: node(target) }
+    Event::TransferLeadership {
+        target: node(target),
+    }
 }
 
 pub(super) fn propose_read(id: u64) -> Event<Vec<u8>> {

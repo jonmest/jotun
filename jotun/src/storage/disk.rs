@@ -270,7 +270,6 @@ impl DiskStorage {
         });
         Ok(())
     }
-
 }
 
 /// Format a segment's filename from its starting index: zero-padded
@@ -709,7 +708,9 @@ async fn read_snapshot(
     let peer_count = u32::from_le_bytes(count_bytes) as usize;
     let expected_len = 20 + peer_count * 8;
     if meta.len() != expected_len {
-        return Err(DiskStorageError::Malformed("snapshot_meta.bin size mismatch"));
+        return Err(DiskStorageError::Malformed(
+            "snapshot_meta.bin size mismatch",
+        ));
     }
     let mut peers = std::collections::BTreeSet::new();
     for i in 0..peer_count {

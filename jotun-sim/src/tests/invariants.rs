@@ -34,11 +34,7 @@ fn cmd_entry(index: u64, term: u64, cmd: u64) -> LogEntry<u64> {
     }
 }
 
-fn recovered_node(
-    id: u64,
-    peers: Vec<NodeId>,
-    persisted: PersistedState<u64>,
-) -> NodeHarness<u64> {
+fn recovered_node(id: u64, peers: Vec<NodeId>, persisted: PersistedState<u64>) -> NodeHarness<u64> {
     let mut harness = NodeHarness::new(node(id), peers, 3, rng());
     harness.persisted = persisted;
     harness.crash();
@@ -145,7 +141,11 @@ fn log_matching_checks_post_snapshot_disagreement_above_snapshot_floor() {
             PersistedState {
                 current_term: Term::new(3),
                 voted_for: None,
-                log: vec![cmd_entry(3, 1, 30), cmd_entry(4, 2, 99), cmd_entry(5, 3, 50)],
+                log: vec![
+                    cmd_entry(3, 1, 30),
+                    cmd_entry(4, 2, 99),
+                    cmd_entry(5, 3, 50),
+                ],
                 snapshot: Some(PersistedSnapshot {
                     last_included_index: LogIndex::new(2),
                     last_included_term: Term::new(1),
@@ -157,7 +157,9 @@ fn log_matching_checks_post_snapshot_disagreement_above_snapshot_floor() {
     );
 
     let mut checker: SafetyChecker<u64> = SafetyChecker::new();
-    let err = checker.check(&nodes).expect_err("must detect mismatch above the floor");
+    let err = checker
+        .check(&nodes)
+        .expect_err("must detect mismatch above the floor");
     assert!(
         matches!(err, SafetyViolation::LogMismatch { index, .. } if index == LogIndex::new(4)),
         "wrong variant: {err:?}",

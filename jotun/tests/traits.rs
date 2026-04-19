@@ -13,9 +13,11 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-use jotun::{DecodeError, NodeId, StateMachine, Storage, StoredHardState, StoredSnapshot, Transport};
-use std::error::Error as _;
+use jotun::{
+    DecodeError, NodeId, StateMachine, Storage, StoredHardState, StoredSnapshot, Transport,
+};
 use jotun_core::{Incoming, LogEntry, LogIndex, Message, Term};
+use std::error::Error as _;
 
 // ---------------------------------------------------------------------------
 // Toy state machine
@@ -321,11 +323,7 @@ struct NopTransport;
 
 impl Transport<Vec<u8>> for NopTransport {
     type Error = Infallible;
-    async fn send(
-        &self,
-        _to: NodeId,
-        _message: Message<Vec<u8>>,
-    ) -> Result<(), Self::Error> {
+    async fn send(&self, _to: NodeId, _message: Message<Vec<u8>>) -> Result<(), Self::Error> {
         Ok(())
     }
     async fn recv(&mut self) -> Option<Incoming<Vec<u8>>> {

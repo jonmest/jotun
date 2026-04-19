@@ -57,9 +57,7 @@ pub enum Event<C> {
     /// starts an election immediately. Followers with a known leader
     /// emit [`crate::engine::action::Action::Redirect`]; followers
     /// without a known leader and candidates drop silently.
-    TransferLeadership {
-        target: NodeId,
-    },
+    TransferLeadership { target: NodeId },
     /// Linearizable read request (Raft §8 "`ReadIndex`").
     ///
     /// Leaders record `commit_index` as the read's `read_index`,
@@ -77,9 +75,7 @@ pub enum Event<C> {
     ///
     /// Non-leaders redirect (if leader is known) or fail the read
     /// with `NoLeader`.
-    ProposeRead {
-        id: u64,
-    },
+    ProposeRead { id: u64 },
     /// The host has just produced a snapshot of the application state
     /// machine that captures everything applied up to
     /// `last_included_index`. The engine truncates its in-memory log

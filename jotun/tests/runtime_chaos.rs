@@ -48,8 +48,14 @@ struct ChaosRng {
 
 impl ChaosRng {
     fn new(seed: u64) -> Self {
-        let s = if seed == 0 { 0xDEAD_BEEF_CAFE_F00D } else { seed };
-        Self { state: Arc::new(Mutex::new(s)) }
+        let s = if seed == 0 {
+            0xDEAD_BEEF_CAFE_F00D
+        } else {
+            seed
+        };
+        Self {
+            state: Arc::new(Mutex::new(s)),
+        }
     }
     fn next_u64(&self) -> u64 {
         let mut g = self.state.lock().unwrap();
@@ -61,7 +67,10 @@ impl ChaosRng {
         x
     }
     fn bernoulli(&self, numerator: u32, denominator: u32) -> bool {
-        (self.next_u64() as u32).checked_rem(denominator).unwrap_or(0) < numerator
+        (self.next_u64() as u32)
+            .checked_rem(denominator)
+            .unwrap_or(0)
+            < numerator
     }
 }
 
@@ -81,13 +90,22 @@ struct Policy {
 
 impl Policy {
     fn happy() -> Self {
-        Self { drop_percent: 0, max_delay_ms: 0 }
+        Self {
+            drop_percent: 0,
+            max_delay_ms: 0,
+        }
     }
     fn lossy(drop_percent: u32) -> Self {
-        Self { drop_percent, max_delay_ms: 0 }
+        Self {
+            drop_percent,
+            max_delay_ms: 0,
+        }
     }
     fn chaotic(drop_percent: u32, max_delay_ms: u64) -> Self {
-        Self { drop_percent, max_delay_ms }
+        Self {
+            drop_percent,
+            max_delay_ms,
+        }
     }
 }
 
@@ -172,7 +190,11 @@ impl ChaosTransport {
     fn start(me: NodeId, network: Network) -> Self {
         let (tx, rx) = mpsc::channel::<Incoming<Vec<u8>>>(1024);
         network.register(me, tx);
-        Self { me, network, inbound_rx: rx }
+        Self {
+            me,
+            network,
+            inbound_rx: rx,
+        }
     }
 }
 
@@ -276,7 +298,10 @@ impl Storage<Vec<u8>> for MemoryStorage {
     }
     async fn append_log(&mut self, entries: Vec<LogEntry<Vec<u8>>>) -> Result<(), Self::Error> {
         let mut g = self.inner.lock().unwrap();
-        let snap_floor = g.snapshot.as_ref().map_or(0, |s| s.last_included_index.get());
+        let snap_floor = g
+            .snapshot
+            .as_ref()
+            .map_or(0, |s| s.last_included_index.get());
         for entry in entries {
             let i = entry.id.index.get();
             if i <= snap_floor {
@@ -295,7 +320,10 @@ impl Storage<Vec<u8>> for MemoryStorage {
     }
     async fn truncate_log(&mut self, from: LogIndex) -> Result<(), Self::Error> {
         let mut g = self.inner.lock().unwrap();
-        let snap_floor = g.snapshot.as_ref().map_or(0, |s| s.last_included_index.get());
+        let snap_floor = g
+            .snapshot
+            .as_ref()
+            .map_or(0, |s| s.last_included_index.get());
         let Ok(local) = usize::try_from(from.get().saturating_sub(snap_floor + 1)) else {
             return Ok(());
         };
@@ -362,10 +390,16 @@ impl Cluster {
             nodes.push(ClusterNode { id, node });
         }
 
-        Self { nodes, network, observed }
+        Self {
+            nodes,
+            network,
+            observed,
+        }
     }
 
-    fn nodes(&self) -> &[ClusterNode] { &self.nodes }
+    fn nodes(&self) -> &[ClusterNode] {
+        &self.nodes
+    }
 
     /// Leader from any node's view. Returns Some(id) if every node
     /// that thinks there's a leader agrees, else None.
@@ -416,7 +450,9 @@ impl Cluster {
     /// node has seen via `status()` and tracks which have been claimed.
     async fn check_election_safety(&self, leaders_by_term: &mut BTreeMap<Term, NodeId>) {
         for n in &self.nodes {
-            let Ok(s) = n.node.status().await else { continue };
+            let Ok(s) = n.node.status().await else {
+                continue;
+            };
             if s.role.to_string() == "leader" {
                 match leaders_by_term.get(&s.current_term) {
                     None => {
@@ -525,7 +561,10 @@ async fn partition_heal_cluster_recovers_and_commits() {
 
     // Commit through the remaining majority.
     let v = cluster.propose_on(initial_leader, CountCmd(1)).await;
-    assert!(v.is_ok(), "proposal failed with one follower partitioned: {v:?}");
+    assert!(
+        v.is_ok(),
+        "proposal failed with one follower partitioned: {v:?}"
+    );
 
     cluster.network.heal();
     tokio::time::sleep(Duration::from_millis(300)).await;

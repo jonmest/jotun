@@ -190,9 +190,7 @@ async fn peer_restart_on_same_port_is_survived_by_reconnect() {
 
     // Restart b on the same port. The writer in `a` should reconnect
     // once b is back up.
-    let mut b2: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b)
-        .await
-        .unwrap();
+    let mut b2: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b).await.unwrap();
     // Send is best-effort: a failed write drops the message. Race
     // send-loop against recv — the writer in `a` will reconnect
     // once b2's listener is up, and the next enqueued frame flushes.
@@ -322,8 +320,7 @@ async fn shutdown_aborts_owned_tasks() {
     let mut peers_a = BTreeMap::new();
     peers_a.insert(nid(2), addr_b);
 
-    let mut a: TcpTransport<Vec<u8>> =
-        TcpTransport::start(nid(1), addr_a, peers_a).await.unwrap();
+    let mut a: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr_a, peers_a).await.unwrap();
 
     // Open an inbound connection from a naked TCP client to spawn a
     // reader task we can observe being aborted.

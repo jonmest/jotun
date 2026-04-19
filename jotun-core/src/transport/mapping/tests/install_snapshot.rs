@@ -9,7 +9,8 @@ fn valid_proto_request_install_snapshot() -> impl Strategy<Value = proto::Reques
     strategies::request_install_snapshot().prop_map(proto::RequestInstallSnapshot::from)
 }
 
-fn valid_proto_install_snapshot_response() -> impl Strategy<Value = proto::InstallSnapshotResponse> {
+fn valid_proto_install_snapshot_response() -> impl Strategy<Value = proto::InstallSnapshotResponse>
+{
     strategies::install_snapshot_response().prop_map(proto::InstallSnapshotResponse::from)
 }
 
@@ -116,10 +117,7 @@ fn request_install_snapshot_zero_peer_id_rejected() {
         offset: 0,
         done: true,
         leader_commit: 1,
-        peers: vec![
-            proto::NodeIdRef { id: 3 },
-            proto::NodeIdRef { id: 0 },
-        ],
+        peers: vec![proto::NodeIdRef { id: 3 }, proto::NodeIdRef { id: 0 }],
     };
     let err = RequestInstallSnapshot::try_from(p).unwrap_err();
     assert_eq!(err, ConvertError::ZeroNodeId);
@@ -145,8 +143,9 @@ fn request_install_snapshot_with_populated_peers_roundtrips() {
         leader_commit: crate::types::index::LogIndex::new(10),
         peers: peers.clone(),
     };
-    let round: RequestInstallSnapshot =
-        proto::RequestInstallSnapshot::from(r.clone()).try_into().unwrap();
+    let round: RequestInstallSnapshot = proto::RequestInstallSnapshot::from(r.clone())
+        .try_into()
+        .unwrap();
     assert_eq!(r, round);
     assert_eq!(round.peers, peers);
 }
