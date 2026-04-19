@@ -250,3 +250,113 @@ impl<C> Log<C> {
     #[cfg(not(debug_assertions))]
     pub(crate) fn check_invariants(&self) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::records::log_entry::LogPayload;
+
+    fn idx(n: u64) -> LogIndex {
+        LogIndex::new(n)
+    }
+    fn term(n: u64) -> Term {
+        Term::new(n)
+    }
+    fn entry(index: u64, term_n: u64) -> LogEntry<Vec<u8>> {
+        LogEntry {
+            id: LogId::new(idx(index), term(term_n)),
+            payload: LogPayload::Command(Vec::new()),
+        }
+    }
+
+    // ---------------- is_empty / len ----------------
+
+    #[test]
+    fn fresh_log_is_empty() {
+        let log: Log<Vec<u8>> = Log::new();
+        assert!(log.is_empty());
+        assert_eq!(log.len(), 0);
+    }
+
+    #[test]
+    fn log_with_entries_is_not_empty() {
+        let mut log: Log<Vec<u8>> = Log::new();
+        log.append(entry(1, 1));
+        assert!(!log.is_empty());
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn log_is_empty_tracks_in_memory_entries_only() {
+        // After a snapshot install that wipes the in-memory tail,
+        // is_empty() is true even though the log has "history" via
+        // snapshot_last.
+        let mut log: Log<Vec<u8>> = Log::new();
+        log.install_snapshot(idx(5), term(2));
+        assert!(log.is_empty());
+        assert_eq!(log.snapshot_last().index, idx(5));
+    }
+
+    // ---------------- truncate_from ----------------
+
+    #[test]
+    fn truncate_from_drops_entries_at_and_after_index() {
+        let mut log: Log<Vec<u8>> = Log::new();
+        for i in 1..=5 {
+            log.append(entry(i, 1));
+        }
+        log.truncate_from(idx(3));
+        // Entries 1 and 2 survive; 3, 4, 5 are gone.
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.last_log_id().unwrap().index, idx(2));
+        assert!(log.entry_at(idx(3)).is_none());
+    }
+
+    #[test]
+    fn truncate_from_at_first_index_drops_everything() {
+        let mut log: Log<Vec<u8>> = Log::new();
+        log.append(entry(1, 1));
+        log.append(entry(2, 1));
+        log.truncate_from(idx(1));
+        assert_eq!(log.len(), 0);
+        assert!(log.last_log_id().is_none());
+    }
+
+    #[test]
+    fn truncate_from_past_tail_is_noop() {
+        let mut log: Log<Vec<u8>> = Log::new();
+        log.append(entry(1, 1));
+        log.append(entry(2, 1));
+        log.truncate_from(idx(99));
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn truncate_from_below_snapshot_floor_is_noop() {
+        // Snapshot floor at 5, in-memory entries 6..=8. Truncate from
+        // index 3 (below floor) must not disturb anything.
+        let mut log: Log<Vec<u8>> = Log::new();
+        log.install_snapshot(idx(5), term(1));
+        log.append(entry(6, 1));
+        log.append(entry(7, 1));
+        log.append(entry(8, 1));
+        log.truncate_from(idx(3));
+        assert_eq!(log.len(), 3);
+    }
+
+    #[test]
+    fn truncate_from_just_above_snapshot_floor_drops_everything() {
+        // Snapshot floor at 5; entries 6..=8 in memory. Truncating
+        // from exactly 6 (floor+1) drops all three.
+        let mut log: Log<Vec<u8>> = Log::new();
+        log.install_snapshot(idx(5), term(1));
+        log.append(entry(6, 1));
+        log.append(entry(7, 1));
+        log.append(entry(8, 1));
+        log.truncate_from(idx(6));
+        assert_eq!(log.len(), 0);
+        // snapshot_last is unchanged — truncate_from only touches the
+        // in-memory tail.
+        assert_eq!(log.snapshot_last().index, idx(5));
+    }
+}

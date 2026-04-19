@@ -327,6 +327,80 @@ mod tests {
         assert_eq!(pp.majority_index(idx(7)), idx(5));
     }
 
+    #[test]
+    fn majority_index_pins_lower_middle_not_upper() {
+        // Leader + 3 peers = 4 total, distinct matchIndex values so the
+        // lower-middle (pos 1) and upper-middle (pos 2) disagree. Pins
+        // the `(len - 1) / 2` indexing against the upper-middle mutant.
+        let peers = [node(2), node(3), node(4)];
+        let mut pp = PeerProgress::new(peers, idx(7));
+        pp.record_success(node(2), idx(3));
+        pp.record_success(node(3), idx(5));
+        pp.record_success(node(4), idx(2));
+        // Sorted values: [2, 3, 5, 7]. Pos 1 = 3 (three of four ≥ 3).
+        // Upper-middle would be 5, but only two of four are ≥ 5, so 5
+        // is NOT a safe commit point.
+        assert_eq!(pp.majority_index(idx(7)), idx(3));
+    }
+
+    // ---------------- record_success vs stale after conflict ----------------
+
+    #[test]
+    fn stale_record_success_does_not_rewind_next_index_after_conflict() {
+        // After a successful replication, matchIndex=5, nextIndex=6. A
+        // later conflict jumps nextIndex down to 3 to probe the peer's
+        // log. A stale in-flight Success with last_appended=5 arrives.
+        // matchIndex must stay 5 AND nextIndex must stay 3 — if we
+        // accepted the stale ack (as `>=` would), nextIndex would
+        // snap back to 6 and we'd re-send entries we're still probing.
+        let peer = node(2);
+        let mut pp = PeerProgress::new([peer], idx(10));
+        pp.record_success(peer, idx(5));
+        pp.record_conflict(peer, idx(3));
+        assert_eq!(pp.next_for(peer), Some(idx(3)));
+        pp.record_success(peer, idx(5));
+        assert_eq!(pp.match_for(peer), Some(idx(5)));
+        assert_eq!(
+            pp.next_for(peer),
+            Some(idx(3)),
+            "stale Success must not rewind nextIndex past a live conflict",
+        );
+    }
+
+    // ---------------- ensure_next_at_least ----------------
+
+    #[test]
+    fn ensure_next_at_least_raises_when_below_floor() {
+        let mut pp = PeerProgress::new([node(2)], idx(10));
+        pp.record_conflict(node(2), idx(3));
+        assert_eq!(pp.next_for(node(2)), Some(idx(3)));
+        pp.ensure_next_at_least(node(2), idx(7));
+        assert_eq!(pp.next_for(node(2)), Some(idx(7)));
+    }
+
+    #[test]
+    fn ensure_next_at_least_is_noop_when_already_at_floor() {
+        let mut pp = PeerProgress::new([node(2)], idx(10));
+        // Default nextIndex = 11.
+        pp.ensure_next_at_least(node(2), idx(11));
+        assert_eq!(pp.next_for(node(2)), Some(idx(11)));
+    }
+
+    #[test]
+    fn ensure_next_at_least_is_noop_when_above_floor() {
+        let mut pp = PeerProgress::new([node(2)], idx(10));
+        // Default nextIndex = 11. floor=5 is below; next must not rewind.
+        pp.ensure_next_at_least(node(2), idx(5));
+        assert_eq!(pp.next_for(node(2)), Some(idx(11)));
+    }
+
+    #[test]
+    fn ensure_next_at_least_ignores_unknown_peer() {
+        let mut pp = PeerProgress::new([node(2)], idx(10));
+        pp.ensure_next_at_least(node(99), idx(5));
+        assert_eq!(pp.next_for(node(99)), None);
+    }
+
     // ---------------- property: matchIndex monotonic ----------------
 
     proptest! {

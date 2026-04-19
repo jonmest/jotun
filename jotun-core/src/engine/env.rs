@@ -107,3 +107,75 @@ impl Env for ScriptedEnv {
         v
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn randomized_env_stays_within_range() {
+        let mut env = RandomizedEnv::new(12345, 10, 20);
+        for _ in 0..1000 {
+            let v = env.next_election_timeout();
+            assert!((10..20).contains(&v), "out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn randomized_env_covers_full_range() {
+        // Over many draws we should hit every value in [min, max).
+        // Pins both the `%` division and the `min + ...` shift.
+        let mut env = RandomizedEnv::new(42, 5, 9);
+        let mut seen = BTreeSet::new();
+        for _ in 0..2000 {
+            seen.insert(env.next_election_timeout());
+        }
+        assert_eq!(seen, BTreeSet::from([5, 6, 7, 8]));
+    }
+
+    #[test]
+    fn randomized_env_is_not_constant() {
+        // Catches a `next_election_timeout -> 0` or `-> 1` mutant.
+        let mut env = RandomizedEnv::new(1, 100, 200);
+        let first = env.next_election_timeout();
+        let mut saw_different = false;
+        for _ in 0..50 {
+            if env.next_election_timeout() != first {
+                saw_different = true;
+                break;
+            }
+        }
+        assert!(saw_different, "RNG produced constant output");
+    }
+
+    #[test]
+    fn randomized_env_uses_seed() {
+        // Two different seeds must produce different sequences.
+        let mut a = RandomizedEnv::new(1, 0, 1000);
+        let mut b = RandomizedEnv::new(2, 0, 1000);
+        let seq_a: Vec<u64> = (0..10).map(|_| a.next_election_timeout()).collect();
+        let seq_b: Vec<u64> = (0..10).map(|_| b.next_election_timeout()).collect();
+        assert_ne!(seq_a, seq_b);
+    }
+
+    #[test]
+    fn randomized_env_zero_seed_does_not_lock() {
+        // xorshift has a fixed point at 0. Seed=0 must be remapped.
+        let mut env = RandomizedEnv::new(0, 0, 100);
+        let mut seen = BTreeSet::new();
+        for _ in 0..200 {
+            seen.insert(env.next_election_timeout());
+        }
+        assert!(seen.len() > 1, "RNG stuck at a single value for seed=0");
+    }
+
+    #[test]
+    fn randomized_env_is_deterministic_for_seed() {
+        let mut a = RandomizedEnv::new(99, 0, 1_000_000);
+        let mut b = RandomizedEnv::new(99, 0, 1_000_000);
+        for _ in 0..100 {
+            assert_eq!(a.next_election_timeout(), b.next_election_timeout());
+        }
+    }
+}
