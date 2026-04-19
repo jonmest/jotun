@@ -153,6 +153,14 @@ pub struct Config {
     /// replication while the state machine catches up. Defaults to
     /// 4096.
     pub max_pending_applies: usize,
+    /// Maximum ticks the driver will hold a proposal before flushing
+    /// the batch. `0` disables batching — every proposal triggers its
+    /// own log append and broadcast. Defaults to `0`.
+    pub max_batch_delay_ticks: u64,
+    /// Flush the current batch as soon as it reaches this many
+    /// buffered proposals, regardless of `max_batch_delay_ticks`.
+    /// Has no effect when `max_batch_delay_ticks == 0`. Defaults to 64.
+    pub max_batch_entries: usize,
     /// Applied-entry threshold for automatic snapshot hints. `0`
     /// disables host-initiated snapshotting in the runtime; incoming
     /// leader snapshots still install normally.
@@ -248,6 +256,8 @@ impl Config {
             bootstrap,
             max_pending_proposals: 1024,
             max_pending_applies: 4096,
+            max_batch_delay_ticks: 0,
+            max_batch_entries: 64,
             snapshot_hint_threshold_entries: 1024,
             snapshot_chunk_size_bytes: 64 * 1024,
         }
@@ -562,6 +572,10 @@ impl<S: StateMachine> Node<S> {
             max_pending_proposals,
             pending_reads: HashMap::new(),
             next_read_id: 0,
+            batch_buffer: Vec::new(),
+            batch_delay_remaining: 0,
+            max_batch_delay_ticks: config.max_batch_delay_ticks,
+            max_batch_entries: config.max_batch_entries,
             last_applied: LogIndex::ZERO,
         };
         let driver: JoinHandle<()> = tokio::spawn(driver_loop(driver_state, recovered));
@@ -794,6 +808,16 @@ struct Driver<S: StateMachine, St, Tr> {
     pending_reads: HashMap<u64, PendingRead<S>>,
     /// Monotonic counter that generates read ids.
     next_read_id: u64,
+    /// Buffered (`command_bytes`, reply) pairs awaiting a batch flush.
+    /// Only used when `max_batch_delay_ticks > 0`.
+    batch_buffer: Vec<BatchEntry<S>>,
+    /// Ticks remaining before the current batch is flushed. `0` with
+    /// an empty buffer means "no batch in flight".
+    batch_delay_remaining: u64,
+    /// Mirror of `Config::max_batch_delay_ticks`.
+    max_batch_delay_ticks: u64,
+    /// Mirror of `Config::max_batch_entries`.
+    max_batch_entries: usize,
     /// Highest log index the driver has fed into the state machine.
     /// Mirrors the engine's own `last_applied` but the engine doesn't
     /// expose it publicly, so we track it from the Apply actions we
@@ -805,6 +829,11 @@ struct PendingRead<S: StateMachine> {
     reader: Box<dyn FnOnce(&S) + Send>,
     on_failure: Box<dyn FnOnce(ReadError) + Send>,
 }
+
+/// One buffered proposal in the driver's batch: the encoded command
+/// bytes and the oneshot that will carry the apply response back to
+/// the user.
+type BatchEntry<S> = (Vec<u8>, oneshot::Sender<Result<<S as StateMachine>::Response, ProposeError>>);
 
 /// Unit of work the driver ships to the apply task. Every request
 /// mutates or observes the state machine in the order the driver
@@ -907,7 +936,7 @@ where
             input = d.inputs.recv() => {
                 let Some(input) = input else { return };
                 match input {
-                    DriverInput::Tick => step_and_dispatch(&mut d, Event::Tick).await,
+                    DriverInput::Tick => handle_tick(&mut d).await,
                     DriverInput::Propose { command, reply } => {
                         handle_propose(&mut d, command, reply).await
                     }
@@ -926,6 +955,9 @@ where
                     }
                     DriverInput::Shutdown { reply } => {
                         debug!(target = "jotun::node", "shutdown requested");
+                        // Best-effort flush of any buffered proposals so
+                        // waiters see their result rather than dropping.
+                        let _ = flush_batch(&mut d).await;
                         d.transport.shutdown().await;
                         let _ = reply.send(());
                         return;
@@ -1017,10 +1049,27 @@ where
         let _ = reply.send(Err(ProposeError::Busy));
         return Ok(());
     }
+
+    let bytes = S::encode_command(&command);
+
+    // Batching path: buffer until cap or tick flush. Skip when the
+    // caller is a non-leader — we still need to return a redirect
+    // synchronously, so dry-step the engine with the single command
+    // to observe its role response.
+    if d.max_batch_delay_ticks > 0 && matches!(d.engine.role(), RoleState::Leader(_)) {
+        d.batch_buffer.push((bytes, reply));
+        if d.batch_delay_remaining == 0 {
+            d.batch_delay_remaining = d.max_batch_delay_ticks;
+        }
+        if d.batch_buffer.len() >= d.max_batch_entries {
+            return flush_batch(d).await;
+        }
+        return Ok(());
+    }
+
     // Encode the command, then drive ClientProposal. The next
     // PersistLogEntries action (if any) tells us the assigned index;
     // we register the reply oneshot at that index.
-    let bytes = S::encode_command(&command);
     let last_before = d
         .engine
         .log()
@@ -1045,6 +1094,71 @@ where
             leader_hint: h,
         });
         let _ = reply.send(Err(err));
+    }
+
+    dispatch_actions(d, actions).await
+}
+
+/// Flush the driver's proposal batch as a single
+/// `Event::ClientProposalBatch`. Replies are registered at the log
+/// indices the engine assigned, in batch order. If we've since lost
+/// the leader role (for example a step-down happened between the
+/// last `handle_propose` call and this flush), every pending reply
+/// fails with `NotLeader`/`NoLeader`.
+async fn flush_batch<S, St, Tr>(d: &mut Driver<S, St, Tr>) -> Result<(), Fatal>
+where
+    S: StateMachine,
+    St: Storage<Vec<u8>>,
+    Tr: Transport<Vec<u8>>,
+{
+    if d.batch_buffer.is_empty() {
+        d.batch_delay_remaining = 0;
+        return Ok(());
+    }
+    let drained: Vec<BatchEntry<S>> = std::mem::take(&mut d.batch_buffer);
+    d.batch_delay_remaining = 0;
+
+    let (commands, replies): (Vec<Vec<u8>>, Vec<_>) = drained.into_iter().unzip();
+    let last_before = d
+        .engine
+        .log()
+        .last_log_id()
+        .map_or(LogIndex::ZERO, |l| l.index);
+    let actions = d.engine.step(Event::ClientProposalBatch(commands));
+    let last_after = d
+        .engine
+        .log()
+        .last_log_id()
+        .map_or(LogIndex::ZERO, |l| l.index);
+
+    let appended = last_after.get().saturating_sub(last_before.get());
+    if appended == u64::try_from(replies.len()).unwrap_or(0) && appended > 0 {
+        // Engine appended every buffered command at indices
+        // [last_before+1 .. last_after]; register each reply at its
+        // index in the same order.
+        for (offset, reply) in replies.into_iter().enumerate() {
+            let idx = LogIndex::new(
+                last_before
+                    .get()
+                    .saturating_add(1)
+                    .saturating_add(u64::try_from(offset).unwrap_or(0)),
+            );
+            d.pending_proposals.insert(idx, reply);
+        }
+    } else {
+        // Engine did not accept the batch — we stepped down between
+        // buffering and flush, or the batch was dropped. Fail each
+        // waiter with a redirect or NoLeader.
+        let leader_hint = actions.iter().find_map(|a| match a {
+            Action::Redirect { leader_hint } => Some(*leader_hint),
+            _ => None,
+        });
+        for reply in replies {
+            let err = leader_hint.map_or(ProposeError::NoLeader, |h| ProposeError::NotLeader {
+                leader_hint: h,
+            });
+            let _ = reply.send(Err(err));
+        }
     }
 
     dispatch_actions(d, actions).await
@@ -1185,6 +1299,25 @@ where
 {
     let actions = d.engine.step(event);
     dispatch_actions(d, actions).await
+}
+
+/// Tick handler. Also drives the proposal-batch timer: if batching
+/// is enabled and the delay has elapsed, flush the buffer before
+/// stepping the engine so batched proposals appear in this tick's
+/// replication broadcast.
+async fn handle_tick<S, St, Tr>(d: &mut Driver<S, St, Tr>) -> Result<(), Fatal>
+where
+    S: StateMachine,
+    St: Storage<Vec<u8>>,
+    Tr: Transport<Vec<u8>>,
+{
+    if d.batch_delay_remaining > 0 {
+        d.batch_delay_remaining -= 1;
+        if d.batch_delay_remaining == 0 && !d.batch_buffer.is_empty() {
+            flush_batch(d).await?;
+        }
+    }
+    step_and_dispatch(d, Event::Tick).await
 }
 
 #[allow(clippy::too_many_lines)]

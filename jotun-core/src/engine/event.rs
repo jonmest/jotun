@@ -31,6 +31,17 @@ pub enum Event<C> {
     ///  - **Follower** without a known leader, or **Candidate**: drops
     ///    silently. The host should retry on its own cadence.
     ClientProposal(C),
+    /// A batch of proposals the host coalesced to reduce fsync /
+    /// broadcast amplification. Semantically equivalent to issuing
+    /// each `ClientProposal` in order, but produces a single
+    /// `Action::PersistLogEntries` (one fsync) and a single
+    /// `AppendEntries` broadcast per peer.
+    ///
+    /// Each entry is appended at consecutive `(last+1, last+2, ...)`
+    /// indices. Non-leaders handle the batch the same way they
+    /// handle a single proposal: redirect if a leader is known, else
+    /// drop.
+    ClientProposalBatch(Vec<C>),
     /// Operator-initiated single-server membership change (§4.3).
     ///
     /// Same role-by-role behaviour as `ClientProposal`, with one extra

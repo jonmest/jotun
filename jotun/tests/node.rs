@@ -478,6 +478,52 @@ impl StateMachine for SlowCounter {
     }
 }
 
+#[tokio::test]
+async fn batched_concurrent_proposals_all_commit_in_order() {
+    let tmp = TmpDir::new("batch");
+    let storage = DiskStorage::open(&tmp.0).await.unwrap();
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let transport: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut config = Config::new(nid(1), std::iter::empty::<NodeId>());
+    config.election_timeout_min_ticks = 3;
+    config.election_timeout_max_ticks = 5;
+    config.heartbeat_interval_ticks = 1;
+    config.tick_interval = Duration::from_millis(10);
+    // Batching on: 2-tick delay, flush at 4 buffered.
+    config.max_batch_delay_ticks = 2;
+    config.max_batch_entries = 4;
+
+    let node = Node::start(config, Counter::default(), storage, transport)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Fire 3 concurrent proposals. The driver buffers them; either
+    // the size cap (unreached, 3 < 4) fires or the tick-based flush
+    // does after 2 ticks (~20ms). Either way, all three commit in
+    // submission order and each returns the cumulative counter value.
+    let (a, b, c) = tokio::join!(
+        node.propose(CountCmd::Inc(10)),
+        node.propose(CountCmd::Inc(20)),
+        node.propose(CountCmd::Inc(30)),
+    );
+    let results = [
+        a.expect("a"),
+        b.expect("b"),
+        c.expect("c"),
+    ];
+    let mut sorted = results;
+    sorted.sort_unstable();
+    assert_eq!(sorted, [10, 30, 60]);
+
+    node.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_apply_does_not_stall_driver_status() {
     let tmp = TmpDir::new("slow-apply");

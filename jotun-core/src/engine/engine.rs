@@ -471,6 +471,7 @@ impl<C: Clone> Engine<C> {
             Event::Tick => self.on_tick(),
             Event::Incoming(incoming) => self.on_incoming(incoming),
             Event::ClientProposal(command) => self.on_client_proposal(command),
+            Event::ClientProposalBatch(commands) => self.on_client_proposal_batch(commands),
             Event::ProposeConfigChange(change) => self.on_propose_config_change(change),
             Event::TransferLeadership { target } => self.on_transfer_leadership(target),
             Event::ProposeRead { id } => self.on_propose_read(id),
@@ -622,6 +623,27 @@ impl<C: Clone> Engine<C> {
     ///    leader this term): drop — the host should retry.
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_client_proposal(&mut self, command: C) -> Vec<Action<C>> {
+        self.append_commands_as_leader(vec![command])
+    }
+
+    /// Batched equivalent of [`Self::on_client_proposal`]. Appends
+    /// every command at consecutive indices with a single
+    /// `PersistLogEntries` Action and a single broadcast per peer.
+    #[instrument(target = "jotun::engine", skip_all)]
+    fn on_client_proposal_batch(&mut self, commands: Vec<C>) -> Vec<Action<C>> {
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        self.append_commands_as_leader(commands)
+    }
+
+    /// Shared leader-side append path for one or more client commands.
+    /// Non-leaders redirect (known leader) or drop. On leader, appends
+    /// every command at consecutive `(last+1, last+2, ...)` indices
+    /// under the current term, emits one `PersistLogEntries` for the
+    /// batch, broadcasts once to all peers, and tries to advance
+    /// commit (single-node path).
+    fn append_commands_as_leader(&mut self, commands: Vec<C>) -> Vec<Action<C>> {
         match &self.state.role {
             RoleState::Leader(_) => {}
             RoleState::Follower(f) => {
@@ -635,18 +657,28 @@ impl<C: Clone> Engine<C> {
             RoleState::Candidate(_) => return vec![],
         }
 
-        let next_index = self
+        if commands.is_empty() {
+            return Vec::new();
+        }
+
+        let mut next_index = self
             .state
             .log
             .last_log_id()
             .map_or(LogIndex::new(1), |l| l.index.next());
-        let entry = LogEntry {
-            id: LogId::new(next_index, self.state.current_term),
-            payload: LogPayload::Command(command),
-        };
-        self.state.log.append(entry.clone());
+        let term = self.state.current_term;
+        let mut entries: Vec<LogEntry<C>> = Vec::with_capacity(commands.len());
+        for command in commands {
+            let entry = LogEntry {
+                id: LogId::new(next_index, term),
+                payload: LogPayload::Command(command),
+            };
+            self.state.log.append(entry.clone());
+            entries.push(entry);
+            next_index = next_index.next();
+        }
 
-        let mut out = vec![Action::PersistLogEntries(vec![entry])];
+        let mut out = vec![Action::PersistLogEntries(entries)];
         out.extend(self.broadcast_append_entries());
         // Single-node clusters won't get a peer ack to drive commit;
         // try advancing now so propose can complete locally. No-op

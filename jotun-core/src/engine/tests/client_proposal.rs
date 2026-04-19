@@ -315,3 +315,79 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Event::ClientProposalBatch — multiple commands land as one
+// PersistLogEntries Action and one broadcast per peer.
+// ---------------------------------------------------------------------------
+
+use crate::engine::action::Action;
+use crate::records::message::Message;
+
+#[test]
+fn batch_appends_all_commands_in_one_persist() {
+    let mut engine = elected_leader_3_node();
+    let term_now = engine.current_term();
+    let last_before = engine.log().last_log_id().unwrap().index;
+
+    let actions = engine.step(Event::ClientProposalBatch(vec![
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+    ]));
+
+    // Three entries appended at consecutive indices.
+    let last_after = engine.log().last_log_id().unwrap().index;
+    assert_eq!(last_after.get(), last_before.get() + 3);
+    for offset in 0..3 {
+        let entry = engine
+            .log()
+            .entry_at(LogIndex::new(last_before.get() + 1 + offset))
+            .expect("entry at batch index");
+        assert_eq!(entry.id.term, term_now);
+        assert!(matches!(entry.payload, LogPayload::Command(_)));
+    }
+
+    // Exactly one PersistLogEntries Action carrying all three entries.
+    let persists: Vec<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::PersistLogEntries(v) => Some(v.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(persists, vec![3]);
+
+    // One AppendEntries send per peer (2 peers, so 2 sends).
+    let sends: Vec<_> = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Send { message: Message::AppendEntriesRequest(_), .. }))
+        .collect();
+    assert_eq!(sends.len(), 2);
+}
+
+#[test]
+fn empty_batch_is_noop() {
+    let mut engine = elected_leader_3_node();
+    let last_before = engine.log().last_log_id().unwrap().index;
+
+    let actions = engine.step(Event::ClientProposalBatch(Vec::<Vec<u8>>::new()));
+
+    assert!(actions.is_empty());
+    let last_after = engine.log().last_log_id().unwrap().index;
+    assert_eq!(last_before, last_after);
+}
+
+#[test]
+fn follower_with_known_leader_redirects_batch() {
+    let mut engine = follower(1);
+    let actions = engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, None, vec![], 0),
+    ));
+    assert!(actions.iter().any(|a| matches!(a, Action::Send { .. })));
+
+    let actions = engine.step(Event::ClientProposalBatch(vec![b"x".to_vec()]));
+    // A single Redirect, not N — the host coalesces.
+    assert_eq!(collect_redirects(&actions), vec![node(2)]);
+}
