@@ -95,3 +95,38 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  fuzz:
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # cargo-fuzz requires nightly for the `-Z sanitizer` path.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: taiki-e/install-action@58e862542551f667fa44c8a2a4a1d64ad477c96a # v2.75.17
+        with:
+          tool: cargo-fuzz
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # 30 seconds per target is enough to catch panics and shallow
+      # crashes on every PR. Nightly ensures the sanitizer runtime
+      # cargo-fuzz needs is available.
+      - name: fuzz proto_message
+        run: cd fuzz && cargo +nightly fuzz run fuzz_proto_message -- -max_total_time=30
+      - name: fuzz engine_events
+        run: cd fuzz && cargo +nightly fuzz run fuzz_engine_events -- -max_total_time=30
+      - name: fuzz disk_storage_recover
+        run: cd fuzz && cargo +nightly fuzz run fuzz_disk_storage_recover -- -max_total_time=30
+      # Keep any crashes the fuzzer finds as an artifact for triage.
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          retention-days: 14

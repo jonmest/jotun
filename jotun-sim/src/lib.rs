@@ -15,7 +15,7 @@
 //!  - [`Cluster::run_until`]: drive the cluster until a predicate holds.
 //!  - [`SafetyViolation`]: the error type panics carry on invariant failure.
 //!
-//! Everything else — [`Network`], [`NodeHarness`], the per-event alphabet
+//! Everything else — `Network`, `NodeHarness`, the per-event alphabet
 //! — is `pub(crate)` so downstream users can't depend on schedule shape.
 
 // This crate is a testing tool: every `expect` is on an invariant the

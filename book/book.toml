@@ -1,0 +1,14 @@
+[book]
+title = "The jotun guide"
+authors = ["jotun contributors"]
+description = "A Rust Raft library: pure engine, deterministic sim, tokio runtime."
+src = "src"
+language = "en"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/joncm/logos"
+edit-url-template = "https://github.com/joncm/logos/edit/main/book/{path}"
+# Rustdoc is published at /api/ next to this book at /guide/; the
+# `site:` just-recipe builds both into target/site/.

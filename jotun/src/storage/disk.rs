@@ -26,8 +26,8 @@
 //! inside a segment is `[u32 LE length][prost-encoded LogEntry]`,
 //! the same stream we used in the pre-segmented single-file layout.
 //!
-//! Segmentation buys us cheap compaction: [`truncate_log`] and
-//! [`persist_snapshot`] can drop whole segment files instead of
+//! Segmentation buys us cheap compaction: `truncate_log` and
+//! `persist_snapshot` can drop whole segment files instead of
 //! rewriting the entire log. Only the segment that straddles the cut
 //! gets rewritten.
 //!

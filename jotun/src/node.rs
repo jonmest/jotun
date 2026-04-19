@@ -6,12 +6,12 @@
 //! [`Storage`] handle, and the [`Transport`]. Public methods on
 //! [`Node`] (`propose`, `add_peer`, `remove_peer`,
 //! `transfer_leadership_to`, `shutdown`)
-//! package a [`DriverInput`] into a channel and `await` a oneshot
+//! package a `DriverInput` into a channel and `await` a oneshot
 //! reply. The driver's loop multiplexes:
 //!
 //!  1. A wall-clock tick (via `tokio::time::interval`).
 //!  2. An inbound message from `Transport::recv`.
-//!  3. A [`DriverInput`] from a user-facing call.
+//!  3. A `DriverInput` from a user-facing call.
 //!
 //! Each of those becomes a `jotun_core::Event`; the driver calls
 //! `engine.step` and dispatches every emitted [`Action`] in order:
