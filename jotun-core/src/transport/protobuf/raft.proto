@@ -89,22 +89,33 @@ message RequestInstallSnapshot {
   // Opaque application snapshot bytes. The receiver hands these to
   // its state machine via Action::ApplySnapshot.
   bytes data = 4;
+  // Byte offset this chunk starts at within the logical snapshot
+  // stream.
+  uint64 offset = 5;
+  // True once this chunk reaches the end of the logical snapshot.
+  bool done = 6;
   // Same role as in AppendEntries: the leader's commit_index, used
   // by the follower to advance its own commit_index.
-  uint64 leader_commit = 5;
+  uint64 leader_commit = 7;
   // Cluster membership as of last_included. Snapshot compaction
   // drops the committed ConfigChange entries that established this
   // config; carrying the set here is how the follower restores the
   // right config on install.
-  repeated NodeIdRef peers = 6;
+  repeated NodeIdRef peers = 8;
 }
 
 message InstallSnapshotResponse {
   // Receiver's term. If higher than the leader's, the leader steps
-  // down. There's no Conflict shape — the snapshot is take-it-or-
-  // leave-it; a follower that can't accept it just doesn't, and the
-  // leader retries.
+  // down.
   uint64 term = 1;
+  // Snapshot tail this acknowledgement refers to.
+  LogId last_included = 2;
+  // Number of contiguous bytes the follower now holds for
+  // last_included. Meaningful only while done == false.
+  uint64 next_offset = 3;
+  // True once the follower has fully installed a snapshot at
+  // last_included.
+  bool done = 4;
 }
 
 message Message {

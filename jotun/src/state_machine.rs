@@ -5,9 +5,10 @@
 //!  - [`StateMachine::apply`] — run a committed command against state,
 //!    return the response. Synchronous, infallible, deterministic.
 //!  - [`StateMachine::snapshot`] — produce a snapshot of state. Default
-//!    is "no snapshot" (returns empty bytes); only override if your
-//!    application intends to drive compaction itself. The runtime does
-//!    not currently call this automatically.
+//!    is "no snapshot" (returns empty bytes). The runtime calls this
+//!    automatically when the engine emits a snapshot hint, unless the
+//!    user disables that path via
+//!    [`crate::Config::snapshot_hint_threshold_entries`].
 //!  - [`StateMachine::restore`] — rebuild state from snapshot bytes.
 //!    Default panics; only override if you also override `snapshot`.
 //!
@@ -59,10 +60,9 @@ pub trait StateMachine: Send + 'static {
     fn apply(&mut self, command: Self::Command) -> Self::Response;
 
     /// Serialize the entire state into bytes. Default: empty bytes,
-    /// signalling "no snapshot" — the runtime never invokes
-    /// [`Self::restore`] in that case. Override if your host
-    /// application plans to cut snapshots itself; automatic runtime-
-    /// driven compaction is deferred for now.
+    /// signalling "no snapshot". Override this if you want the runtime
+    /// to auto-compact on snapshot hints, or if your host integration
+    /// plans to cut snapshots explicitly.
     fn snapshot(&self) -> Vec<u8> {
         Vec::new()
     }

@@ -22,6 +22,7 @@ The workspace is aimed at two kinds of users:
 
 - leader election, log replication, crash recovery, and membership changes
 - snapshot install/restore in the engine and runtime
+- chunked snapshot transfer plus runtime auto-compaction hints
 - segmented on-disk log storage
 - protobuf wire format and a TCP transport
 - deterministic simulation with safety checks
@@ -31,8 +32,6 @@ The workspace is aimed at two kinds of users:
 
 - no linearizable read helper / `ReadIndex` API yet
 - no leadership-transfer API yet
-- snapshot creation in the `jotun` runtime is still application-driven
-- snapshot transfer is not chunked yet; large snapshots still need follow-up work
 - proposal batching and async state-machine apply are queued, not implemented
 
 ## Quick Start

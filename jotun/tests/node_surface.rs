@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +62,53 @@ impl StateMachine for Counter {
     }
 
     fn restore(&mut self, _bytes: Vec<u8>) {}
+}
+
+#[derive(Debug)]
+struct SnapshottingCounter {
+    value: u64,
+    snapshots_taken: Arc<AtomicUsize>,
+}
+
+impl SnapshottingCounter {
+    fn new(snapshots_taken: Arc<AtomicUsize>) -> Self {
+        Self {
+            value: 0,
+            snapshots_taken,
+        }
+    }
+}
+
+impl StateMachine for SnapshottingCounter {
+    type Command = CountCmd;
+    type Response = u64;
+
+    fn encode_command(c: &CountCmd) -> Vec<u8> {
+        Counter::encode_command(c)
+    }
+
+    fn decode_command(bytes: &[u8]) -> Result<CountCmd, DecodeError> {
+        Counter::decode_command(bytes)
+    }
+
+    fn apply(&mut self, cmd: CountCmd) -> u64 {
+        match cmd {
+            CountCmd::Inc(n) => {
+                self.value += n;
+                self.value
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.snapshots_taken.fetch_add(1, Ordering::Relaxed);
+        self.value.to_le_bytes().to_vec()
+    }
+
+    fn restore(&mut self, bytes: Vec<u8>) {
+        let arr: [u8; 8] = bytes.try_into().expect("snapshot bytes are well-formed");
+        self.value = u64::from_le_bytes(arr);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +179,80 @@ impl<C: Send + Clone + 'static> Storage<C> for MemoryStorage<C> {
         let keep_from = drop_through.min(self.log.len());
         self.log.drain(..keep_from);
         self.snapshot = Some(snap);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedMemoryStorage<C> {
+    inner: Arc<Mutex<MemoryStorage<C>>>,
+}
+
+impl<C: Send + Clone + 'static> Storage<C> for SharedMemoryStorage<C> {
+    type Error = Infallible;
+
+    async fn recover(&mut self) -> Result<jotun::storage::RecoveredState<C>, Self::Error> {
+        let guard = self.inner.lock().unwrap();
+        Ok(jotun::storage::RecoveredState {
+            hard_state: guard.hard_state.clone(),
+            snapshot: guard.snapshot.clone(),
+            log: guard.log.clone(),
+        })
+    }
+
+    async fn persist_hard_state(&mut self, state: StoredHardState) -> Result<(), Self::Error> {
+        self.inner.lock().unwrap().hard_state = Some(state);
+        Ok(())
+    }
+
+    async fn append_log(&mut self, entries: Vec<LogEntry<C>>) -> Result<(), Self::Error> {
+        let mut guard = self.inner.lock().unwrap();
+        for entry in entries {
+            let i = entry.id.index.get();
+            let snap_floor = guard
+                .snapshot
+                .as_ref()
+                .map_or(0, |s| s.last_included_index.get());
+            if i <= snap_floor {
+                continue;
+            }
+            let Ok(local_idx) = usize::try_from(i - snap_floor - 1) else {
+                continue;
+            };
+            if let Some(slot) = guard.log.get_mut(local_idx) {
+                *slot = entry;
+            } else {
+                guard.log.push(entry);
+            }
+        }
+        Ok(())
+    }
+
+    async fn truncate_log(&mut self, from: LogIndex) -> Result<(), Self::Error> {
+        let mut guard = self.inner.lock().unwrap();
+        let snap_floor = guard
+            .snapshot
+            .as_ref()
+            .map_or(0, |s| s.last_included_index.get());
+        let Ok(local) = usize::try_from(from.get().saturating_sub(snap_floor + 1)) else {
+            return Ok(());
+        };
+        if local < guard.log.len() {
+            guard.log.truncate(local);
+        }
+        Ok(())
+    }
+
+    async fn persist_snapshot(&mut self, snap: StoredSnapshot) -> Result<(), Self::Error> {
+        let mut guard = self.inner.lock().unwrap();
+        let Ok(drop_through) = usize::try_from(snap.last_included_index.get()) else {
+            guard.log.clear();
+            guard.snapshot = Some(snap);
+            return Ok(());
+        };
+        let keep_from = drop_through.min(guard.log.len());
+        guard.log.drain(..keep_from);
+        guard.snapshot = Some(snap);
         Ok(())
     }
 }
@@ -254,6 +376,20 @@ fn config_validate_rejects_self_in_peers() {
 
     let err = config.validate().unwrap_err();
     assert!(matches!(err, ConfigError::PeersContainSelf { node_id } if node_id == nid(1)));
+}
+
+#[test]
+fn config_validate_rejects_zero_snapshot_chunk_size() {
+    let mut config = Config::new(nid(1), std::iter::empty::<NodeId>());
+    config.snapshot_chunk_size_bytes = 0;
+
+    let err = config.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ConfigError::InvalidSnapshotChunkSize {
+            snapshot_chunk_size_bytes: 0,
+        }
+    ));
 }
 
 async fn wait_for_status<S, F>(node: &Node<S>, deadline: Duration, mut predicate: F) -> NodeStatus
@@ -523,4 +659,78 @@ async fn config_change_returns_busy_when_pending_limit_is_reached() {
     node.shutdown().await.unwrap();
     let err = first.await.unwrap().unwrap_err();
     assert!(matches!(err, ProposeError::DriverDead | ProposeError::Shutdown));
+}
+
+#[tokio::test]
+async fn runtime_auto_snapshots_on_hint_by_default() {
+    let (transport, _handle) = TestTransport::new();
+    let snapshots_taken = Arc::new(AtomicUsize::new(0));
+    let storage = SharedMemoryStorage::<Vec<u8>>::default();
+    let snapshot_view = Arc::clone(&storage.inner);
+    let mut config = fast_single_node_config();
+    config.snapshot_hint_threshold_entries = 2;
+
+    let node = Node::start(
+        config,
+        SnapshottingCounter::new(Arc::clone(&snapshots_taken)),
+        storage,
+        transport,
+    )
+    .await
+    .unwrap();
+
+    let _ = wait_for_status(&node, Duration::from_secs(1), |status| {
+        status.role.to_string() == "leader" && status.commit_index >= LogIndex::new(1)
+    })
+    .await;
+    assert_eq!(node.propose(CountCmd::Inc(5)).await.unwrap(), 5);
+
+    let start = tokio::time::Instant::now();
+    loop {
+        let snapshot = snapshot_view.lock().unwrap().snapshot.clone();
+        if let Some(snapshot) = snapshot {
+            assert_eq!(snapshot.last_included_index, LogIndex::new(2));
+            assert_eq!(snapshot.bytes, 5u64.to_le_bytes().to_vec());
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "auto snapshot was never persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(snapshots_taken.load(Ordering::Relaxed) >= 1);
+
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_hints_can_be_disabled_via_config() {
+    let (transport, _handle) = TestTransport::new();
+    let snapshots_taken = Arc::new(AtomicUsize::new(0));
+    let storage = SharedMemoryStorage::<Vec<u8>>::default();
+    let snapshot_view = Arc::clone(&storage.inner);
+    let mut config = fast_single_node_config();
+    config.snapshot_hint_threshold_entries = 0;
+
+    let node = Node::start(
+        config,
+        SnapshottingCounter::new(Arc::clone(&snapshots_taken)),
+        storage,
+        transport,
+    )
+    .await
+    .unwrap();
+
+    let _ = wait_for_status(&node, Duration::from_secs(1), |status| {
+        status.role.to_string() == "leader" && status.commit_index >= LogIndex::new(1)
+    })
+    .await;
+    assert_eq!(node.propose(CountCmd::Inc(5)).await.unwrap(), 5);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(snapshot_view.lock().unwrap().snapshot.is_none());
+    assert_eq!(snapshots_taken.load(Ordering::Relaxed), 0);
+
+    node.shutdown().await.unwrap();
 }

@@ -48,9 +48,10 @@
 //! accept client connections on a separate socket, marshal
 //! commands through `Node::propose`. Everything else — elections,
 //! replication, persistence, transport, and incoming snapshot
-//! restore/install — the runtime handles. The runtime does not yet
-//! auto-trigger compaction or call `snapshot()` itself; host-driven
-//! snapshot creation is deferred for now.
+//! restore/install — the runtime handles. Snapshot creation is driven
+//! by engine hints; if this example overrode `snapshot()`, the runtime
+//! would cut snapshots automatically once enough applied history had
+//! accumulated.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

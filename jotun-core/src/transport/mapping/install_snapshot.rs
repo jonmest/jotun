@@ -11,6 +11,8 @@ impl From<RequestInstallSnapshot> for proto::RequestInstallSnapshot {
             leader_id: v.leader_id.get(),
             last_included: Some(v.last_included.into()),
             data: v.data,
+            offset: v.offset,
+            done: v.done,
             leader_commit: v.leader_commit.get(),
             peers: v
                 .peers
@@ -39,6 +41,8 @@ impl TryFrom<proto::RequestInstallSnapshot> for RequestInstallSnapshot {
                 ))?
                 .try_into()?,
             data: v.data,
+            offset: v.offset,
+            done: v.done,
             leader_commit: LogIndex::new(v.leader_commit),
             peers,
         })
@@ -47,7 +51,12 @@ impl TryFrom<proto::RequestInstallSnapshot> for RequestInstallSnapshot {
 
 impl From<InstallSnapshotResponse> for proto::InstallSnapshotResponse {
     fn from(v: InstallSnapshotResponse) -> Self {
-        Self { term: v.term.get() }
+        Self {
+            term: v.term.get(),
+            last_included: Some(v.last_included.into()),
+            next_offset: v.next_offset,
+            done: v.done,
+        }
     }
 }
 
@@ -57,6 +66,14 @@ impl TryFrom<proto::InstallSnapshotResponse> for InstallSnapshotResponse {
     fn try_from(v: proto::InstallSnapshotResponse) -> Result<Self, Self::Error> {
         Ok(Self {
             term: Term::new(v.term),
+            last_included: v
+                .last_included
+                .ok_or(ConvertError::MissingField(
+                    "InstallSnapshotResponse.last_included",
+                ))?
+                .try_into()?,
+            next_offset: v.next_offset,
+            done: v.done,
         })
     }
 }

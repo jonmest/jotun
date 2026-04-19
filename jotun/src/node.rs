@@ -19,20 +19,21 @@
 //! Redirects fail any matching pending propose with `NotLeader`. On
 //! explicit shutdown the driver also asks the transport to stop any
 //! background tasks it owns before exiting. The runtime restores and
-//! installs incoming snapshots during recovery / `InstallSnapshot`,
-//! but it does not currently decide when to cut a snapshot or invoke
-//! [`StateMachine::snapshot`] on its own; host-driven compaction is
-//! deferred.
+//! installs incoming snapshots during recovery / `InstallSnapshot`.
+//! By default it also reacts to `Action::SnapshotHint` by calling
+//! [`StateMachine::snapshot`] and feeding the resulting bytes back into
+//! the engine; set [`Config::snapshot_hint_threshold_entries`] to `0`
+//! to disable host-initiated snapshotting.
 //!
 //! The driver is the only mutator of any shared state; no locks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jotun_core::{
-    Action, ConfigChange, Engine, Env, Event, LogEntry, LogIndex, LogPayload, NodeId,
-    RandomizedEnv, RoleState, Term,
+    Action, ConfigChange, Engine, EngineConfig, Env, Event, LogEntry, LogIndex, LogPayload,
+    NodeId, RandomizedEnv, RoleState, Term,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -106,6 +107,11 @@ pub enum Bootstrap {
 /// with [`ProposeError::Busy`] rather than queue unboundedly in the
 /// driver's reply map. 1024 is plenty of headroom for normal
 /// workloads; lower it if your callers can tolerate backpressure.
+///
+/// Snapshot creation is also configurable here: the runtime asks the
+/// engine to emit `Action::SnapshotHint` once enough applied entries
+/// have accumulated past the current floor, and streams outbound
+/// `InstallSnapshot` RPCs in chunks of `snapshot_chunk_size_bytes`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -137,6 +143,12 @@ pub struct Config {
     /// the driver rejects new calls with [`ProposeError::Busy`].
     /// Defaults to 1024.
     pub max_pending_proposals: usize,
+    /// Applied-entry threshold for automatic snapshot hints. `0`
+    /// disables host-initiated snapshotting in the runtime; incoming
+    /// leader snapshots still install normally.
+    pub snapshot_hint_threshold_entries: u64,
+    /// Maximum size of one outbound `InstallSnapshot` chunk in bytes.
+    pub snapshot_chunk_size_bytes: usize,
 }
 
 /// Invalid [`Config`] settings rejected by [`Config::validate`] and
@@ -158,6 +170,10 @@ pub enum ConfigError {
     /// `peers` must exclude self; membership is always "other nodes".
     PeersContainSelf {
         node_id: NodeId,
+    },
+    /// Snapshot chunks must have a positive size.
+    InvalidSnapshotChunkSize {
+        snapshot_chunk_size_bytes: usize,
     },
 }
 
@@ -181,6 +197,12 @@ impl std::fmt::Display for ConfigError {
             Self::PeersContainSelf { node_id } => {
                 write!(f, "peer set must not contain self ({node_id})")
             }
+            Self::InvalidSnapshotChunkSize {
+                snapshot_chunk_size_bytes,
+            } => write!(
+                f,
+                "snapshot chunk size must be greater than zero (got {snapshot_chunk_size_bytes})"
+            ),
         }
     }
 }
@@ -215,6 +237,8 @@ impl Config {
             tick_interval: Duration::from_millis(50),
             bootstrap,
             max_pending_proposals: 1024,
+            snapshot_hint_threshold_entries: 1024,
+            snapshot_chunk_size_bytes: 64 * 1024,
         }
     }
 
@@ -235,6 +259,11 @@ impl Config {
         if self.peers.contains(&self.node_id) {
             return Err(ConfigError::PeersContainSelf {
                 node_id: self.node_id,
+            });
+        }
+        if self.snapshot_chunk_size_bytes == 0 {
+            return Err(ConfigError::InvalidSnapshotChunkSize {
+                snapshot_chunk_size_bytes: self.snapshot_chunk_size_bytes,
             });
         }
         Ok(())
@@ -408,11 +437,15 @@ impl<S: StateMachine> Node<S> {
             config.election_timeout_min_ticks,
             config.election_timeout_max_ticks,
         ));
-        let engine: Engine<Vec<u8>> = Engine::new(
+        let engine: Engine<Vec<u8>> = Engine::with_config(
             config.node_id,
             initial_peers.iter().copied(),
             env,
             config.heartbeat_interval_ticks,
+            EngineConfig::new(
+                config.snapshot_chunk_size_bytes,
+                config.snapshot_hint_threshold_entries,
+            ),
         );
 
         let max_pending_proposals = config.max_pending_proposals;
@@ -836,7 +869,8 @@ where
     St: Storage<Vec<u8>>,
     Tr: Transport<Vec<u8>>,
 {
-    for action in actions {
+    let mut pending: VecDeque<Action<Vec<u8>>> = actions.into();
+    while let Some(action) = pending.pop_front() {
         match action {
             Action::PersistHardState {
                 current_term,
@@ -897,6 +931,21 @@ where
             }
             Action::ApplySnapshot { bytes } => {
                 d.state_machine.restore(bytes);
+            }
+            Action::SnapshotHint {
+                last_included_index,
+            } => {
+                let bytes = d.state_machine.snapshot();
+                if bytes.is_empty() {
+                    continue;
+                }
+                let follow_up = d.engine.step(Event::SnapshotTaken {
+                    last_included_index,
+                    bytes,
+                });
+                for action in follow_up.into_iter().rev() {
+                    pending.push_front(action);
+                }
             }
             Action::Redirect { .. } => {
                 // Already handled at the propose call site; engine

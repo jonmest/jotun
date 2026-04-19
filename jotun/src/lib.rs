@@ -7,9 +7,11 @@
 //! [`Node::start`]; the runtime owns the engine, the network
 //! transport, the on-disk persistence, the tick driver, and the
 //! action dispatcher. Incoming snapshots are installed and restored
-//! automatically, but the runtime does not currently initiate
-//! compaction or call [`StateMachine::snapshot`] on its own; host-
-//! initiated snapshot support is deferred for now.
+//! automatically. By default the runtime also reacts to snapshot hints
+//! from the engine by calling [`StateMachine::snapshot`] and feeding
+//! the resulting bytes back into Raft; set
+//! [`Config::snapshot_hint_threshold_entries`] to `0` if you want to
+//! disable that host-initiated compaction path.
 //!
 //! For users who want different transport, storage, or concurrency,
 //! [`Storage`] and [`Transport`] are traits — the defaults are

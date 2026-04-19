@@ -287,12 +287,15 @@ pub(super) fn snapshot_taken(last_included_index: u64, bytes: Vec<u8>) -> Event<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn install_snapshot_from(
     from: u64,
     term_n: u64,
     last_included_index: u64,
     last_included_term: u64,
     leader_commit: u64,
+    offset: u64,
+    done: bool,
     bytes: Vec<u8>,
 ) -> Event<Vec<u8>> {
     use crate::records::install_snapshot::RequestInstallSnapshot;
@@ -303,17 +306,31 @@ pub(super) fn install_snapshot_from(
             leader_id: node(from),
             last_included: log_id(last_included_index, last_included_term),
             data: bytes,
+            offset,
+            done,
             leader_commit: LogIndex::new(leader_commit),
             peers: std::collections::BTreeSet::new(),
         }),
     })
 }
 
-pub(super) fn install_snapshot_response_from(from: u64, term_n: u64) -> Event<Vec<u8>> {
+pub(super) fn install_snapshot_response_from(
+    from: u64,
+    term_n: u64,
+    last_included_index: u64,
+    last_included_term: u64,
+    next_offset: u64,
+    done: bool,
+) -> Event<Vec<u8>> {
     use crate::records::install_snapshot::InstallSnapshotResponse;
     Event::Incoming(Incoming {
         from: node(from),
-        message: Message::InstallSnapshotResponse(InstallSnapshotResponse { term: term(term_n) }),
+        message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+            term: term(term_n),
+            last_included: log_id(last_included_index, last_included_term),
+            next_offset,
+            done,
+        }),
     })
 }
 
@@ -357,6 +374,18 @@ pub(super) fn collect_install_snapshots(
                 to,
                 message: Message::InstallSnapshotRequest(req),
             } => Some((*to, req.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) fn collect_snapshot_hints(actions: &[Action<Vec<u8>>]) -> Vec<LogIndex> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SnapshotHint {
+                last_included_index,
+            } => Some(*last_included_index),
             _ => None,
         })
         .collect()

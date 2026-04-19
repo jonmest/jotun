@@ -3,6 +3,7 @@ use proptest::prelude::*;
 
 use crate::records::{
     append_entries::{AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries},
+    install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot},
     log_entry::{LogEntry, LogPayload},
     message::Message,
     vote::{RequestVote, VoteResponse, VoteResult},
@@ -96,11 +97,51 @@ pub(super) fn append_entries_response() -> impl Strategy<Value = AppendEntriesRe
         .prop_map(|(term, result)| AppendEntriesResponse { term, result })
 }
 
+pub(super) fn request_install_snapshot() -> impl Strategy<Value = RequestInstallSnapshot> {
+    (
+        term(),
+        node_id(),
+        log_id(),
+        vec(any::<u8>(), 0..256),
+        any::<u64>(),
+        any::<bool>(),
+        log_index(),
+        proptest::collection::btree_set(node_id(), 0..8),
+    )
+        .prop_map(
+            |(term, leader_id, last_included, data, offset, done, leader_commit, peers)| {
+                RequestInstallSnapshot {
+                    term,
+                    leader_id,
+                    last_included,
+                    data,
+                    offset,
+                    done,
+                    leader_commit,
+                    peers,
+                }
+            },
+        )
+}
+
+pub(super) fn install_snapshot_response() -> impl Strategy<Value = InstallSnapshotResponse> {
+    (term(), log_id(), any::<u64>(), any::<bool>()).prop_map(
+        |(term, last_included, next_offset, done)| InstallSnapshotResponse {
+            term,
+            last_included,
+            next_offset,
+            done,
+        },
+    )
+}
+
 pub(super) fn message() -> impl Strategy<Value = Message<Vec<u8>>> {
     prop_oneof![
         request_vote().prop_map(Message::VoteRequest),
         vote_response().prop_map(Message::VoteResponse),
         request_append_entries().prop_map(Message::AppendEntriesRequest),
         append_entries_response().prop_map(Message::AppendEntriesResponse),
+        request_install_snapshot().prop_map(Message::InstallSnapshotRequest),
+        install_snapshot_response().prop_map(Message::InstallSnapshotResponse),
     ]
 }

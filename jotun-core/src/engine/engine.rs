@@ -18,7 +18,7 @@ use crate::{
         action::Action,
         event::Event,
         incoming::Incoming,
-        role_state::{CandidateState, FollowerState, LeaderState, RoleState},
+        role_state::{CandidateState, FollowerState, LeaderState, RoleState, SnapshotTransfer},
     },
     types::{index::LogIndex, node::NodeId, term::Term},
 };
@@ -80,6 +80,27 @@ pub(crate) struct RaftState<C> {
     /// `InstallSnapshot` RPCs so receivers can restore the right
     /// config on install.
     pub(crate) snapshot_peers: Option<BTreeSet<NodeId>>,
+    /// Follower-side partial snapshot assembly, if we're in the
+    /// middle of a chunked `InstallSnapshot` transfer.
+    pub(crate) pending_snapshot_install: Option<PendingSnapshotInstall>,
+    /// Highest threshold band we have already hinted compaction for.
+    /// Compared against the number of applied entries past the
+    /// current snapshot floor.
+    pub(crate) snapshot_hint_band: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSnapshotInstall {
+    pub(crate) last_included: LogId,
+    pub(crate) leader_commit: LogIndex,
+    pub(crate) peers: BTreeSet<NodeId>,
+    pub(crate) bytes: Vec<u8>,
+}
+
+impl PendingSnapshotInstall {
+    fn next_offset(&self) -> u64 {
+        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
 }
 
 /// What the host hands back to [`Engine::recover_from`] at boot:
@@ -139,9 +160,45 @@ pub struct Engine<C> {
     /// How often the leader emits heartbeats, in ticks. Must be smaller
     /// than the election timeout (§5.2).
     heartbeat_interval_ticks: u64,
+    /// Maximum size of one outbound snapshot chunk.
+    snapshot_chunk_size_bytes: usize,
+    /// Applied-entry threshold for emitting `Action::SnapshotHint`.
+    snapshot_hint_threshold_entries: u64,
     /// All mutable per-node state. Includes the active peer set, which
     /// the §4.3 single-server membership rule mutates from log entries.
     state: RaftState<C>,
+}
+
+/// Optional engine behavior knobs beyond the core Raft constructor
+/// parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EngineConfig {
+    /// Maximum bytes to place in one `InstallSnapshot` chunk.
+    pub snapshot_chunk_size_bytes: usize,
+    /// Emit `Action::SnapshotHint` once the number of applied entries
+    /// past the current floor crosses this threshold. `0` disables the
+    /// hint.
+    pub snapshot_hint_threshold_entries: u64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_chunk_size_bytes: 64 * 1024,
+            snapshot_hint_threshold_entries: 0,
+        }
+    }
+}
+
+impl EngineConfig {
+    #[must_use]
+    pub fn new(snapshot_chunk_size_bytes: usize, snapshot_hint_threshold_entries: u64) -> Self {
+        Self {
+            snapshot_chunk_size_bytes,
+            snapshot_hint_threshold_entries,
+        }
+    }
 }
 
 impl<C: Clone> Engine<C> {
@@ -158,8 +215,27 @@ impl<C: Clone> Engine<C> {
     pub fn new(
         id: NodeId,
         peers: impl IntoIterator<Item = NodeId>,
+        env: Box<dyn Env>,
+        heartbeat_interval_ticks: u64,
+    ) -> Self {
+        Self::with_config(
+            id,
+            peers,
+            env,
+            heartbeat_interval_ticks,
+            EngineConfig::default(),
+        )
+    }
+
+    /// Create a fresh follower with explicit snapshot-transfer and
+    /// snapshot-hint behavior knobs.
+    #[must_use]
+    pub fn with_config(
+        id: NodeId,
+        peers: impl IntoIterator<Item = NodeId>,
         mut env: Box<dyn Env>,
         heartbeat_interval_ticks: u64,
+        config: EngineConfig,
     ) -> Self {
         let peers: BTreeSet<NodeId> = peers.into_iter().filter(|p| *p != id).collect();
         let initial_peers = peers.clone();
@@ -169,6 +245,8 @@ impl<C: Clone> Engine<C> {
             id,
             env,
             heartbeat_interval_ticks,
+            snapshot_chunk_size_bytes: config.snapshot_chunk_size_bytes.max(1),
+            snapshot_hint_threshold_entries: config.snapshot_hint_threshold_entries,
             state: RaftState {
                 current_term: Term::ZERO,
                 voted_for: None,
@@ -183,6 +261,8 @@ impl<C: Clone> Engine<C> {
                 initial_peers,
                 snapshot_bytes: None,
                 snapshot_peers: None,
+                pending_snapshot_install: None,
+                snapshot_hint_band: 0,
             },
         }
     }
@@ -220,10 +300,10 @@ impl<C: Clone> Engine<C> {
                 .log
                 .install_snapshot(snap.last_included_index, snap.last_included_term);
             self.state.snapshot_bytes = Some(snap.bytes);
-            self.state.snapshot_peers = Some(snap.peers);
-            self.state.commit_index = snap.last_included_index;
-            self.state.last_applied = snap.last_included_index;
-        }
+        self.state.snapshot_peers = Some(snap.peers);
+        self.state.commit_index = snap.last_included_index;
+        self.state.last_applied = snap.last_included_index;
+    }
         if let Some(mut peers) = restored_peers {
             peers.remove(&self.id); // self is implicit
             self.state.peers = peers;
@@ -247,6 +327,8 @@ impl<C: Clone> Engine<C> {
         self.state.role = RoleState::Follower(FollowerState::default());
         self.state.election_elapsed = 0;
         self.state.heartbeat_elapsed = 0;
+        self.state.pending_snapshot_install = None;
+        self.state.snapshot_hint_band = 0;
     }
 
     // =========================================================================
@@ -382,7 +464,7 @@ impl<C: Clone> Engine<C> {
         #[cfg(debug_assertions)]
         let prev_term = self.state.current_term;
 
-        let actions = match event {
+        let mut actions = match event {
             Event::Tick => self.on_tick(),
             Event::Incoming(incoming) => self.on_incoming(incoming),
             Event::ClientProposal(command) => self.on_client_proposal(command),
@@ -392,6 +474,7 @@ impl<C: Clone> Engine<C> {
                 bytes,
             } => self.on_snapshot_taken(last_included_index, bytes),
         };
+        self.maybe_emit_snapshot_hint(&mut actions);
 
         #[cfg(debug_assertions)]
         {
@@ -418,6 +501,30 @@ impl<C: Clone> Engine<C> {
         Action::PersistHardState {
             current_term: self.state.current_term,
             voted_for: self.state.voted_for,
+        }
+    }
+
+    /// Emit at most one compaction hint per applied-entry threshold
+    /// band. Hints are advisory and appended after the transition's
+    /// real Raft actions so hosts observe a state machine that has
+    /// already applied everything through `last_included_index`.
+    fn maybe_emit_snapshot_hint(&mut self, actions: &mut Vec<Action<C>>) {
+        let threshold = self.snapshot_hint_threshold_entries;
+        if threshold == 0 {
+            return;
+        }
+
+        let floor = self.state.log.snapshot_last().index;
+        let applied_past_floor = self.state.last_applied.get().saturating_sub(floor.get());
+        let band = applied_past_floor / threshold;
+        if band < self.state.snapshot_hint_band {
+            self.state.snapshot_hint_band = band;
+        }
+        if band > self.state.snapshot_hint_band && self.state.last_applied > floor {
+            actions.push(Action::SnapshotHint {
+                last_included_index: self.state.last_applied,
+            });
+            self.state.snapshot_hint_band = band;
         }
     }
 
@@ -644,6 +751,10 @@ impl<C: Clone> Engine<C> {
             .install_snapshot(last_included_index, last_included_term);
         self.state.snapshot_bytes = Some(bytes.clone());
         self.state.snapshot_peers = Some(peers_at_floor.clone());
+        self.state.pending_snapshot_install = None;
+        if let RoleState::Leader(leader) = &mut self.state.role {
+            leader.snapshot_transfers.clear();
+        }
         vec![Action::PersistSnapshot {
             last_included_index,
             peers: peers_at_floor,
@@ -715,6 +826,7 @@ impl<C: Clone> Engine<C> {
                     self.state.peers.remove(&id);
                     if let RoleState::Leader(l) = &mut self.state.role {
                         l.progress.remove_peer(id);
+                        l.snapshot_transfers.remove(&id);
                     }
                 }
             }
@@ -794,6 +906,7 @@ impl<C: Clone> Engine<C> {
             }
             for id in tracked.difference(&self.state.peers).copied() {
                 l.progress.remove_peer(id);
+                l.snapshot_transfers.remove(&id);
             }
         }
     }
@@ -1082,15 +1195,12 @@ impl<C: Clone> Engine<C> {
         if response.term < self.current_term() {
             return vec![];
         }
-        let RoleState::Leader(leader) = &mut self.state.role else {
-            return vec![];
-        };
-
         let leader_last = self
             .state
             .log
             .last_log_id()
             .map_or(LogIndex::ZERO, |l| l.index);
+        let snapshot_floor = self.state.log.snapshot_last().index;
 
         match response.result {
             AppendEntriesResult::Success { last_appended } => {
@@ -1102,7 +1212,13 @@ impl<C: Clone> Engine<C> {
                 if last_appended > leader_last {
                     return vec![];
                 }
+                let RoleState::Leader(leader) = &mut self.state.role else {
+                    return vec![];
+                };
                 leader.progress.record_success(peer, last_appended);
+                if last_appended >= snapshot_floor {
+                    leader.snapshot_transfers.remove(&peer);
+                }
                 self.try_advance_commit_as_leader()
             }
             AppendEntriesResult::Conflict { next_index_hint } => {
@@ -1112,7 +1228,13 @@ impl<C: Clone> Engine<C> {
                 // region of our log that doesn't exist.
                 let cap = leader_last.next();
                 let hint = next_index_hint.min(cap);
+                let RoleState::Leader(leader) = &mut self.state.role else {
+                    return vec![];
+                };
                 leader.progress.record_conflict(peer, hint);
+                if hint > snapshot_floor {
+                    leader.snapshot_transfers.remove(&peer);
+                }
                 vec![self.append_entries_to(peer)]
             }
         }
@@ -1127,6 +1249,7 @@ impl<C: Clone> Engine<C> {
     /// state machine. The `PersistSnapshot` action is emitted before
     /// the final response Send to honour the persist-before-send rule.
     #[instrument(target = "jotun::engine", skip_all)]
+    #[allow(clippy::too_many_lines)]
     fn on_install_snapshot_request(&mut self, request: RequestInstallSnapshot) -> Vec<Action<C>> {
         let prior_term = self.state.current_term;
         let prior_voted_for = self.state.voted_for;
@@ -1140,96 +1263,181 @@ impl<C: Clone> Engine<C> {
         if request.term < self.state.current_term {
             // Stale leader. Reply with our (higher) term so they step
             // down. No state mutation.
-            return vec![Action::Send {
-                to: request.leader_id,
-                message: InstallSnapshotResponse(InstallSnapshotResponse {
-                    term: self.state.current_term,
-                }),
-            }];
+            return vec![self.snapshot_response(
+                request.leader_id,
+                request.last_included,
+                0,
+                false,
+            )];
         }
+
+        let RequestInstallSnapshot {
+            leader_id,
+            last_included,
+            data,
+            offset,
+            done,
+            leader_commit,
+            peers,
+            ..
+        } = request;
 
         // Record the leader for client redirects.
         if let RoleState::Follower(f) = &mut self.state.role {
-            f.leader_id = Some(request.leader_id);
+            f.leader_id = Some(leader_id);
         }
         self.reset_election_timer();
 
         let hard_state_changed =
             self.state.current_term != prior_term || self.state.voted_for != prior_voted_for;
+        let response_term = self.state.current_term;
+        let snapshot_ack = |last_included: LogId, next_offset: u64, done: bool| Action::Send {
+            to: leader_id,
+            message: InstallSnapshotResponse(InstallSnapshotResponse {
+                term: response_term,
+                last_included,
+                next_offset,
+                done,
+            }),
+        };
 
         // Stale snapshot at or below our existing floor: ack but do
         // nothing else.
-        if request.last_included.index <= self.state.log.snapshot_last().index {
+        if last_included.index <= self.state.log.snapshot_last().index {
+            let current_floor = self.state.log.snapshot_last();
             let mut out = Vec::new();
             if hard_state_changed {
                 out.push(self.persist_hard_state());
             }
-            out.push(Action::Send {
-                to: request.leader_id,
-                message: InstallSnapshotResponse(InstallSnapshotResponse {
-                    term: self.state.current_term,
-                }),
-            });
+            out.push(snapshot_ack(current_floor, 0, true));
             return out;
         }
+
+        let mut out = Vec::new();
+        if hard_state_changed {
+            out.push(self.persist_hard_state());
+        }
+
+        let reset_pending = self
+            .state
+            .pending_snapshot_install
+            .as_ref()
+            .is_none_or(|pending| pending.last_included != last_included);
+        if reset_pending {
+            if offset != 0 {
+                out.push(snapshot_ack(last_included, 0, false));
+                return out;
+            }
+            self.state.pending_snapshot_install = Some(PendingSnapshotInstall {
+                last_included,
+                leader_commit,
+                peers: peers.clone(),
+                bytes: Vec::new(),
+            });
+        }
+
+        let Some(pending) = &mut self.state.pending_snapshot_install else {
+            unreachable!("pending snapshot install initialized above");
+        };
+
+        let incompatible_metadata = pending.peers != peers && offset != 0;
+        if incompatible_metadata {
+            self.state.pending_snapshot_install = None;
+            out.push(snapshot_ack(last_included, 0, false));
+            return out;
+        }
+
+        let current_offset = pending.next_offset();
+        if offset > current_offset {
+            out.push(snapshot_ack(pending.last_included, current_offset, false));
+            return out;
+        }
+
+        let overlap = current_offset.saturating_sub(offset);
+        let overlap_len = usize::try_from(overlap).unwrap_or(usize::MAX).min(data.len());
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let overlap_matches = start
+            .checked_add(overlap_len)
+            .and_then(|end| pending.bytes.get(start..end))
+            .is_some_and(|existing| data.get(..overlap_len) == Some(existing));
+        if overlap_len > 0 && !overlap_matches {
+            if offset == 0 {
+                pending.bytes.clear();
+                pending.peers.clone_from(&peers);
+            } else {
+                self.state.pending_snapshot_install = None;
+                out.push(snapshot_ack(last_included, 0, false));
+                return out;
+            }
+        }
+
+        let append_from = if overlap_len > 0 && overlap_matches {
+            overlap_len
+        } else {
+            0
+        };
+        pending
+            .bytes
+            .extend_from_slice(data.get(append_from..).unwrap_or(&[]));
+        pending.leader_commit = pending.leader_commit.max(leader_commit);
+        pending.peers.clone_from(&peers);
+
+        if !done {
+            out.push(snapshot_ack(
+                pending.last_included,
+                pending.next_offset(),
+                false,
+            ));
+            return out;
+        }
+
+        let Some(pending) = self.state.pending_snapshot_install.take() else {
+            return out;
+        };
 
         // Install the snapshot floor. Log::install_snapshot keeps
         // post-floor entries iff our log already had a matching
         // boundary entry; otherwise it wipes the in-memory tail.
         self.state
             .log
-            .install_snapshot(request.last_included.index, request.last_included.term);
-        self.state.snapshot_bytes = Some(request.data.clone());
-        self.state.snapshot_peers = Some(request.peers.clone());
+            .install_snapshot(pending.last_included.index, pending.last_included.term);
+        self.state.snapshot_bytes = Some(pending.bytes.clone());
+        self.state.snapshot_peers = Some(pending.peers.clone());
 
         // Advance commit / applied past the snapshot. The snapshot
         // captures everything up to `last_included.index`, so we treat
         // it as if those entries had already been applied.
-        if request.last_included.index > self.state.commit_index {
-            self.state.commit_index = request.last_included.index;
+        if pending.last_included.index > self.state.commit_index {
+            self.state.commit_index = pending.last_included.index;
         }
-        if request.last_included.index > self.state.last_applied {
-            self.state.last_applied = request.last_included.index;
+        if pending.last_included.index > self.state.last_applied {
+            self.state.last_applied = pending.last_included.index;
         }
         // leader_commit may also exceed the snapshot's tail — propagate.
-        if request.leader_commit > self.state.commit_index {
-            // Cap at our last log index, same rule as on_append_entries.
+        if pending.leader_commit > self.state.commit_index {
             let last_log = self
                 .state
                 .log
                 .last_log_id()
                 .map_or(LogIndex::ZERO, |l| l.index);
-            self.state.commit_index = request.leader_commit.min(last_log);
+            self.state.commit_index = pending.leader_commit.min(last_log);
         }
-        // §7 + §4.3: restore membership from the snapshot's peer set.
-        // Pre-floor entries are gone; the snapshot carries the config
-        // as of last_included_index. Any surviving post-floor entries
-        // (Log::install_snapshot keeps entries past a matching
-        // boundary) get their CCs replayed on top.
-        let mut peers = request.peers.clone();
+        let mut peers = pending.peers.clone();
         peers.remove(&self.id);
         self.state.peers = peers;
         self.recompute_active_config();
 
-        let mut out = Vec::new();
-        if hard_state_changed {
-            out.push(self.persist_hard_state());
-        }
+        let final_offset = u64::try_from(pending.bytes.len()).unwrap_or(u64::MAX);
         out.push(Action::PersistSnapshot {
-            last_included_index: request.last_included.index,
-            last_included_term: request.last_included.term,
-            peers: request.peers.clone(),
-            bytes: request.data.clone(),
+            last_included_index: pending.last_included.index,
+            last_included_term: pending.last_included.term,
+            peers: pending.peers.clone(),
+            bytes: pending.bytes.clone(),
         });
         out.push(Action::ApplySnapshot {
-            bytes: request.data,
+            bytes: pending.bytes,
         });
-        out.push(Action::Send {
-            to: request.leader_id,
-            message: InstallSnapshotResponse(InstallSnapshotResponse {
-                term: self.state.current_term,
-            }),
-        });
+        out.push(snapshot_ack(self.state.log.snapshot_last(), final_offset, true));
         out
     }
 
@@ -1256,18 +1464,39 @@ impl<C: Clone> Engine<C> {
         let RoleState::Leader(leader) = &mut self.state.role else {
             return vec![];
         };
-        // The peer just installed a snapshot whose tail is at our log's
-        // current floor (which is what we sent). record_success only
-        // advances when last_appended > matchIndex; an idempotent
-        // InstallSnapshot ack at exactly the floor would otherwise
-        // leave nextIndex stuck at floor, looping the leader forever.
-        // Push nextIndex to floor + 1 unconditionally so the next
-        // broadcast switches back to AppendEntries.
-        let snapshot_floor = self.state.log.snapshot_last().index;
-        leader.progress.record_success(peer, snapshot_floor);
-        leader
-            .progress
-            .ensure_next_at_least(peer, snapshot_floor.next());
+
+        if response.done {
+            let leader_last = self
+                .state
+                .log
+                .last_log_id()
+                .map_or(LogIndex::ZERO, |l| l.index);
+            let applied = response.last_included.index.min(leader_last);
+            leader.progress.record_success(peer, applied);
+            leader.progress.ensure_next_at_least(peer, applied.next());
+            if let Some(transfer) = leader.snapshot_transfers.get(&peer)
+                && response.last_included.index >= transfer.last_included.index
+            {
+                leader.snapshot_transfers.remove(&peer);
+            }
+            return vec![];
+        }
+
+        let Some(transfer) = leader.snapshot_transfers.get_mut(&peer) else {
+            return vec![];
+        };
+        if response.last_included != transfer.last_included {
+            return vec![];
+        }
+        let snapshot_len = self
+            .state
+            .snapshot_bytes
+            .as_ref()
+            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if response.next_offset > snapshot_len || response.next_offset <= transfer.next_offset {
+            return vec![];
+        }
+        transfer.next_offset = response.next_offset;
         vec![]
     }
 
@@ -1342,14 +1571,13 @@ impl<C: Clone> Engine<C> {
     /// empty (effective heartbeat); when behind it carries the missing tail.
     /// Called from `on_tick` (heartbeat), `become_leader` (initial broadcast),
     /// and `on_client_proposal` (post-append replication).
-    fn broadcast_append_entries(&self) -> Vec<Action<C>> {
+    fn broadcast_append_entries(&mut self) -> Vec<Action<C>> {
         if !matches!(self.state.role, RoleState::Leader(_)) {
             return vec![];
         }
-        self.state
-            .peers
-            .iter()
-            .copied()
+        let peers: Vec<NodeId> = self.state.peers.iter().copied().collect();
+        peers
+            .into_iter()
             .map(|peer| self.append_entries_to(peer))
             .collect()
     }
@@ -1361,7 +1589,7 @@ impl<C: Clone> Engine<C> {
     /// to construct from log entries that have been compacted away.
     /// On non-leaders we fall back to `nextIndex = 1`; in practice
     /// this is only called from leader paths.
-    fn append_entries_to(&self, peer: NodeId) -> Action<C> {
+    fn append_entries_to(&mut self, peer: NodeId) -> Action<C> {
         let next = match &self.state.role {
             RoleState::Leader(l) => l.progress.next_for(peer).unwrap_or(LogIndex::new(1)),
             _ => LogIndex::new(1),
@@ -1402,17 +1630,43 @@ impl<C: Clone> Engine<C> {
     /// the leader's log floor. Caller must have already checked that
     /// `nextIndex[peer] ≤ snapshot_last_index` and that we have
     /// snapshot bytes in memory.
-    fn install_snapshot_to(&self, peer: NodeId) -> Action<C> {
+    fn install_snapshot_to(&mut self, peer: NodeId) -> Action<C> {
         let last_included = self.state.log.snapshot_last();
-        let bytes = self.state.snapshot_bytes.clone().unwrap_or_default();
+        let offset = match &mut self.state.role {
+            RoleState::Leader(leader) => {
+                let transfer = leader
+                    .snapshot_transfers
+                    .entry(peer)
+                    .or_insert(SnapshotTransfer {
+                        last_included,
+                        next_offset: 0,
+                    });
+                if transfer.last_included != last_included {
+                    *transfer = SnapshotTransfer {
+                        last_included,
+                        next_offset: 0,
+                    };
+                }
+                transfer.next_offset
+            }
+            _ => 0,
+        };
+        let bytes = self.state.snapshot_bytes.as_deref().unwrap_or(&[]);
         let peers = self.state.snapshot_peers.clone().unwrap_or_default();
+        let start = usize::try_from(offset).unwrap_or(bytes.len()).min(bytes.len());
+        let end = start
+            .saturating_add(self.snapshot_chunk_size_bytes)
+            .min(bytes.len());
+        let data = bytes.get(start..end).unwrap_or(&[]).to_vec();
         Action::Send {
             to: peer,
             message: InstallSnapshotRequest(RequestInstallSnapshot {
                 term: self.state.current_term,
                 leader_id: self.id,
                 last_included,
-                data: bytes,
+                data,
+                offset,
+                done: end == bytes.len(),
                 leader_commit: self.state.commit_index,
                 peers,
             }),
@@ -1429,6 +1683,26 @@ impl<C: Clone> Engine<C> {
                 result: AppendEntriesResult::Conflict {
                     next_index_hint: hint,
                 },
+            }),
+        }
+    }
+
+    /// Build an `InstallSnapshotResponse` carrying either partial
+    /// progress (`done == false`) or completion (`done == true`).
+    fn snapshot_response(
+        &self,
+        leader_id: NodeId,
+        last_included: LogId,
+        next_offset: u64,
+        done: bool,
+    ) -> Action<C> {
+        Action::Send {
+            to: leader_id,
+            message: InstallSnapshotResponse(InstallSnapshotResponse {
+                term: self.current_term(),
+                last_included,
+                next_offset,
+                done,
             }),
         }
     }
@@ -1501,7 +1775,10 @@ impl<C: Clone> Engine<C> {
         let last_log_index = self.log().last_log_id().map_or(LogIndex::ZERO, |l| l.index);
 
         let progress = PeerProgress::new(self.state.peers.iter().copied(), last_log_index);
-        self.state.role = RoleState::Leader(LeaderState { progress });
+        self.state.role = RoleState::Leader(LeaderState {
+            progress,
+            snapshot_transfers: std::collections::BTreeMap::default(),
+        });
         telemetry::became_leader(self.id, self.state.current_term);
 
         // The no-op is now in our log; persist before we announce it via

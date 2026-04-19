@@ -1,6 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{engine::peer_progress::PeerProgress, types::node::NodeId};
+use crate::{
+    engine::peer_progress::PeerProgress,
+    types::{log::LogId, node::NodeId},
+};
 
 /// Per-role state the follower carries while in the Follower role.
 ///
@@ -55,6 +58,10 @@ impl CandidateState {
 pub struct LeaderState {
     /// Per-peer replication state for every other node in the cluster.
     pub(crate) progress: PeerProgress,
+    /// Per-peer outbound snapshot transfer progress. `next_offset` is
+    /// the first byte the follower has not yet acknowledged for the
+    /// snapshot at `last_included`.
+    pub(crate) snapshot_transfers: BTreeMap<NodeId, SnapshotTransfer>,
 }
 
 impl LeaderState {
@@ -64,6 +71,13 @@ impl LeaderState {
     pub fn progress(&self) -> &PeerProgress {
         &self.progress
     }
+}
+
+/// Leader-side progress for one chunked snapshot install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotTransfer {
+    pub(crate) last_included: LogId,
+    pub(crate) next_offset: u64,
 }
 
 /// The Raft role. Every node is exactly one of these at any given time.

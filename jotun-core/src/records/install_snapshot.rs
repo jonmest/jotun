@@ -24,6 +24,14 @@ pub struct RequestInstallSnapshot {
     /// Opaque application bytes. The receiver hands these to its
     /// state machine via `Action::ApplySnapshot` after persisting.
     pub data: Vec<u8>,
+    /// Byte offset this chunk starts at within the logical snapshot
+    /// stream. `0` starts a fresh transfer; non-zero values resume an
+    /// in-progress install.
+    pub offset: u64,
+    /// True when this chunk reaches the end of the logical snapshot
+    /// stream. Followers install only once they have received every
+    /// byte up to and including this chunk.
+    pub done: bool,
     /// Sender's `commit_index` at the time of send. The follower
     /// advances its own `commit_index` to at least
     /// `min(leader_commit, last_included.index)` on success.
@@ -45,4 +53,15 @@ pub struct RequestInstallSnapshot {
 pub struct InstallSnapshotResponse {
     /// Receiver's term.
     pub term: Term,
+    /// Snapshot tail this acknowledgement refers to. On a completed
+    /// install this is the follower's currently-installed snapshot
+    /// tail, which may be newer than the leader's offered tail if the
+    /// follower had already compacted further.
+    pub last_included: LogId,
+    /// Number of contiguous bytes the follower now holds for
+    /// `last_included`. Meaningful only when `done == false`.
+    pub next_offset: u64,
+    /// True once the follower has installed a complete snapshot at
+    /// `last_included` and is ready to resume with `AppendEntries`.
+    pub done: bool,
 }

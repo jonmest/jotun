@@ -4,15 +4,17 @@
 use super::fixtures::{
     append_entries_from, append_entries_request, append_entries_success_from,
     collect_append_entries, collect_apply_snapshots, collect_install_snapshots,
-    collect_persist_snapshots, follower, follower_with_env, install_snapshot_from,
-    install_snapshot_response_from, log_id, node, seed_log, snapshot_taken, term,
-    vote_response_from,
+    collect_persist_snapshots, collect_snapshot_hints, follower, follower_with_env,
+    install_snapshot_from, install_snapshot_response_from, log_id, node, seed_log,
+    snapshot_taken, term, vote_response_from,
 };
 use crate::engine::action::Action;
-use crate::engine::engine::Engine;
+use crate::engine::engine::{Engine, EngineConfig};
 use crate::engine::env::StaticEnv;
 use crate::engine::event::Event;
 use crate::engine::role_state::RoleState;
+use crate::records::log_entry::{LogEntry, LogPayload};
+use crate::types::log::LogId;
 use crate::types::index::LogIndex;
 use crate::types::term::Term;
 
@@ -187,15 +189,50 @@ fn entries_from_below_floor_returns_empty_slice() {
     assert_eq!(engine.log().entries_from(LogIndex::new(4)).len(), 2);
 }
 
+#[test]
+fn snapshot_hint_fires_once_per_applied_threshold_band_and_rearms_after_snapshot() {
+    let mut engine = Engine::with_config(
+        node(1),
+        [node(2), node(3)],
+        Box::new(StaticEnv(10)),
+        1,
+        EngineConfig {
+            snapshot_chunk_size_bytes: 16,
+            snapshot_hint_threshold_entries: 2,
+        },
+    );
+    seed_log(&mut engine, &[1, 1, 1, 1]);
+
+    let first = engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, engine.log().last_log_id(), vec![], 2),
+    ));
+    assert_eq!(collect_snapshot_hints(&first), vec![LogIndex::new(2)]);
+
+    let no_repeat = engine.step(Event::Tick);
+    assert!(
+        collect_snapshot_hints(&no_repeat).is_empty(),
+        "threshold band should only hint once until the floor advances",
+    );
+
+    engine.step(snapshot_taken(2, b"snap@2".to_vec()));
+
+    let second = engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, engine.log().last_log_id(), vec![], 4),
+    ));
+    assert_eq!(collect_snapshot_hints(&second), vec![LogIndex::new(4)]);
+}
+
 // ---------------------------------------------------------------------------
 // Pass 2: InstallSnapshot RPC (§7) — leader-side branching
 // ---------------------------------------------------------------------------
 
 /// 3-node leader (self=1, peers=2,3) at term 1, log = [(1,1)=Noop],
 /// having already taken a snapshot at index 1.
-fn leader_with_snapshot() -> Engine<Vec<u8>> {
+fn leader_with_snapshot_config(config: EngineConfig) -> Engine<Vec<u8>> {
     let env = StaticEnv(1);
-    let mut engine = follower_with_env(1, &[2, 3], Box::new(env));
+    let mut engine = Engine::with_config(node(1), [node(2), node(3)], Box::new(env), 1, config);
     engine.step(Event::Tick);
     engine.step(vote_response_from(2, 1, true));
     assert!(matches!(engine.role(), RoleState::Leader(_)));
@@ -205,6 +242,10 @@ fn leader_with_snapshot() -> Engine<Vec<u8>> {
     engine.step(snapshot_taken(1, b"snap@1".to_vec()));
     assert_eq!(engine.log().snapshot_last().index, LogIndex::new(1));
     engine
+}
+
+fn leader_with_snapshot() -> Engine<Vec<u8>> {
+    leader_with_snapshot_config(EngineConfig::default())
 }
 
 #[test]
@@ -235,6 +276,8 @@ fn leader_sends_install_snapshot_when_peer_next_index_is_below_floor() {
     assert_eq!(req.last_included.index, LogIndex::new(1));
     assert_eq!(req.last_included.term, term(1));
     assert_eq!(req.data, b"snap@1");
+    assert_eq!(req.offset, 0);
+    assert!(req.done);
 }
 
 #[test]
@@ -267,7 +310,7 @@ fn install_snapshot_response_advances_match_index_to_snapshot_floor() {
     engine.step(Event::Tick); // sends InstallSnapshot
 
     let term_now = engine.current_term().get();
-    engine.step(install_snapshot_response_from(3, term_now));
+    engine.step(install_snapshot_response_from(3, term_now, 1, 1, 6, true));
 
     let RoleState::Leader(s) = engine.role() else {
         panic!("expected Leader");
@@ -280,9 +323,98 @@ fn install_snapshot_response_advances_match_index_to_snapshot_floor() {
 fn higher_term_install_snapshot_response_demotes_leader() {
     let mut engine = leader_with_snapshot();
     let term_before = engine.current_term();
-    engine.step(install_snapshot_response_from(2, term_before.next().get()));
+    engine.step(install_snapshot_response_from(2, term_before.next().get(), 1, 1, 0, false));
     assert!(matches!(engine.role(), RoleState::Follower(_)));
     assert_eq!(engine.current_term(), term_before.next());
+}
+
+#[test]
+fn leader_streams_snapshot_one_chunk_per_broadcast_and_resumes_on_ack() {
+    let mut engine = leader_with_snapshot_config(EngineConfig {
+        snapshot_chunk_size_bytes: 3,
+        snapshot_hint_threshold_entries: 0,
+    });
+    engine.state_mut().snapshot_bytes = Some(b"abcdefg".to_vec());
+    if let RoleState::Leader(ls) = &mut engine.state_mut().role {
+        ls.progress.record_conflict(node(3), LogIndex::new(1));
+    }
+
+    let first = engine.step(Event::Tick);
+    let req = collect_install_snapshots(&first)
+        .into_iter()
+        .find(|(peer, _)| *peer == node(3))
+        .expect("peer 3 should receive the first snapshot chunk")
+        .1;
+    assert_eq!(req.offset, 0);
+    assert_eq!(req.data, b"abc");
+    assert!(!req.done);
+
+    engine.step(install_snapshot_response_from(3, 1, 1, 1, 3, false));
+    let second = engine.step(Event::Tick);
+    let req = collect_install_snapshots(&second)
+        .into_iter()
+        .find(|(peer, _)| *peer == node(3))
+        .expect("peer 3 should receive the second snapshot chunk")
+        .1;
+    assert_eq!(req.offset, 3);
+    assert_eq!(req.data, b"def");
+    assert!(!req.done);
+
+    engine.step(install_snapshot_response_from(3, 1, 1, 1, 6, false));
+    let third = engine.step(Event::Tick);
+    let req = collect_install_snapshots(&third)
+        .into_iter()
+        .find(|(peer, _)| *peer == node(3))
+        .expect("peer 3 should receive the final snapshot chunk")
+        .1;
+    assert_eq!(req.offset, 6);
+    assert_eq!(req.data, b"g");
+    assert!(req.done);
+
+    engine.step(install_snapshot_response_from(3, 1, 1, 1, 7, true));
+    let RoleState::Leader(s) = engine.role() else {
+        panic!("expected Leader");
+    };
+    assert_eq!(s.progress.match_for(node(3)), Some(LogIndex::new(1)));
+    assert_eq!(s.progress.next_for(node(3)), Some(LogIndex::new(2)));
+}
+
+#[test]
+fn leader_restarts_snapshot_transfer_when_floor_moves() {
+    let mut engine = leader_with_snapshot_config(EngineConfig {
+        snapshot_chunk_size_bytes: 3,
+        snapshot_hint_threshold_entries: 0,
+    });
+    if let RoleState::Leader(ls) = &mut engine.state_mut().role {
+        ls.progress.record_conflict(node(3), LogIndex::new(1));
+    }
+
+    let first = engine.step(Event::Tick);
+    let req = collect_install_snapshots(&first)
+        .into_iter()
+        .find(|(peer, _)| *peer == node(3))
+        .expect("initial snapshot chunk must be sent")
+        .1;
+    assert_eq!(req.offset, 0);
+
+    engine.step(install_snapshot_response_from(3, 1, 1, 1, 3, false));
+    engine.state_mut().log.append(LogEntry {
+        id: LogId::new(LogIndex::new(2), term(1)),
+        payload: LogPayload::Command(Vec::new()),
+    });
+    engine.state_mut().commit_index = LogIndex::new(2);
+    engine.state_mut().last_applied = LogIndex::new(2);
+    engine.step(snapshot_taken(2, b"newer".to_vec()));
+
+    let restarted = engine.step(Event::Tick);
+    let req = collect_install_snapshots(&restarted)
+        .into_iter()
+        .find(|(peer, _)| *peer == node(3))
+        .expect("snapshot transfer should restart from the new floor")
+        .1;
+    assert_eq!(req.last_included.index, LogIndex::new(2));
+    assert_eq!(req.offset, 0);
+    assert_eq!(req.data, b"new");
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +432,8 @@ fn follower_install_snapshot_truncates_log_and_advances_commit() {
         5, // last_included_index past our log
         1,
         5,
+        0,
+        true,
         b"the-snapshot".to_vec(),
     ));
 
@@ -351,7 +485,7 @@ fn follower_install_snapshot_keeps_consistent_log_tail() {
     let mut engine = follower(1);
     seed_log(&mut engine, &[1, 1, 1, 1]);
 
-    engine.step(install_snapshot_from(2, 1, 2, 1, 2, b"snap".to_vec()));
+    engine.step(install_snapshot_from(2, 1, 2, 1, 2, 0, true, b"snap".to_vec()));
 
     assert_eq!(engine.log().snapshot_last().index, LogIndex::new(2));
     // Entries 3, 4 still in memory.
@@ -375,12 +509,24 @@ fn follower_install_snapshot_below_existing_floor_is_a_noop() {
     assert_eq!(engine.log().snapshot_last().index, LogIndex::new(5));
 
     // Stale snapshot at 3.
-    engine.step(install_snapshot_from(2, 1, 3, 1, 3, b"stale".to_vec()));
+    let actions = engine.step(install_snapshot_from(2, 1, 3, 1, 3, 0, true, b"stale".to_vec()));
     assert_eq!(
         engine.log().snapshot_last().index,
         LogIndex::new(5),
         "stale InstallSnapshot must not move our floor backward",
     );
+    let response = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::Send {
+                message: crate::records::message::Message::InstallSnapshotResponse(response),
+                ..
+            } => Some(*response),
+            _ => None,
+        })
+        .expect("stale snapshot must still be acknowledged");
+    assert_eq!(response.last_included.index, LogIndex::new(5));
+    assert!(response.done);
 }
 
 #[test]
@@ -393,7 +539,7 @@ fn install_snapshot_with_lower_term_is_rejected_with_our_term() {
     ));
     assert_eq!(engine.current_term(), term(5));
 
-    let actions = engine.step(install_snapshot_from(2, 1, 1, 1, 1, b"".to_vec()));
+    let actions = engine.step(install_snapshot_from(2, 1, 1, 1, 1, 0, true, b"".to_vec()));
 
     // Floor unchanged; reply carries our term so leader steps down.
     assert_eq!(engine.log().snapshot_last().index, LogIndex::ZERO);
@@ -419,9 +565,66 @@ fn install_snapshot_at_higher_term_demotes_candidate_then_accepts() {
     engine.step(Event::Tick); // → Candidate at term 1
     assert!(matches!(engine.role(), RoleState::Candidate(_)));
 
-    engine.step(install_snapshot_from(2, 5, 1, 5, 1, b"new".to_vec()));
+    engine.step(install_snapshot_from(2, 5, 1, 5, 1, 0, true, b"new".to_vec()));
 
     assert!(matches!(engine.role(), RoleState::Follower(_)));
     assert_eq!(engine.current_term(), term(5));
     assert_eq!(engine.log().snapshot_last().index, LogIndex::new(1));
+}
+
+#[test]
+fn follower_buffers_chunked_snapshot_until_final_chunk() {
+    let mut engine = follower(1);
+    seed_log(&mut engine, &[1, 1]);
+
+    let first = engine.step(install_snapshot_from(2, 1, 5, 1, 5, 0, false, b"chunk-1".to_vec()));
+    assert!(
+        collect_persist_snapshots(&first).is_empty(),
+        "partial chunks must not be persisted as a complete snapshot",
+    );
+    assert!(
+        collect_apply_snapshots(&first).is_empty(),
+        "partial chunks must not be applied to the state machine",
+    );
+    let response = first
+        .iter()
+        .find_map(|action| match action {
+            Action::Send {
+                message: crate::records::message::Message::InstallSnapshotResponse(response),
+                ..
+            } => Some(*response),
+            _ => None,
+        })
+        .expect("partial snapshot chunk should be acknowledged");
+    assert_eq!(response.next_offset, 7);
+    assert!(!response.done);
+    assert_eq!(engine.log().snapshot_last().index, LogIndex::ZERO);
+
+    let second = engine.step(install_snapshot_from(2, 1, 5, 1, 5, 7, true, b"-done".to_vec()));
+    assert_eq!(engine.log().snapshot_last().index, LogIndex::new(5));
+    let persists = collect_persist_snapshots(&second);
+    assert_eq!(persists.len(), 1);
+    assert_eq!(persists[0].2, b"chunk-1-done");
+    let applied = collect_apply_snapshots(&second);
+    assert_eq!(applied, vec![b"chunk-1-done".to_vec()]);
+}
+
+#[test]
+fn follower_reports_resume_offset_for_out_of_order_snapshot_chunk() {
+    let mut engine = follower(1);
+
+    let actions = engine.step(install_snapshot_from(2, 1, 5, 1, 5, 4, false, b"tail".to_vec()));
+    let response = actions
+        .iter()
+        .find_map(|action| match action {
+            Action::Send {
+                message: crate::records::message::Message::InstallSnapshotResponse(response),
+                ..
+            } => Some(*response),
+            _ => None,
+        })
+        .expect("out-of-order chunk must be acknowledged with a resume offset");
+    assert_eq!(response.next_offset, 0);
+    assert!(!response.done);
+    assert_eq!(engine.log().snapshot_last().index, LogIndex::ZERO);
 }

@@ -69,4 +69,13 @@ pub enum Action<C> {
     /// `restore` method with these bytes before consuming any
     /// subsequent `Apply`.
     ApplySnapshot { bytes: Vec<u8> },
+    /// Advisory: enough applied history has accumulated past the
+    /// current snapshot floor that the host may want to cut a new
+    /// snapshot at `last_included_index`.
+    ///
+    /// The engine emits at most one hint per configured threshold band
+    /// until the floor advances. Hosts are free to ignore the hint,
+    /// debounce it further, or snapshot at a lower index if their
+    /// state machine can only cut at a coarser boundary.
+    SnapshotHint { last_included_index: LogIndex },
 }

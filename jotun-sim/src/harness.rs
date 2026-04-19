@@ -175,10 +175,11 @@ impl<C: Clone> NodeHarness<C> {
                         bytes: bytes.clone(),
                     });
                 }
-                // Redirect: nothing for the harness to do; tests inspect
-                // these directly. ApplySnapshot: pass-2 InstallSnapshot
-                // path; pass-1 SnapshotTaken never emits it.
-                Action::Redirect { .. } | Action::ApplySnapshot { .. } => {}
+                // Redirect and SnapshotHint are advisory; ApplySnapshot
+                // only affects the host-side state machine model.
+                Action::Redirect { .. }
+                | Action::ApplySnapshot { .. }
+                | Action::SnapshotHint { .. } => {}
             }
         }
         Ok(())
@@ -322,6 +323,8 @@ fn hydrate_engine<C: Clone>(engine: &mut Engine<C>, persisted: &PersistedState<C
                 leader_id: peer,
                 last_included: LogId::new(snap.last_included_index, snap.last_included_term),
                 data: snap.bytes.clone(),
+                offset: 0,
+                done: true,
                 leader_commit: snap.last_included_index,
                 peers: snap.peers.clone(),
             }),
