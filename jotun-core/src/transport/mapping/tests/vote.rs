@@ -60,3 +60,31 @@ proptest! {
         }
     }
 }
+
+// A RequestVote carrying last_log_id = Some(LogId { index: 0 }) must
+// reject — covers the `last_log_id.map(TryInto::try_into).transpose()?`
+// branch that the fuzzy strategy rarely lands on with bad inputs.
+#[test]
+fn request_vote_zero_last_log_index_rejected() {
+    let p = proto::RequestVote {
+        term: 1,
+        candidate_id: 2,
+        last_log_id: Some(proto::LogId { index: 0, term: 1 }),
+    };
+    let err = RequestVote::try_from(p).unwrap_err();
+    assert_eq!(err, ConvertError::ZeroLogIndex("LogId.index"));
+}
+
+#[test]
+fn request_vote_with_populated_last_log_id_roundtrips() {
+    let v = RequestVote {
+        term: crate::types::term::Term::new(3),
+        candidate_id: crate::types::node::NodeId::new(2).unwrap(),
+        last_log_id: Some(crate::types::log::LogId::new(
+            crate::types::index::LogIndex::new(7),
+            crate::types::term::Term::new(3),
+        )),
+    };
+    let round: RequestVote = proto::RequestVote::from(v).try_into().unwrap();
+    assert_eq!(v, round);
+}

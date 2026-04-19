@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use crate::records::{
     append_entries::{AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries},
     install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot},
-    log_entry::{LogEntry, LogPayload},
+    log_entry::{ConfigChange, LogEntry, LogPayload},
     message::Message,
     timeout_now::TimeoutNow,
     vote::{RequestVote, VoteResponse, VoteResult},
@@ -54,10 +54,18 @@ pub(super) fn vote_response() -> impl Strategy<Value = VoteResponse> {
     (term(), vote_result()).prop_map(|(term, result)| VoteResponse { term, result })
 }
 
+pub(super) fn config_change() -> impl Strategy<Value = ConfigChange> {
+    prop_oneof![
+        node_id().prop_map(ConfigChange::AddPeer),
+        node_id().prop_map(ConfigChange::RemovePeer),
+    ]
+}
+
 pub(super) fn log_payload() -> impl Strategy<Value = LogPayload<Vec<u8>>> {
     prop_oneof![
         Just(LogPayload::Noop),
         vec(any::<u8>(), 0..64).prop_map(LogPayload::Command),
+        config_change().prop_map(LogPayload::ConfigChange),
     ]
 }
 

@@ -46,3 +46,21 @@ proptest! {
         }
     }
 }
+
+// Exhaustive Display coverage for ConvertError — every variant must
+// produce a non-empty, human-readable string with the field name or
+// discriminant surfaced. Not behavior-critical, but keeps the error
+// surface honest for operators reading logs.
+#[test]
+fn convert_error_display_every_variant() {
+    assert_eq!(
+        ConvertError::ZeroNodeId.to_string(),
+        "node id must be non-zero",
+    );
+    let s = ConvertError::ZeroLogIndex("SomeField.index").to_string();
+    assert!(s.contains("SomeField.index"), "got {s}");
+    let s = ConvertError::MissingField("OtherField").to_string();
+    assert!(s.contains("OtherField"), "got {s}");
+    let s = ConvertError::UnknownEnum("VoteResult", 42).to_string();
+    assert!(s.contains("VoteResult") && s.contains("42"), "got {s}");
+}

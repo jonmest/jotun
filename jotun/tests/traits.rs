@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-use jotun::{DecodeError, NodeId, StateMachine, Storage, StoredHardState, StoredSnapshot};
+use jotun::{DecodeError, NodeId, StateMachine, Storage, StoredHardState, StoredSnapshot, Transport};
+use std::error::Error as _;
 use jotun_core::{Incoming, LogEntry, LogIndex, Message, Term};
 
 // ---------------------------------------------------------------------------
@@ -263,4 +264,91 @@ fn impls_are_send_static() {
     // Engine carries Incoming/Message between threads via Action::Send.
     let _: Option<Incoming<Vec<u8>>> = None;
     let _: Option<Message<Vec<u8>>> = None;
+}
+
+// ---------------------------------------------------------------------------
+// state_machine.rs direct coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decode_error_new_and_display() {
+    let e = DecodeError::new("bad input");
+    assert_eq!(e.reason, "bad input");
+    let s = format!("{e}");
+    assert!(s.contains("command decode error"));
+    assert!(s.contains("bad input"));
+    // Error::source is the default (None).
+    assert!(e.source().is_none());
+    // Clone + Eq round-trip.
+    let e2 = e.clone();
+    assert_eq!(e, e2);
+}
+
+/// State machine that opts out of `snapshot()` and relies on the default
+/// `restore()` panic.
+struct NoSnapshotKv;
+
+impl StateMachine for NoSnapshotKv {
+    type Command = Vec<u8>;
+    type Response = ();
+    fn encode_command(c: &Self::Command) -> Vec<u8> {
+        c.clone()
+    }
+    fn decode_command(bytes: &[u8]) -> Result<Self::Command, DecodeError> {
+        Ok(bytes.to_vec())
+    }
+    fn apply(&mut self, _: Self::Command) -> Self::Response {}
+}
+
+#[test]
+#[should_panic(expected = "StateMachine::restore not implemented")]
+fn default_restore_panics_with_documented_message() {
+    let mut sm = NoSnapshotKv;
+    sm.restore(b"anything".to_vec());
+}
+
+#[test]
+fn default_snapshot_for_custom_impl_is_empty() {
+    let sm = NoSnapshotKv;
+    assert!(sm.snapshot().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// transport::Transport default shutdown() — covers the 3-line default body.
+// ---------------------------------------------------------------------------
+
+struct NopTransport;
+
+impl Transport<Vec<u8>> for NopTransport {
+    type Error = Infallible;
+    async fn send(
+        &self,
+        _to: NodeId,
+        _message: Message<Vec<u8>>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    async fn recv(&mut self) -> Option<Incoming<Vec<u8>>> {
+        None
+    }
+    // Intentionally does NOT override `shutdown` — exercises the default.
+}
+
+#[tokio::test]
+async fn transport_default_shutdown_is_a_noop() {
+    let mut t = NopTransport;
+    // Default impl returns () immediately.
+    t.shutdown().await;
+    // And recv still returns None.
+    assert!(t.recv().await.is_none());
+    t.send(
+        nid(1),
+        Message::VoteRequest(jotun_core::RequestVote {
+            term: Term::new(1),
+            candidate_id: nid(1),
+            last_log_id: None,
+        }),
+    )
+    .await
+    .unwrap();
 }

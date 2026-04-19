@@ -19,6 +19,8 @@ use jotun::{NodeId, TcpTransport, Transport};
 use jotun_core::records::vote::{RequestVote, VoteResponse, VoteResult};
 use jotun_core::types::log::LogId;
 use jotun_core::{LogIndex, Message, Term};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 fn nid(n: u64) -> NodeId {
     NodeId::new(n).unwrap()
@@ -146,6 +148,255 @@ async fn many_messages_arrive_in_order() {
             other => panic!("expected VoteRequest, got {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn peer_restart_on_same_port_is_survived_by_reconnect() {
+    // Exercises the writer task's reconnect loop: when the peer drops
+    // the TCP connection, the next `write_all` fails, we set `conn =
+    // None`, loop back, re-dial, and deliver the frame.
+    let port_a = free_port();
+    let port_b = free_port();
+    let addr_a: SocketAddr = (Ipv4Addr::LOCALHOST, port_a).into();
+    let addr_b: SocketAddr = (Ipv4Addr::LOCALHOST, port_b).into();
+
+    let mut peers_a = BTreeMap::new();
+    peers_a.insert(nid(2), addr_b);
+    let mut peers_b = BTreeMap::new();
+    peers_b.insert(nid(1), addr_a);
+
+    let a: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr_a, peers_a).await.unwrap();
+
+    let mut b: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b.clone())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send once to confirm the path works.
+    let req = RequestVote {
+        term: Term::new(1),
+        candidate_id: nid(1),
+        last_log_id: None,
+    };
+    a.send(nid(2), Message::VoteRequest(req)).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(1), b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Kill b. Give the OS a beat to release the port.
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Restart b on the same port. The writer in `a` should reconnect
+    // once b is back up.
+    let mut b2: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b)
+        .await
+        .unwrap();
+    // Send is best-effort: a failed write drops the message. Race
+    // send-loop against recv — the writer in `a` will reconnect
+    // once b2's listener is up, and the next enqueued frame flushes.
+    let req2 = RequestVote {
+        term: Term::new(2),
+        candidate_id: nid(1),
+        last_log_id: None,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut received = None;
+    while std::time::Instant::now() < deadline {
+        let _ = a.send(nid(2), Message::VoteRequest(req2)).await;
+        if let Ok(msg) = tokio::time::timeout(Duration::from_millis(250), b2.recv()).await {
+            received = msg;
+            if received.is_some() {
+                break;
+            }
+        }
+    }
+    assert!(
+        received.is_some(),
+        "reconnect never delivered a message within 10s",
+    );
+}
+
+#[tokio::test]
+async fn malformed_prefix_zero_sender_drops_connection() {
+    // Open a raw TCP stream to a TcpTransport and send a frame whose
+    // sender id is zero. The reader must drop the connection instead
+    // of crashing; we observe the drop via the socket being closed.
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let _rx: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&0u64.to_be_bytes()); // sender id = 0
+    frame.extend_from_slice(&0u32.to_be_bytes()); // body len 0
+    s.write_all(&frame).await.unwrap();
+    s.flush().await.unwrap();
+    // The reader task should close its side; reading returns 0.
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+    assert_eq!(n, 0, "expected server to close after zero-sender frame");
+}
+
+#[tokio::test]
+async fn malformed_prefix_oversize_drops_connection() {
+    // Send a frame whose declared body length exceeds the 64 MiB cap.
+    // The reader must drop the connection without allocating the body.
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let _rx: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&1u64.to_be_bytes());
+    frame.extend_from_slice(&(128u32 * 1024 * 1024).to_be_bytes()); // 128 MiB, over the cap
+    s.write_all(&frame).await.unwrap();
+    s.flush().await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn malformed_body_fails_decode_and_drops_connection() {
+    // Valid prefix but a body that isn't a valid protobuf Message.
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let _rx: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let garbage: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff";
+    let len = garbage.len() as u32;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&2u64.to_be_bytes());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(garbage);
+    s.write_all(&frame).await.unwrap();
+    s.flush().await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn client_disconnect_before_full_prefix_is_clean() {
+    // Exercise the UnexpectedEof branch of read_prefix (no debug log).
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let _rx: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let s = TcpStream::connect(addr).await.unwrap();
+    // Close immediately, no bytes sent.
+    drop(s);
+    // No panic; give the reader task a beat to run its EOF branch.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn shutdown_aborts_owned_tasks() {
+    // Calling shutdown() should abort listener, writers, and readers.
+    // After shutdown, recv() returns None (the inbound sender in the
+    // listener task has been dropped).
+    let port_a = free_port();
+    let port_b = free_port();
+    let addr_a: SocketAddr = (Ipv4Addr::LOCALHOST, port_a).into();
+    let addr_b: SocketAddr = (Ipv4Addr::LOCALHOST, port_b).into();
+    let mut peers_a = BTreeMap::new();
+    peers_a.insert(nid(2), addr_b);
+
+    let mut a: TcpTransport<Vec<u8>> =
+        TcpTransport::start(nid(1), addr_a, peers_a).await.unwrap();
+
+    // Open an inbound connection from a naked TCP client to spawn a
+    // reader task we can observe being aborted.
+    let _s = TcpStream::connect(addr_a).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    a.shutdown().await;
+
+    // After shutdown, recv returns None promptly.
+    let result = tokio::time::timeout(Duration::from_secs(1), a.recv())
+        .await
+        .expect("recv didn't return after shutdown");
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn drop_aborts_tasks_without_shutdown() {
+    // Construct a transport with an active inbound reader, then drop
+    // it without calling shutdown. The Drop impl should abort all
+    // tasks cleanly.
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let t: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+    let _s = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(t);
+    // If Drop panics, this test fails. Otherwise, we're good.
+}
+
+#[tokio::test]
+async fn debug_impl_prints_node_id() {
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let t: TcpTransport<Vec<u8>> = TcpTransport::start(nid(42), addr, BTreeMap::new())
+        .await
+        .unwrap();
+    let s = format!("{t:?}");
+    assert!(s.contains("TcpTransport"));
+    assert!(s.contains("42"));
+}
+
+#[tokio::test]
+async fn self_id_in_peer_map_is_silently_ignored() {
+    // `me` in the peers arg should be dropped silently, not produce an
+    // error or spawn a self-connecting writer.
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let mut peers = BTreeMap::new();
+    peers.insert(nid(1), addr); // same as `me`
+    let a: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, peers).await.unwrap();
+    // Sending to nid(1) should return UnknownPeer — the self entry was
+    // filtered out of the map.
+    let req = RequestVote {
+        term: Term::new(1),
+        candidate_id: nid(1),
+        last_log_id: None,
+    };
+    let err = a.send(nid(1), Message::VoteRequest(req)).await.unwrap_err();
+    assert!(format!("{err}").contains("unknown peer"));
+}
+
+#[tokio::test]
+async fn tcp_transport_error_display_covers_all_variants() {
+    use jotun::TcpTransportError;
+    let e = TcpTransportError::UnknownPeer(nid(5));
+    let s = format!("{e}");
+    assert!(s.contains("unknown peer") && s.contains('5'), "got: {s}");
+    let e = TcpTransportError::PeerWriterDead(nid(6));
+    assert!(format!("{e}").contains("peer writer task dead"));
+    let e = TcpTransportError::FrameTooLarge;
+    assert!(format!("{e}").contains("4 GiB"));
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 use super::strategies;
 use crate::records::{
     append_entries::{AppendEntriesResponse, RequestAppendEntries},
-    log_entry::LogEntry,
+    log_entry::{ConfigChange, LogEntry},
 };
 use crate::transport::mapping::ConvertError;
 use crate::transport::protobuf as proto;
@@ -184,4 +184,58 @@ fn append_entries_response_conflict_zero_hint_rejected() {
         err,
         ConvertError::ZeroLogIndex("AppendEntriesResponse.conflict.next_index_hint"),
     );
+}
+
+// ---------------------------------------------------------------------------
+// ConfigChange payload coverage. The strategy now includes ConfigChange,
+// so log_entry_roundtrip / _wire_roundtrip transitively exercise them
+// through the fuzzer — these targeted tests lock in the failure modes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_change_missing_kind_rejected() {
+    let p = proto::ConfigChange { kind: None };
+    let err = ConfigChange::try_from(p).unwrap_err();
+    assert_eq!(err, ConvertError::MissingField("ConfigChange.kind"));
+}
+
+#[test]
+fn config_change_add_peer_zero_id_rejected() {
+    let p = proto::ConfigChange {
+        kind: Some(proto::config_change::Kind::AddPeer(proto::NodeIdRef {
+            id: 0,
+        })),
+    };
+    let err = ConfigChange::try_from(p).unwrap_err();
+    assert_eq!(err, ConvertError::ZeroNodeId);
+}
+
+#[test]
+fn config_change_remove_peer_zero_id_rejected() {
+    let p = proto::ConfigChange {
+        kind: Some(proto::config_change::Kind::RemovePeer(proto::NodeIdRef {
+            id: 0,
+        })),
+    };
+    let err = ConfigChange::try_from(p).unwrap_err();
+    assert_eq!(err, ConvertError::ZeroNodeId);
+}
+
+#[test]
+fn log_entry_config_change_payload_with_bad_inner_rejects() {
+    // A LogEntry carrying a ConfigChange whose inner NodeIdRef is
+    // zero must propagate the ZeroNodeId error up to the LogEntry
+    // boundary.
+    let p = proto::LogEntry {
+        id: Some(proto::LogId { index: 1, term: 1 }),
+        payload: Some(proto::log_entry::Payload::ConfigChange(
+            proto::ConfigChange {
+                kind: Some(proto::config_change::Kind::AddPeer(proto::NodeIdRef {
+                    id: 0,
+                })),
+            },
+        )),
+    };
+    let err = <LogEntry<Vec<u8>>>::try_from(p).unwrap_err();
+    assert_eq!(err, ConvertError::ZeroNodeId);
 }

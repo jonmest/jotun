@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use jotun::{
     Bootstrap, Config, ConfigError, DecodeError, Node, NodeId, NodeStartError, NodeStatus,
-    ProposeError, StateMachine, Storage, StoredHardState, StoredSnapshot, Transport,
+    ProposeError, ReadError, StateMachine, Storage, StoredHardState, StoredSnapshot,
+    Transport, TransferLeadershipError,
 };
 use jotun_core::{
     Incoming, LogEntry, LogIndex, LogPayload, Message, Term,
@@ -733,4 +734,292 @@ async fn snapshot_hints_can_be_disabled_via_config() {
     assert_eq!(snapshots_taken.load(Ordering::Relaxed), 0);
 
     node.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Error-type Display / source plumbing. Exhaustive unit coverage for the
+// public error enums — every variant's Display reads, and NodeStartError's
+// Error::source returns the underlying cause.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_error_display_covers_every_variant() {
+    let e = ConfigError::HeartbeatNotLessThanElectionMin {
+        heartbeat_interval_ticks: 5,
+        election_timeout_min_ticks: 3,
+    };
+    let s = e.to_string();
+    assert!(s.contains('5') && s.contains('3'), "got: {s}");
+
+    let e = ConfigError::InvalidElectionTimeoutRange {
+        election_timeout_min_ticks: 10,
+        election_timeout_max_ticks: 10,
+    };
+    assert!(e.to_string().contains("empty"));
+
+    let e = ConfigError::PeersContainSelf { node_id: nid(1) };
+    assert!(e.to_string().contains("must not contain self"));
+
+    let e = ConfigError::InvalidSnapshotChunkSize {
+        snapshot_chunk_size_bytes: 0,
+    };
+    assert!(e.to_string().contains("greater than zero"));
+}
+
+#[test]
+fn propose_error_display_covers_every_variant() {
+    let cases = [
+        ProposeError::NotLeader { leader_hint: nid(2) },
+        ProposeError::NoLeader,
+        ProposeError::Shutdown,
+        ProposeError::DriverDead,
+        ProposeError::Busy,
+        ProposeError::Fatal { reason: "boom" },
+    ];
+    for e in cases {
+        assert!(!e.to_string().is_empty(), "empty display for {e:?}");
+    }
+    assert!(
+        ProposeError::NotLeader { leader_hint: nid(7) }
+            .to_string()
+            .contains('7'),
+        "leader_hint must surface in Display",
+    );
+    assert!(
+        ProposeError::Fatal { reason: "disk on fire" }
+            .to_string()
+            .contains("disk on fire"),
+    );
+}
+
+#[test]
+fn transfer_leadership_error_display_covers_every_variant() {
+    let cases = [
+        TransferLeadershipError::NotLeader { leader_hint: nid(2) },
+        TransferLeadershipError::NoLeader,
+        TransferLeadershipError::InvalidTarget { target: nid(9) },
+        TransferLeadershipError::Shutdown,
+        TransferLeadershipError::DriverDead,
+        TransferLeadershipError::Fatal { reason: "x" },
+    ];
+    for e in cases {
+        assert!(!e.to_string().is_empty(), "empty display for {e:?}");
+    }
+    assert!(
+        TransferLeadershipError::InvalidTarget { target: nid(9) }
+            .to_string()
+            .contains('9'),
+    );
+}
+
+#[test]
+fn read_error_display_covers_every_variant() {
+    let cases = [
+        ReadError::NotLeader { leader_hint: nid(2) },
+        ReadError::NotReady,
+        ReadError::SteppedDown,
+        ReadError::Shutdown,
+        ReadError::DriverDead,
+        ReadError::Fatal { reason: "y" },
+    ];
+    for e in cases {
+        assert!(!e.to_string().is_empty(), "empty display for {e:?}");
+    }
+}
+
+#[test]
+fn node_start_error_display_and_source_delegate_to_cause() {
+    // NodeStartError is generic over the storage error; pick a real
+    // one (ConfigError is an Error impl so it doubles as a stand-in).
+    let inner = ConfigError::PeersContainSelf { node_id: nid(1) };
+    let e: NodeStartError<std::io::Error> = NodeStartError::Config(inner);
+    assert!(e.to_string().contains("invalid config"));
+    let src = std::error::Error::source(&e).expect("source present");
+    assert!(src.to_string().contains("must not contain self"));
+
+    let io_err = std::io::Error::other("boom");
+    let e: NodeStartError<std::io::Error> = NodeStartError::Storage(io_err);
+    assert!(e.to_string().contains("storage recover failed"));
+    assert!(e.to_string().contains("boom"));
+    assert!(std::error::Error::source(&e).is_some());
+}
+
+// ---------------------------------------------------------------------------
+// transfer_leadership_to: the runtime-level API. Engine-level coverage
+// exists in jotun-core; these tests pin the driver-side role gating.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transfer_leadership_to_self_returns_invalid_target() {
+    let (node, _handle) = start_three_node_leader(16).await;
+    let err = node.transfer_leadership_to(nid(1)).await.unwrap_err();
+    assert!(
+        matches!(err, TransferLeadershipError::InvalidTarget { target } if target == nid(1)),
+        "got {err:?}",
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn transfer_leadership_to_unknown_peer_returns_invalid_target() {
+    let (node, _handle) = start_three_node_leader(16).await;
+    let err = node.transfer_leadership_to(nid(99)).await.unwrap_err();
+    assert!(
+        matches!(err, TransferLeadershipError::InvalidTarget { target } if target == nid(99)),
+        "got {err:?}",
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn transfer_leadership_from_follower_without_leader_returns_no_leader() {
+    // Boot a node with ghost peers so it never wins an election.
+    let (transport, _handle) = TestTransport::new();
+    let node = Node::start(
+        fast_three_node_config(16),
+        Counter::default(),
+        MemoryStorage::<Vec<u8>>::default(),
+        transport,
+    )
+    .await
+    .unwrap();
+
+    // No VoteResponse injected — it stays candidate (or cycles
+    // between follower/candidate). The driver hands back NoLeader
+    // whichever non-leader role it happens to be in at call time.
+    let err = node.transfer_leadership_to(nid(2)).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TransferLeadershipError::NoLeader
+                | TransferLeadershipError::NotLeader { .. }
+        ),
+        "got {err:?}",
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn transfer_leadership_accepts_known_peer_on_leader() {
+    let (node, _handle) = start_three_node_leader(16).await;
+    // Valid known peer — the engine accepts the request and emits a
+    // targeted AppendEntries. Even without a follower acking,
+    // the call itself returns Ok.
+    let r = node.transfer_leadership_to(nid(2)).await;
+    assert!(r.is_ok(), "got {r:?}");
+    node.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// After shutdown, public API calls fail cleanly with Shutdown/DriverDead —
+// no hangs, no panics.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn post_shutdown_api_calls_return_shutdown_errors() {
+    let (node, _handle) = start_three_node_leader(16).await;
+    let clone = node.clone();
+    node.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let err = clone.propose(CountCmd::Inc(1)).await.unwrap_err();
+    assert!(
+        matches!(err, ProposeError::Shutdown | ProposeError::DriverDead),
+        "got {err:?}",
+    );
+    let err = clone.transfer_leadership_to(nid(2)).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TransferLeadershipError::Shutdown | TransferLeadershipError::DriverDead
+        ),
+        "got {err:?}",
+    );
+    let err = clone
+        .read_linearizable(|c: &Counter| c.value)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ReadError::Shutdown | ReadError::DriverDead),
+        "got {err:?}",
+    );
+    let err = clone.add_peer(nid(7)).await.unwrap_err();
+    assert!(
+        matches!(err, ProposeError::Shutdown | ProposeError::DriverDead),
+        "got {err:?}",
+    );
+    let err = clone.remove_peer(nid(2)).await.unwrap_err();
+    assert!(
+        matches!(err, ProposeError::Shutdown | ProposeError::DriverDead),
+        "got {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// add_peer / remove_peer on a non-leader follower return NoLeader; on a
+// candidate, same. Integration coverage of handle_config_change role gating.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn add_peer_on_leaderless_follower_returns_no_leader_or_not_leader() {
+    let (transport, _handle) = TestTransport::new();
+    let node = Node::start(
+        fast_three_node_config(16),
+        Counter::default(),
+        MemoryStorage::<Vec<u8>>::default(),
+        transport,
+    )
+    .await
+    .unwrap();
+
+    let err = node.add_peer(nid(9)).await.unwrap_err();
+    assert!(
+        matches!(err, ProposeError::NoLeader | ProposeError::NotLeader { .. }),
+        "got {err:?}",
+    );
+    let err = node.remove_peer(nid(2)).await.unwrap_err();
+    assert!(
+        matches!(err, ProposeError::NoLeader | ProposeError::NotLeader { .. }),
+        "got {err:?}",
+    );
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn add_peer_on_leader_appends_config_change() {
+    let (node, handle) = start_three_node_leader(16).await;
+
+    // add_peer submits a ConfigChange. The leader's broadcast will
+    // include the new entry. Give the driver a moment to emit, then
+    // inspect what was sent.
+    //
+    // We fire the add_peer concurrently with a tight wait: the call
+    // won't return until the entry commits, which requires a peer
+    // ack we don't provide — so we just check the leader emitted
+    // the replication broadcast with a ConfigChange payload.
+    let handle_ref = handle.clone();
+    tokio::spawn(async move {
+        let _ = node.add_peer(nid(9)).await;
+        let _ = node.shutdown().await;
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_config_change = false;
+    while std::time::Instant::now() < deadline {
+        for (_, msg) in handle_ref.sent.lock().unwrap().iter() {
+            if let Message::AppendEntriesRequest(req) = msg {
+                for e in &req.entries {
+                    if matches!(e.payload, LogPayload::ConfigChange(_)) {
+                        saw_config_change = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if saw_config_change {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(saw_config_change, "leader never broadcast ConfigChange");
 }
