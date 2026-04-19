@@ -12,8 +12,6 @@ env:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages-${{ github.ref }}
@@ -23,6 +21,12 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    # configure-pages needs pages: write on push-to-main to flip
+    # the Pages source. PR builds only read. Keep these job-scoped
+    # so nothing else in the workflow gets write permissions.
+    permissions:
+      contents: read
+      pages: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -81,6 +85,11 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # deploy-pages needs id-token: write for OIDC attestation and
+    # pages: write to publish. Scope to this job only.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
