@@ -5,15 +5,15 @@ Jotun is a Rust Raft library split into a pure consensus engine, a deterministic
 ## Crates
 
 - `jotun-core`
-  Pure Raft engine. No network, disk, or async runtime assumptions. The main API is `Engine::step(Event<C>) -> Vec<Action<C>>`.
+  Pure Raft engine. The main API is `Engine::step(Event<C>) -> Vec<Action<C>>`.
 - `jotun-sim`
   Deterministic cluster simulator for `jotun-core`. It drives crash/recover, partitions, drops, reorderings, partial flushes, and snapshots, then checks Raft safety invariants after every step.
 - `jotun`
-  Batteries-included runtime. Ships `Node`, `Storage`, `Transport`, `DiskStorage`, and `TcpTransport`.
+  Raft runtime. Ships `Node`, `Storage`, `Transport`, `DiskStorage`, and `TcpTransport`.
 - `jotun-examples`
   A small replicated KV server built on `jotun`, plus `run-three-node.sh` for local bring-up.
 
-## What Ships Today
+## Current features
 
 - leader election, log replication, crash recovery, and membership changes
 - snapshot install/restore in the engine and runtime
