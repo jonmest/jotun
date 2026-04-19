@@ -16,10 +16,12 @@ use crate::records::vote::{RequestVote, VoteResponse, VoteResult};
 use crate::types::log::LogId;
 use crate::{
     engine::{
-        action::Action,
+        action::{Action, ReadFailure},
         event::Event,
         incoming::Incoming,
-        role_state::{CandidateState, FollowerState, LeaderState, RoleState, SnapshotTransfer},
+        role_state::{
+            CandidateState, FollowerState, LeaderState, PendingRead, RoleState, SnapshotTransfer,
+        },
     },
     types::{index::LogIndex, node::NodeId, term::Term},
 };
@@ -471,6 +473,7 @@ impl<C: Clone> Engine<C> {
             Event::ClientProposal(command) => self.on_client_proposal(command),
             Event::ProposeConfigChange(change) => self.on_propose_config_change(change),
             Event::TransferLeadership { target } => self.on_transfer_leadership(target),
+            Event::ProposeRead { id } => self.on_propose_read(id),
             Event::SnapshotTaken {
                 last_included_index,
                 bytes,
@@ -978,8 +981,9 @@ impl<C: Clone> Engine<C> {
         let prior_term = self.state.current_term;
         let prior_voted_for = self.state.voted_for;
 
+        let mut stepdown: Vec<Action<C>> = Vec::new();
         if request.term > self.state.current_term {
-            self.become_follower(request.term);
+            stepdown = self.become_follower(request.term);
         }
 
         let is_valid_term = request.term == self.state.current_term;
@@ -1009,7 +1013,7 @@ impl<C: Clone> Engine<C> {
             },
         };
 
-        let mut out = Vec::new();
+        let mut out = stepdown;
         if self.state.current_term != prior_term || self.state.voted_for != prior_voted_for {
             out.push(self.persist_hard_state());
         }
@@ -1023,8 +1027,9 @@ impl<C: Clone> Engine<C> {
     #[instrument(target = "jotun::engine", skip_all)]
     fn on_vote_response(&mut self, voter_id: NodeId, response: VoteResponse) -> Vec<Action<C>> {
         if response.term > self.state.current_term {
-            self.become_follower(response.term);
-            return vec![self.persist_hard_state()];
+            let mut out = self.become_follower(response.term);
+            out.push(self.persist_hard_state());
+            return out;
         }
         if response.term < self.state.current_term {
             return vec![];
@@ -1094,15 +1099,17 @@ impl<C: Clone> Engine<C> {
             term = %request.term
         )
     )]
+    #[allow(clippy::too_many_lines)]
     fn on_append_entries_request(&mut self, request: RequestAppendEntries<C>) -> Vec<Action<C>> {
         let prior_term = self.state.current_term;
         let prior_voted_for = self.state.voted_for;
 
+        let mut stepdown: Vec<Action<C>> = Vec::new();
         if request.term > self.state.current_term
             || (request.term == self.state.current_term
                 && matches!(self.state.role, RoleState::Candidate(_)))
         {
-            self.become_follower(request.term);
+            stepdown = self.become_follower(request.term);
         }
         if request.term < self.state.current_term {
             return vec![self.conflict(request.leader_id, LogIndex::ZERO)];
@@ -1136,7 +1143,7 @@ impl<C: Clone> Engine<C> {
                 .last_log_id()
                 .map_or(LogIndex::new(1), |l| l.index.next());
             let hint = our_last_next.min(prev.index);
-            let mut out = Vec::new();
+            let mut out = std::mem::take(&mut stepdown);
             if hard_state_changed {
                 out.push(self.persist_hard_state());
             }
@@ -1168,7 +1175,7 @@ impl<C: Clone> Engine<C> {
                     if existing.id.term != entry.id.term {
                         if entry.id.index <= self.state.commit_index {
                             let hint = entry.id.index;
-                            let mut out = Vec::new();
+                            let mut out = std::mem::take(&mut stepdown);
                             if hard_state_changed {
                                 out.push(self.persist_hard_state());
                             }
@@ -1201,7 +1208,7 @@ impl<C: Clone> Engine<C> {
             self.state.commit_index = request.leader_commit.min(last_appended);
         }
 
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut stepdown);
         if hard_state_changed {
             out.push(self.persist_hard_state());
         }
@@ -1239,8 +1246,9 @@ impl<C: Clone> Engine<C> {
         response: AppendEntriesResponse,
     ) -> Vec<Action<C>> {
         if response.term > self.current_term() {
-            self.become_follower(response.term);
-            return vec![self.persist_hard_state()];
+            let mut out = self.become_follower(response.term);
+            out.push(self.persist_hard_state());
+            return out;
         }
         if response.term < self.current_term() {
             return vec![];
@@ -1269,8 +1277,17 @@ impl<C: Clone> Engine<C> {
                 if last_appended >= snapshot_floor {
                     leader.snapshot_transfers.remove(&peer);
                 }
+                // ReadIndex: this ack implicitly confirms every seq
+                // we've stamped this peer with. Copy it across.
+                if let Some(stamp) = leader.peer_sent_seq.get(&peer).copied() {
+                    let cur = leader.peer_acked_seq.get(&peer).copied().unwrap_or(0);
+                    if stamp > cur {
+                        leader.peer_acked_seq.insert(peer, stamp);
+                    }
+                }
                 let mut out = self.try_advance_commit_as_leader();
                 out.extend(self.maybe_complete_leadership_transfer(peer));
+                out.extend(self.drain_ready_reads());
                 out
             }
             AppendEntriesResult::Conflict { next_index_hint } => {
@@ -1306,11 +1323,12 @@ impl<C: Clone> Engine<C> {
         let prior_term = self.state.current_term;
         let prior_voted_for = self.state.voted_for;
 
+        let mut stepdown: Vec<Action<C>> = Vec::new();
         if request.term > self.state.current_term
             || (request.term == self.state.current_term
                 && matches!(self.state.role, RoleState::Candidate(_)))
         {
-            self.become_follower(request.term);
+            stepdown = self.become_follower(request.term);
         }
         if request.term < self.state.current_term {
             // Stale leader. Reply with our (higher) term so they step
@@ -1357,7 +1375,7 @@ impl<C: Clone> Engine<C> {
         // nothing else.
         if last_included.index <= self.state.log.snapshot_last().index {
             let current_floor = self.state.log.snapshot_last();
-            let mut out = Vec::new();
+            let mut out = std::mem::take(&mut stepdown);
             if hard_state_changed {
                 out.push(self.persist_hard_state());
             }
@@ -1365,7 +1383,7 @@ impl<C: Clone> Engine<C> {
             return out;
         }
 
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut stepdown);
         if hard_state_changed {
             out.push(self.persist_hard_state());
         }
@@ -1507,8 +1525,9 @@ impl<C: Clone> Engine<C> {
         response: InstallSnapshotResponse,
     ) -> Vec<Action<C>> {
         if response.term > self.state.current_term {
-            self.become_follower(response.term);
-            return vec![self.persist_hard_state()];
+            let mut out = self.become_follower(response.term);
+            out.push(self.persist_hard_state());
+            return out;
         }
         if response.term < self.state.current_term {
             return vec![];
@@ -1583,9 +1602,16 @@ impl<C: Clone> Engine<C> {
                 let prior_term = self.state.current_term;
                 // Same-term step-down preserves voted_for; no Persist
                 // needed beyond what drain_apply might emit.
-                self.become_follower(prior_term);
+                // become_follower fails every pending ReadIndex with
+                // SteppedDown as it flips the role.
+                let mut out = self.become_follower(prior_term);
+                out.extend(self.drain_apply());
+                return out;
             }
-            return self.drain_apply();
+            let mut out = self.drain_apply();
+            // last_applied advanced; pending reads may be ready.
+            out.extend(self.drain_ready_reads());
+            return out;
         }
         vec![]
     }
@@ -1627,6 +1653,12 @@ impl<C: Clone> Engine<C> {
         if !matches!(self.state.role, RoleState::Leader(_)) {
             return vec![];
         }
+        // Bump the ReadIndex heartbeat seq: every peer we address in
+        // this round gets stamped with the new seq, and acks to those
+        // messages confirm still-leader at or after this point.
+        if let RoleState::Leader(leader) = &mut self.state.role {
+            leader.heartbeat_seq = leader.heartbeat_seq.wrapping_add(1);
+        }
         let peers: Vec<NodeId> = self.state.peers.iter().copied().collect();
         peers
             .into_iter()
@@ -1647,6 +1679,14 @@ impl<C: Clone> Engine<C> {
             _ => LogIndex::new(1),
         };
         debug_assert!(next.get() >= 1, "nextIndex floor is 1");
+
+        // Stamp this peer with the current heartbeat_seq. On successful
+        // ack, this value is copied into peer_acked_seq so majority-
+        // acked-seq tracks the ReadIndex quorum round.
+        if let RoleState::Leader(leader) = &mut self.state.role {
+            let stamp = leader.heartbeat_seq;
+            leader.peer_sent_seq.insert(peer, stamp);
+        }
 
         // §7: if the peer's nextIndex is at or below the snapshot floor,
         // we can't address the prev entry — send the snapshot instead.
@@ -1799,6 +1839,145 @@ impl<C: Clone> Engine<C> {
         vec![self.timeout_now(peer)]
     }
 
+    // =========================================================================
+    // ReadIndex — linearizable reads (§8)
+    // =========================================================================
+
+    /// Submit a linearizable read against the leader's applied state.
+    ///
+    /// Non-leaders redirect (if a leader is known) or fail with
+    /// `NoLeader` / `NotReady`. Leaders that haven't yet committed an
+    /// entry in their current term fail the read with `NotReady` — the
+    /// §5.4.2 no-op fixes this shortly after election.
+    ///
+    /// Otherwise the read is queued. A broadcast is kicked off to
+    /// confirm still-leader; on majority ack, and once `last_applied`
+    /// has caught up to the recorded `read_index`, `ReadReady` is
+    /// emitted. If either condition fails to hold (e.g. we step down),
+    /// `ReadFailed` is emitted instead.
+    #[instrument(target = "jotun::engine", skip_all)]
+    fn on_propose_read(&mut self, id: u64) -> Vec<Action<C>> {
+        match &self.state.role {
+            RoleState::Leader(_) => {}
+            RoleState::Follower(f) => {
+                let reason = f.leader_id.map_or(ReadFailure::NotReady, |leader_hint| {
+                    ReadFailure::NotLeader { leader_hint }
+                });
+                return vec![Action::ReadFailed { id, reason }];
+            }
+            RoleState::Candidate(_) => {
+                return vec![Action::ReadFailed {
+                    id,
+                    reason: ReadFailure::NotReady,
+                }];
+            }
+        }
+
+        // §8 ReadIndex safety: the leader must have committed at least
+        // one entry in its current term before serving a linearizable
+        // read. Otherwise commit_index may reflect a stale predecessor.
+        // The §5.4.2 no-op appended in become_leader fills this gap as
+        // soon as it commits.
+        if self.state.log.term_at(self.state.commit_index) != Some(self.state.current_term) {
+            return vec![Action::ReadFailed {
+                id,
+                reason: ReadFailure::NotReady,
+            }];
+        }
+
+        let read_index = self.state.commit_index;
+        let RoleState::Leader(leader) = &mut self.state.role else {
+            unreachable!("matched above");
+        };
+        let required_seq = leader.heartbeat_seq + 1;
+        leader.pending_reads.push(PendingRead {
+            id,
+            read_index,
+            required_seq,
+        });
+
+        // Kick a broadcast so the next round of acks advances
+        // majority_acked_seq to >= required_seq.
+        let mut out = self.broadcast_append_entries();
+        // Single-node clusters: no peers to ack, so the read is ready
+        // as soon as it was filed. drain_ready_reads checks the
+        // majority condition below.
+        out.extend(self.drain_ready_reads());
+        out
+    }
+
+    /// Return the highest `heartbeat_seq` that has been acked by a
+    /// majority of the current cluster (self always counted as having
+    /// acked the current `heartbeat_seq`).
+    fn majority_acked_seq(&self) -> u64 {
+        let RoleState::Leader(leader) = &self.state.role else {
+            return 0;
+        };
+        // Collect every peer's acked seq, then add self (always at
+        // the current seq). Majority is floor(n/2)+1 over the full
+        // cluster (peers + self).
+        let mut seqs: Vec<u64> = self
+            .state
+            .peers
+            .iter()
+            .map(|p| leader.peer_acked_seq.get(p).copied().unwrap_or(0))
+            .collect();
+        seqs.push(leader.heartbeat_seq);
+        seqs.sort_unstable();
+        // cluster_size = peers + 1 (self). Majority index from the
+        // top of the sorted list is at seqs[cluster_size - majority]
+        // where majority = cluster_size/2 + 1.
+        let cluster_size = seqs.len();
+        let majority = cluster_size / 2 + 1;
+        // seqs[cluster_size - majority] is the majority-th highest.
+        // cluster_size is always >= 1 (self pushed above); majority
+        // is in (0, cluster_size], so the index is in bounds.
+        seqs.get(cluster_size - majority).copied().unwrap_or(0)
+    }
+
+    /// Emit `ReadReady` for every pending read whose heartbeat-quorum
+    /// condition and `last_applied >= read_index` condition are now
+    /// both satisfied. Called after events that advance either side:
+    /// commit advance (bumps `last_applied`), or AE success (bumps
+    /// `majority_acked_seq`).
+    fn drain_ready_reads(&mut self) -> Vec<Action<C>> {
+        if !matches!(self.state.role, RoleState::Leader(_)) {
+            return vec![];
+        }
+        let majority_seq = self.majority_acked_seq();
+        let last_applied = self.state.last_applied;
+        let RoleState::Leader(leader) = &mut self.state.role else {
+            unreachable!("just matched");
+        };
+        let mut out = Vec::new();
+        leader.pending_reads.retain(|r| {
+            if majority_seq >= r.required_seq && last_applied >= r.read_index {
+                out.push(Action::ReadReady { id: r.id });
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
+    /// Fail every pending read with `SteppedDown`. Called when the
+    /// leader state is about to be discarded (term advance, same-term
+    /// step-down after self-removal, etc.).
+    fn fail_pending_reads(&mut self) -> Vec<Action<C>> {
+        let RoleState::Leader(leader) = &mut self.state.role else {
+            return vec![];
+        };
+        let drained: Vec<PendingRead> = std::mem::take(&mut leader.pending_reads);
+        drained
+            .into_iter()
+            .map(|r| Action::ReadFailed {
+                id: r.id,
+                reason: ReadFailure::SteppedDown,
+            })
+            .collect()
+    }
+
     /// Handle an incoming `TimeoutNow` by starting an immediate
     /// election if the request came from the leader we currently trust
     /// for this term, or from a higher-term leader we just stepped
@@ -1828,8 +2007,11 @@ impl<C: Clone> Engine<C> {
     /// the timer resets only on accepting `AppendEntries` from the current
     /// leader or granting a vote. Callers that need both should do so
     /// explicitly after this returns.
-    fn become_follower(&mut self, term: Term) {
+    fn become_follower(&mut self, term: Term) -> Vec<Action<C>> {
         let from_term = self.state.current_term;
+        // If we were leader, every pending ReadIndex dies with the
+        // role. Collect ReadFailed{SteppedDown} before the role flip.
+        let out = self.fail_pending_reads();
         self.state.current_term = term;
         // §5.1: voted_for is per-term. Only clear it when the term actually
         // advances — a same-term step-down (e.g. a candidate discovering
@@ -1846,6 +2028,7 @@ impl<C: Clone> Engine<C> {
             telemetry::term_advanced(self.id, from_term, term);
         }
         telemetry::became_follower(self.id, term);
+        out
     }
 
     /// Transition to candidate: bump term, vote for self, reset the election
@@ -1892,6 +2075,10 @@ impl<C: Clone> Engine<C> {
             progress,
             snapshot_transfers: std::collections::BTreeMap::default(),
             transfer_target: None,
+            heartbeat_seq: 0,
+            peer_sent_seq: std::collections::BTreeMap::default(),
+            peer_acked_seq: std::collections::BTreeMap::default(),
+            pending_reads: Vec::new(),
         });
         telemetry::became_leader(self.id, self.state.current_term);
 

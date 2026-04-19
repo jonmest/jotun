@@ -7,6 +7,7 @@ mod fixtures;
 mod leadership_transfer;
 mod membership;
 mod persistence;
+mod read_index;
 mod snapshot;
 mod tick;
 mod vote_request;

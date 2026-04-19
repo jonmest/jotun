@@ -399,6 +399,41 @@ impl std::fmt::Display for TransferLeadershipError {
 
 impl std::error::Error for TransferLeadershipError {}
 
+/// Errors from [`Node::read_linearizable`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ReadError {
+    /// We are a follower that knows the current leader. Retry there.
+    NotLeader { leader_hint: NodeId },
+    /// No leader is currently known, or this leader hasn't committed
+    /// an entry in its current term yet (§8 `ReadIndex` safety). The
+    /// caller should retry after a short delay.
+    NotReady,
+    /// The leader stepped down before the read could be served.
+    SteppedDown,
+    /// The node is shutting down.
+    Shutdown,
+    /// The driver task died.
+    DriverDead,
+    /// A non-recoverable runtime error occurred.
+    Fatal { reason: &'static str },
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader { leader_hint } => write!(f, "not leader; try {leader_hint}"),
+            Self::NotReady => write!(f, "leader not ready to serve linearizable reads"),
+            Self::SteppedDown => write!(f, "leader stepped down before read completed"),
+            Self::Shutdown => write!(f, "node is shutting down"),
+            Self::DriverDead => write!(f, "node driver task died"),
+            Self::Fatal { reason } => write!(f, "fatal runtime error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
 /// Errors from [`Node::start`].
 #[non_exhaustive]
 #[derive(Debug)]
@@ -511,6 +546,8 @@ impl<S: StateMachine> Node<S> {
             pending_proposals: HashMap::new(),
             pending_config_changes: HashMap::new(),
             max_pending_proposals,
+            pending_reads: HashMap::new(),
+            next_read_id: 0,
             last_applied: LogIndex::ZERO,
         };
         let driver: JoinHandle<()> = tokio::spawn(driver_loop(driver_state, recovered));
@@ -552,6 +589,51 @@ impl<S: StateMachine> Node<S> {
     /// peer is self, the local node steps down on commit.
     pub async fn remove_peer(&self, peer: NodeId) -> Result<(), ProposeError> {
         self.config_change(ConfigChange::RemovePeer(peer)).await
+    }
+
+    /// Run `reader` against the state machine at a linearizable
+    /// read point (Raft §8 "`ReadIndex`"). Returns whatever `reader`
+    /// returns once the engine confirms this leader is still
+    /// authoritative and has applied everything committed at request
+    /// time.
+    ///
+    /// Errors if this node is not the leader, the leader hasn't yet
+    /// committed an entry in its current term, or the leader steps
+    /// down before the quorum round completes.
+    pub async fn read_linearizable<R, F>(&self, reader: F) -> Result<R, ReadError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&S) -> R + Send + 'static,
+    {
+        let (ok_tx, ok_rx) = oneshot::channel::<R>();
+        let (err_tx, err_rx) = oneshot::channel::<ReadError>();
+
+        let boxed_reader: Box<dyn FnOnce(&S) + Send> = Box::new(move |sm: &S| {
+            let value = reader(sm);
+            let _ = ok_tx.send(value);
+        });
+        let boxed_on_failure: Box<dyn FnOnce(ReadError) + Send> = Box::new(move |e: ReadError| {
+            let _ = err_tx.send(e);
+        });
+
+        if self
+            .inputs
+            .send(DriverInput::Read {
+                reader: boxed_reader,
+                on_failure: boxed_on_failure,
+            })
+            .await
+            .is_err()
+        {
+            return Err(ReadError::Shutdown);
+        }
+
+        tokio::select! {
+            biased;
+            Ok(err) = err_rx => Err(err),
+            Ok(val) = ok_rx => Ok(val),
+            else => Err(ReadError::DriverDead),
+        }
     }
 
     /// Ask the current leader to transfer leadership to `peer`.
@@ -682,11 +764,21 @@ struct Driver<S: StateMachine, St, Tr> {
     /// Combined cap on in-flight proposals + config changes. Keeps the
     /// reply maps from growing unboundedly under load.
     max_pending_proposals: usize,
+    /// Read id → pending reader closures. Keyed on the id chosen when
+    /// the runtime submitted the `ProposeRead` event.
+    pending_reads: HashMap<u64, PendingRead<S>>,
+    /// Monotonic counter that generates read ids.
+    next_read_id: u64,
     /// Highest log index the driver has fed into the state machine.
     /// Mirrors the engine's own `last_applied` but the engine doesn't
     /// expose it publicly, so we track it from the Apply actions we
     /// dispatch.
     last_applied: LogIndex,
+}
+
+struct PendingRead<S: StateMachine> {
+    reader: Box<dyn FnOnce(&S) + Send>,
+    on_failure: Box<dyn FnOnce(ReadError) + Send>,
 }
 
 enum DriverInput<S: StateMachine> {
@@ -702,6 +794,16 @@ enum DriverInput<S: StateMachine> {
     TransferLeadership {
         target: NodeId,
         reply: oneshot::Sender<Result<(), TransferLeadershipError>>,
+    },
+    /// Linearizable read. The driver hands `reader` to the engine as
+    /// a `ProposeRead` event; once the engine signals `ReadReady` for
+    /// this id, the driver runs the closure against the state machine
+    /// and fires its own oneshot. On `ReadFailed` (or driver death),
+    /// `on_failure` converts the reason to a user-visible error and
+    /// fires whatever oneshot the caller is awaiting.
+    Read {
+        reader: Box<dyn FnOnce(&S) + Send>,
+        on_failure: Box<dyn FnOnce(ReadError) + Send>,
     },
     Status {
         reply: oneshot::Sender<NodeStatus>,
@@ -732,6 +834,9 @@ where
                     }
                     DriverInput::ConfigChange { change, reply } => {
                         handle_config_change(&mut d, change, reply).await
+                    }
+                    DriverInput::Read { reader, on_failure } => {
+                        handle_read(&mut d, reader, on_failure).await
                     }
                     DriverInput::TransferLeadership { target, reply } => {
                         handle_transfer_leadership(&mut d, target, reply).await
@@ -948,6 +1053,31 @@ where
     }
 }
 
+async fn handle_read<S, St, Tr>(
+    d: &mut Driver<S, St, Tr>,
+    reader: Box<dyn FnOnce(&S) + Send>,
+    on_failure: Box<dyn FnOnce(ReadError) + Send>,
+) -> Result<(), Fatal>
+where
+    S: StateMachine,
+    St: Storage<Vec<u8>>,
+    Tr: Transport<Vec<u8>>,
+{
+    let id = d.next_read_id;
+    d.next_read_id = d.next_read_id.wrapping_add(1);
+    d.pending_reads.insert(id, PendingRead { reader, on_failure });
+    let actions = d.engine.step(Event::ProposeRead { id });
+    match dispatch_actions(d, actions).await {
+        Ok(()) => Ok(()),
+        Err(fatal) => {
+            if let Some(pending) = d.pending_reads.remove(&id) {
+                (pending.on_failure)(ReadError::Fatal { reason: fatal.reason });
+            }
+            Err(fatal)
+        }
+    }
+}
+
 /// A non-recoverable runtime error. Caught at every layer above
 /// dispatch and propagated up to [`driver_loop`], which fails every
 /// in-flight waiter with [`ProposeError::Fatal`] before exiting.
@@ -973,6 +1103,7 @@ where
     dispatch_actions(d, actions).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_actions<S, St, Tr>(
     d: &mut Driver<S, St, Tr>,
     actions: Vec<Action<Vec<u8>>>,
@@ -1063,6 +1194,25 @@ where
             Action::Redirect { .. } => {
                 // Already handled at the propose call site; engine
                 // shouldn't emit Redirect from any other path.
+            }
+            Action::ReadReady { id } => {
+                if let Some(pending) = d.pending_reads.remove(&id) {
+                    (pending.reader)(&d.state_machine);
+                }
+            }
+            Action::ReadFailed { id, reason } => {
+                if let Some(pending) = d.pending_reads.remove(&id) {
+                    let err = match reason {
+                        jotun_core::ReadFailure::NotLeader { leader_hint } => {
+                            ReadError::NotLeader { leader_hint }
+                        }
+                        jotun_core::ReadFailure::SteppedDown => ReadError::SteppedDown,
+                        // NotReady and any future non-exhaustive variants
+                        // both surface as NotReady; the caller retries.
+                        _ => ReadError::NotReady,
+                    };
+                    (pending.on_failure)(err);
+                }
             }
         }
     }
@@ -1204,6 +1354,12 @@ where
     for idx in indices {
         if let Some(reply) = d.pending_config_changes.remove(&idx) {
             let _ = reply.send(Err(ProposeError::Fatal { reason }));
+        }
+    }
+    let read_ids: Vec<u64> = d.pending_reads.keys().copied().collect();
+    for id in read_ids {
+        if let Some(pending) = d.pending_reads.remove(&id) {
+            (pending.on_failure)(ReadError::Fatal { reason });
         }
     }
 }

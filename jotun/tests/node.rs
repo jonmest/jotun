@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use jotun::{
-    Config, DecodeError, DiskStorage, Node, NodeId, ProposeError, StateMachine, TcpTransport,
+    Config, DecodeError, DiskStorage, Node, NodeId, ProposeError, ReadError, StateMachine,
+    TcpTransport,
 };
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -347,4 +348,95 @@ async fn decode_failure_on_apply_fails_waiter_with_fatal() {
         matches!(err, ProposeError::Fatal { .. }),
         "expected Fatal, got {err:?}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// ReadIndex: a single-node leader serves a linearizable read after its
+// election no-op commits. The closure observes whatever `propose` has
+// already applied.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn single_node_read_linearizable_observes_applied_state() {
+    let tmp = TmpDir::new("single-read");
+    let storage = DiskStorage::open(&tmp.0).await.unwrap();
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let transport: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut config = Config::new(nid(1), std::iter::empty::<NodeId>());
+    config.election_timeout_min_ticks = 3;
+    config.election_timeout_max_ticks = 5;
+    config.heartbeat_interval_ticks = 1;
+    config.tick_interval = Duration::from_millis(10);
+
+    let node = Node::start(config, Counter::default(), storage, transport)
+        .await
+        .unwrap();
+
+    // Wait out election, then commit two increments.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), node.propose(CountCmd::Inc(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), node.propose(CountCmd::Inc(3)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let value = tokio::time::timeout(
+        Duration::from_secs(2),
+        node.read_linearizable(|sm: &Counter| sm.value),
+    )
+    .await
+    .expect("read timed out")
+    .expect("read returned error");
+    assert_eq!(value, 8);
+
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_linearizable_on_follower_returns_not_leader() {
+    // A fresh single-node cluster that hasn't elected yet looks like
+    // a follower to read_linearizable. With peers listed but no quorum
+    // possible, it never becomes leader.
+    let tmp = TmpDir::new("follower-read");
+    let storage = DiskStorage::open(&tmp.0).await.unwrap();
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let transport: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Two ghost peers so the node stays as candidate/follower forever.
+    let mut config = Config::new(nid(1), [nid(2), nid(3)]);
+    config.election_timeout_min_ticks = 3;
+    config.election_timeout_max_ticks = 5;
+    config.heartbeat_interval_ticks = 1;
+    config.tick_interval = Duration::from_millis(10);
+
+    let node = Node::start(config, Counter::default(), storage, transport)
+        .await
+        .unwrap();
+
+    // Short wait — plenty of time to realise no leader will emerge.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(2),
+        node.read_linearizable(|sm: &Counter| sm.value),
+    )
+    .await
+    .expect("read timed out")
+    .expect_err("no-leader read must fail");
+    assert!(
+        matches!(err, ReadError::NotReady | ReadError::NotLeader { .. }),
+        "expected NotReady/NotLeader, got {err:?}",
+    );
+
+    node.shutdown().await.unwrap();
 }

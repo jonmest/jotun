@@ -423,6 +423,32 @@ pub(super) fn transfer_leadership(target: u64) -> Event<Vec<u8>> {
     Event::TransferLeadership { target: node(target) }
 }
 
+pub(super) fn propose_read(id: u64) -> Event<Vec<u8>> {
+    Event::ProposeRead { id }
+}
+
+pub(super) fn collect_read_ready(actions: &[Action<Vec<u8>>]) -> Vec<u64> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::ReadReady { id } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) fn collect_read_failed(
+    actions: &[Action<Vec<u8>>],
+) -> Vec<(u64, crate::engine::action::ReadFailure)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::ReadFailed { id, reason } => Some((*id, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(super) fn timeout_now_from(from: u64, term_n: u64) -> Event<Vec<u8>> {
     Event::Incoming(Incoming {
         from: node(from),

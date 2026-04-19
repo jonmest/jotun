@@ -175,11 +175,15 @@ impl<C: Clone> NodeHarness<C> {
                         bytes: bytes.clone(),
                     });
                 }
-                // Redirect and SnapshotHint are advisory; ApplySnapshot
-                // only affects the host-side state machine model.
+                // Redirect, SnapshotHint, ReadReady, ReadFailed are
+                // advisory for the sim's durability/persistence model;
+                // ApplySnapshot only affects the host-side state
+                // machine model.
                 Action::Redirect { .. }
                 | Action::ApplySnapshot { .. }
-                | Action::SnapshotHint { .. } => {}
+                | Action::SnapshotHint { .. }
+                | Action::ReadReady { .. }
+                | Action::ReadFailed { .. } => {}
             }
         }
         Ok(())

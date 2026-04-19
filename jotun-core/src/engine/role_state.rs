@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     engine::peer_progress::PeerProgress,
-    types::{log::LogId, node::NodeId},
+    types::{index::LogIndex, log::LogId, node::NodeId},
 };
 
 /// Per-role state the follower carries while in the Follower role.
@@ -65,6 +65,34 @@ pub struct LeaderState {
     /// Leadership transfer target, if the current leader is trying to
     /// hand off authority.
     pub(crate) transfer_target: Option<NodeId>,
+    /// Monotonic counter bumped on each replication broadcast. Each
+    /// outgoing `AppendEntries` is stamped with the current value via
+    /// `peer_sent_seq`; a successful ack copies that value into
+    /// `peer_acked_seq`. `ReadIndex` uses majority acked-seq to confirm
+    /// still-leader for a given request.
+    pub(crate) heartbeat_seq: u64,
+    /// Per-peer highest `heartbeat_seq` stamped on a message we sent
+    /// to that peer. Used to translate a successful response back to
+    /// the seq it implicitly acks.
+    pub(crate) peer_sent_seq: BTreeMap<NodeId, u64>,
+    /// Per-peer highest `heartbeat_seq` the peer has acked in the
+    /// current term.
+    pub(crate) peer_acked_seq: BTreeMap<NodeId, u64>,
+    /// Pending `ReadIndex` requests, in submission order.
+    pub(crate) pending_reads: Vec<PendingRead>,
+}
+
+/// A `ReadIndex` request awaiting confirmation that we're still leader.
+///
+/// A request is ready to serve once:
+///  - a majority of the cluster (self included) has acked a broadcast
+///    at or after `required_seq`, AND
+///  - `last_applied >= read_index` on this leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingRead {
+    pub(crate) id: u64,
+    pub(crate) read_index: LogIndex,
+    pub(crate) required_seq: u64,
 }
 
 impl LeaderState {

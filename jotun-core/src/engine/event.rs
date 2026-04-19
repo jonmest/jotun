@@ -49,6 +49,26 @@ pub enum Event<C> {
     TransferLeadership {
         target: NodeId,
     },
+    /// Linearizable read request (Raft §8 "`ReadIndex`").
+    ///
+    /// Leaders record `commit_index` as the read's `read_index`,
+    /// confirm they are still leader via a heartbeat-quorum round,
+    /// then emit [`crate::engine::action::Action::ReadReady`] once
+    /// `last_applied >= read_index`. The id is opaque to the engine;
+    /// the host uses it to match `ReadReady` back to a waiter.
+    ///
+    /// Leaders that have not yet committed an entry in their current
+    /// term fail the read with
+    /// [`crate::engine::action::Action::ReadFailed`] / `NotReady` —
+    /// per §8 the leader must prove current-term authority before
+    /// serving linearizable reads, which the §5.4.2 no-op provides
+    /// once committed.
+    ///
+    /// Non-leaders redirect (if leader is known) or fail the read
+    /// with `NoLeader`.
+    ProposeRead {
+        id: u64,
+    },
     /// The host has just produced a snapshot of the application state
     /// machine that captures everything applied up to
     /// `last_included_index`. The engine truncates its in-memory log

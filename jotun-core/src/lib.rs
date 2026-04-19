@@ -32,7 +32,7 @@ pub mod types;
 // users can `use jotun_core::{Engine, Event, Action, NodeId}` without
 // memorising the internal module layout.
 
-pub use engine::action::Action;
+pub use engine::action::{Action, ReadFailure};
 pub use engine::engine::{Engine, EngineConfig, RecoveredHardState, RecoveredSnapshot};
 pub use engine::env::{Env, RandomizedEnv, StaticEnv};
 pub use engine::event::Event;

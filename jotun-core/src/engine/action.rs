@@ -78,4 +78,31 @@ pub enum Action<C> {
     /// debounce it further, or snapshot at a lower index if their
     /// state machine can only cut at a coarser boundary.
     SnapshotHint { last_included_index: LogIndex },
+    /// A previously-submitted `Event::ProposeRead` is now safe to
+    /// serve against the state machine. `last_applied` has reached
+    /// the read's `read_index` and a majority heartbeat round has
+    /// confirmed this leader is still authoritative.
+    ReadReady { id: u64 },
+    /// A previously-submitted `Event::ProposeRead` cannot be served
+    /// by this engine and will never emit `ReadReady` for this id.
+    ///
+    /// The host should translate the reason into an error returned to
+    /// the caller. `NotLeader { leader_hint }` means the host may
+    /// retry against `leader_hint`; other variants mean give up.
+    ReadFailed { id: u64, reason: ReadFailure },
+}
+
+/// Why a [`Action::ReadFailed`] was emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReadFailure {
+    /// We are not the leader. The host may retry against `leader_hint`.
+    NotLeader { leader_hint: NodeId },
+    /// We are a leader or candidate but have no leader to redirect to,
+    /// OR we are a leader that hasn't yet committed an entry in our
+    /// current term (§5.4.2 / §8): the `ReadIndex` protocol isn't safe
+    /// until then. The caller should retry after a short delay.
+    NotReady,
+    /// We stepped down before the read could complete.
+    SteppedDown,
 }

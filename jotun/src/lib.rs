@@ -1,9 +1,7 @@
-//! Jotun — batteries-included Raft node runtime built on
+//! Jotun — a Raft node runtime built on
 //! [`jotun_core`].
 //!
-//! This crate is the answer for users who want a clustered service
-//! without writing the engine integration themselves. You implement
-//! [`StateMachine`] (your application's apply/restore logic) and call
+//! Users implement [`StateMachine`] (your application's apply/restore logic) and call
 //! [`Node::start`]; the runtime owns the engine, the network
 //! transport, the on-disk persistence, the tick driver, and the
 //! action dispatcher. Incoming snapshots are installed and restored
@@ -31,7 +29,10 @@ pub mod state_machine;
 pub mod storage;
 pub mod transport;
 
-pub use node::{Bootstrap, Config, ConfigError, Node, NodeStartError, NodeStatus, ProposeError, Role};
+pub use node::{
+    Bootstrap, Config, ConfigError, Node, NodeStartError, NodeStatus, ProposeError, ReadError,
+    Role, TransferLeadershipError,
+};
 pub use state_machine::{DecodeError, StateMachine};
 pub use storage::{DiskStorage, DiskStorageError, Storage, StoredHardState, StoredSnapshot};
 pub use transport::{TcpTransport, TcpTransportError, Transport};
