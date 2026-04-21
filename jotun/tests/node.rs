@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use jotun::{
-    Config, DecodeError, DiskStorage, Node, NodeId, ProposeError, ReadError, StateMachine,
-    TcpTransport,
+    Config, DecodeError, DiskStorage, LogIndex, Node, NodeId, NodeStatus, ProposeError, ReadError,
+    Role, StateMachine, TcpTransport,
 };
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -93,6 +93,35 @@ fn free_port() -> u16 {
     let p = l.local_addr().unwrap().port();
     drop(l);
     p
+}
+
+async fn wait_for_status<S, F>(node: &Node<S>, deadline: Duration, mut predicate: F) -> NodeStatus
+where
+    S: StateMachine,
+    F: FnMut(&NodeStatus) -> bool,
+{
+    let start = tokio::time::Instant::now();
+    loop {
+        let status = node.status().await.expect("status call succeeds");
+        if predicate(&status) {
+            return status;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "status predicate timed out: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_single_node_leader<S>(node: &Node<S>) -> NodeStatus
+where
+    S: StateMachine,
+{
+    wait_for_status(node, Duration::from_secs(2), |status| {
+        status.role == Role::Leader && status.commit_index >= LogIndex::new(1)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +203,7 @@ async fn single_node_self_elects_and_applies_proposal() {
         .await
         .unwrap();
 
-    // Give the node a moment to elect itself (single-node cluster
-    // self-elects on first tick after the timeout).
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = wait_for_single_node_leader(&node).await;
 
     let result = tokio::time::timeout(Duration::from_secs(2), node.propose(CountCmd::Inc(5)))
         .await
@@ -209,8 +236,6 @@ async fn shutdown_handle_after_first_use_returns_shutdown_error() {
         .unwrap();
     let clone = node.clone();
     node.shutdown().await.unwrap();
-    // Give the driver a tick to finish exiting.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let err: ProposeError = clone.propose(CountCmd::Inc(1)).await.unwrap_err();
     assert!(matches!(
@@ -334,8 +359,7 @@ async fn decode_failure_on_apply_fails_waiter_with_fatal() {
         .await
         .unwrap();
 
-    // Wait for self-election (single-node cluster).
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = wait_for_single_node_leader(&node).await;
 
     // The proposal will commit (no peers to ack means the engine's
     // try_advance_commit_as_leader fires), apply will try to decode,
@@ -376,8 +400,7 @@ async fn single_node_read_linearizable_observes_applied_state() {
         .await
         .unwrap();
 
-    // Wait out election, then commit two increments.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = wait_for_single_node_leader(&node).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), node.propose(CountCmd::Inc(5)))
         .await
         .unwrap()
@@ -424,7 +447,10 @@ async fn read_linearizable_on_follower_returns_not_leader() {
         .unwrap();
 
     // Short wait — plenty of time to realise no leader will emerge.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = wait_for_status(&node, Duration::from_secs(2), |status| {
+        status.current_term.get() >= 1
+    })
+    .await;
 
     let err = tokio::time::timeout(
         Duration::from_secs(2),
@@ -501,7 +527,7 @@ async fn batched_concurrent_proposals_all_commit_in_order() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = wait_for_single_node_leader(&node).await;
 
     // Fire 3 concurrent proposals. The driver buffers them; either
     // the size cap (unreached, 3 < 4) fires or the tick-based flush
@@ -540,7 +566,7 @@ async fn slow_apply_does_not_stall_driver_status() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let _ = wait_for_single_node_leader(&node).await;
 
     // Fire several proposals back-to-back. Propose returns as soon
     // as each commits and lands on the state machine via the apply

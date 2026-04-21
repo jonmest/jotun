@@ -34,6 +34,27 @@ fn free_port() -> u16 {
     p
 }
 
+async fn restart_transport_on_same_port(
+    me: NodeId,
+    addr: SocketAddr,
+    peers: BTreeMap<NodeId, SocketAddr>,
+) -> TcpTransport<Vec<u8>> {
+    let start = tokio::time::Instant::now();
+    loop {
+        match TcpTransport::start(me, addr, peers.clone()).await {
+            Ok(transport) => return transport,
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "port {addr} stayed busy after restart: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => panic!("failed to restart transport on {addr}: {err}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn vote_request_round_trips_over_tcp() {
     let port_a = free_port();
@@ -48,9 +69,6 @@ async fn vote_request_round_trips_over_tcp() {
 
     let a: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr_a, peers_a).await.unwrap();
     let mut b: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b).await.unwrap();
-
-    // Give the dialer tasks a moment to connect.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let req = RequestVote {
         term: Term::new(7),
@@ -90,8 +108,6 @@ async fn vote_response_round_trips_over_tcp() {
     let mut a: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr_a, peers_a).await.unwrap();
     let b: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     let resp = VoteResponse {
         term: Term::new(7),
         result: VoteResult::Granted,
@@ -127,8 +143,6 @@ async fn many_messages_arrive_in_order() {
 
     let a: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr_a, peers_a).await.unwrap();
     let mut b: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     for i in 1..=20u64 {
         let req = RequestVote {
@@ -170,7 +184,6 @@ async fn peer_restart_on_same_port_is_survived_by_reconnect() {
     let mut b: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b.clone())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Send once to confirm the path works.
     let req = RequestVote {
@@ -184,13 +197,12 @@ async fn peer_restart_on_same_port_is_survived_by_reconnect() {
         .unwrap()
         .unwrap();
 
-    // Kill b. Give the OS a beat to release the port.
+    // Kill b and wait for the port to become bindable again.
     drop(b);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Restart b on the same port. The writer in `a` should reconnect
     // once b is back up.
-    let mut b2: TcpTransport<Vec<u8>> = TcpTransport::start(nid(2), addr_b, peers_b).await.unwrap();
+    let mut b2 = restart_transport_on_same_port(nid(2), addr_b, peers_b).await;
     // Send is best-effort: a failed write drops the message. Race
     // send-loop against recv — the writer in `a` will reconnect
     // once b2's listener is up, and the next enqueued frame flushes.
@@ -304,8 +316,13 @@ async fn client_disconnect_before_full_prefix_is_clean() {
     let s = TcpStream::connect(addr).await.unwrap();
     // Close immediately, no bytes sent.
     drop(s);
-    // No panic; give the reader task a beat to run its EOF branch.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The listener should still accept new connections after handling
+    // the early EOF path.
+    let reconnect = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr))
+        .await
+        .expect("listener stopped accepting after client EOF")
+        .expect("reconnect after client EOF failed");
+    drop(reconnect);
 }
 
 #[tokio::test]
@@ -325,7 +342,6 @@ async fn shutdown_aborts_owned_tasks() {
     // Open an inbound connection from a naked TCP client to spawn a
     // reader task we can observe being aborted.
     let _s = TcpStream::connect(addr_a).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     a.shutdown().await;
 
@@ -347,7 +363,6 @@ async fn drop_aborts_tasks_without_shutdown() {
         .await
         .unwrap();
     let _s = TcpStream::connect(addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
     drop(t);
     // If Drop panics, this test fails. Otherwise, we're good.
 }

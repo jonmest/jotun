@@ -579,11 +579,27 @@ async fn partition_heal_cluster_recovers_and_commits() {
 
 use proptest::prelude::*;
 
+fn runtime_chaos_cases() -> u32 {
+    match std::env::var("JOTUN_RUNTIME_CHAOS_CASES") {
+        Ok(raw) => raw
+            .parse::<u32>()
+            .ok()
+            .filter(|cases| *cases > 0)
+            .expect("JOTUN_RUNTIME_CHAOS_CASES must be a positive integer"),
+        Err(std::env::VarError::NotPresent) => 16,
+        Err(e) => panic!("failed to read JOTUN_RUNTIME_CHAOS_CASES: {e}"),
+    }
+}
+
+fn runtime_chaos_proptest_config() -> ProptestConfig {
+    ProptestConfig {
+        cases: runtime_chaos_cases(),
+        ..ProptestConfig::default()
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 16,
-        .. ProptestConfig::default()
-    })]
+    #![proptest_config(runtime_chaos_proptest_config())]
 
     /// Under moderate chaos (10% drop, some delay), safety must hold
     /// across arbitrary seeds. Liveness is not asserted — the

@@ -61,9 +61,9 @@ The library is tested in four layers.
 1. Unit tests. Pure-engine tests covering every `Event`/`Action` path.
 2. Property tests. 1024-case proptests on term and commit monotonicity, vote uniqueness, and recover idempotence. Wire-format decoders are fuzzed through `Message::try_from` for arbitrary bytes.
 3. Sim chaos. 128 seeds, 1500 steps, on 3-, 5-, and 7-node clusters, under drops, reorderings, partitions, crashes, and partial fsync. Election Safety, Log Matching, Leader Completeness, and State Machine Safety are checked after every step.
-4. Runtime chaos. Real `Node` instances (driver task, apply task, storage) connected through an in-process chaos transport. The same safety invariants are asserted at the full-stack level.
+4. Runtime chaos. Real `Node` instances (driver task, apply task, storage) connected through an in-process chaos transport. PRs run a 16-case smoke sweep; scheduled CI runs a heavier seeded sweep. The same safety invariants are asserted at the full-stack level.
 
-There are also `cargo-mutants` sweeps on the correctness-critical modules and `cargo-fuzz` targets for the wire codec, the engine, and disk recovery.
+There are also scheduled `cargo-mutants` sweeps on the correctness-critical crates and `cargo-fuzz` targets for the wire codec, the engine, and disk recovery.
 
 ## Status
 
