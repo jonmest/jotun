@@ -603,3 +603,84 @@ async fn slow_apply_does_not_stall_driver_status() {
 
     node.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Node::metrics — pull-model observability. Exposes engine-level
+// counters (elections, AEs, commits, reads, …) and gauges
+// (current_term, commit_index, role_code, …).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn metrics_track_election_and_apply() {
+    let tmp = TmpDir::new("single-metrics");
+    let storage = DiskStorage::open(&tmp.0).await.unwrap();
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let transport: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut config = Config::new(nid(1), std::iter::empty::<NodeId>());
+    config.election_timeout_min_ticks = 3;
+    config.election_timeout_max_ticks = 5;
+    config.heartbeat_interval_ticks = 1;
+    config.tick_interval = Duration::from_millis(10);
+
+    let node = Node::start(config, Counter::default(), storage, transport)
+        .await
+        .unwrap();
+
+    let _ = wait_for_single_node_leader(&node).await;
+
+    // Fresh single-node leader: at least one election started, at
+    // least one won, zero votes granted (no peers to ask).
+    let m = node.metrics().await.expect("metrics call");
+    assert!(m.elections_started >= 1);
+    assert_eq!(m.leader_elections_won, 1);
+    assert_eq!(m.role_code, 3, "leader");
+
+    // Propose two commands, observe commit + apply counters move.
+    let _ = node.propose(CountCmd::Inc(5)).await.unwrap();
+    let _ = node.propose(CountCmd::Inc(3)).await.unwrap();
+
+    let m = node.metrics().await.expect("metrics call");
+    // Noop + two commands committed past the snapshot floor.
+    assert!(m.entries_committed >= 2);
+    assert!(m.entries_applied >= 2);
+    assert!(m.commit_index >= LogIndex::new(2));
+
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn metrics_after_shutdown_return_error() {
+    let tmp = TmpDir::new("metrics-shutdown");
+    let storage = DiskStorage::open(&tmp.0).await.unwrap();
+    let port = free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+    let transport: TcpTransport<Vec<u8>> = TcpTransport::start(nid(1), addr, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut config = Config::new(nid(1), std::iter::empty::<NodeId>());
+    config.election_timeout_min_ticks = 3;
+    config.election_timeout_max_ticks = 5;
+    config.heartbeat_interval_ticks = 1;
+    config.tick_interval = Duration::from_millis(10);
+
+    let node = Node::start(config, Counter::default(), storage, transport)
+        .await
+        .unwrap();
+
+    let handle = node.clone();
+    node.shutdown().await.unwrap();
+
+    let err = handle
+        .metrics()
+        .await
+        .expect_err("metrics on shut-down node must fail");
+    assert!(matches!(
+        err,
+        ProposeError::Shutdown | ProposeError::DriverDead
+    ));
+}

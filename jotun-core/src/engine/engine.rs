@@ -172,6 +172,9 @@ pub struct Engine<C> {
     /// §9.6 pre-vote enabled. When on, election-timer expiry enters
     /// `PreCandidate` instead of bumping the term directly.
     pre_vote: bool,
+    /// Pull-model observability counters. Gauges are reconstructed
+    /// from `state` on read; counters are updated in-place here.
+    metrics: crate::engine::metrics::MetricsCounters,
     /// All mutable per-node state. Includes the active peer set, which
     /// the §4.3 single-server membership rule mutates from log entries.
     state: RaftState<C>,
@@ -277,6 +280,7 @@ impl<C: Clone> Engine<C> {
             snapshot_chunk_size_bytes: config.snapshot_chunk_size_bytes.max(1),
             snapshot_hint_threshold_entries: config.snapshot_hint_threshold_entries,
             pre_vote: config.pre_vote,
+            metrics: crate::engine::metrics::MetricsCounters::default(),
             state: RaftState {
                 current_term: Term::ZERO,
                 voted_for: None,
@@ -396,6 +400,51 @@ impl<C: Clone> Engine<C> {
     #[must_use]
     pub fn log(&self) -> &Log<C> {
         &self.state.log
+    }
+
+    /// Snapshot of the engine's counters and current gauges. Pull it
+    /// on whatever cadence the caller likes — reading never blocks
+    /// the engine's event processing.
+    #[must_use]
+    pub fn metrics(&self) -> crate::engine::metrics::EngineMetrics {
+        let role_code = match &self.state.role {
+            RoleState::Follower(_) => 0,
+            RoleState::PreCandidate(_) => 1,
+            RoleState::Candidate(_) => 2,
+            RoleState::Leader(_) => 3,
+        };
+        let last_index = self
+            .state
+            .log
+            .last_log_id()
+            .map_or(0, |id| id.index.get());
+        let snapshot_index = self.state.log.snapshot_last().index.get();
+        let log_len = last_index.saturating_sub(snapshot_index);
+        crate::engine::metrics::EngineMetrics {
+            elections_started: self.metrics.elections_started,
+            pre_votes_granted: self.metrics.pre_votes_granted,
+            pre_votes_denied: self.metrics.pre_votes_denied,
+            votes_granted: self.metrics.votes_granted,
+            votes_denied: self.metrics.votes_denied,
+            leader_elections_won: self.metrics.leader_elections_won,
+            higher_term_stepdowns: self.metrics.higher_term_stepdowns,
+            append_entries_sent: self.metrics.append_entries_sent,
+            append_entries_received: self.metrics.append_entries_received,
+            append_entries_rejected: self.metrics.append_entries_rejected,
+            entries_appended: self.metrics.entries_appended,
+            entries_committed: self.metrics.entries_committed,
+            entries_applied: self.metrics.entries_applied,
+            snapshots_sent: self.metrics.snapshots_sent,
+            snapshots_installed: self.metrics.snapshots_installed,
+            read_index_started: self.metrics.read_index_started,
+            reads_completed: self.metrics.reads_completed,
+            reads_failed: self.metrics.reads_failed,
+            current_term: self.state.current_term,
+            commit_index: self.state.commit_index,
+            last_applied: self.state.last_applied,
+            log_len,
+            role_code,
+        }
     }
 
     #[cfg(test)]
@@ -1063,6 +1112,9 @@ impl<C: Clone> Engine<C> {
         if granted {
             self.state.voted_for = Some(request.candidate_id);
             self.reset_election_timer();
+            self.metrics.votes_granted += 1;
+        } else {
+            self.metrics.votes_denied += 1;
         }
 
         tracing::Span::current().record(
@@ -1136,6 +1188,7 @@ impl<C: Clone> Engine<C> {
     /// the pre-vote majority check and the vote majority check both
     /// pass with one grant.
     fn start_election(&mut self) -> Vec<Action<C>> {
+        self.metrics.elections_started += 1;
         if self.pre_vote {
             return self.start_pre_election();
         }
@@ -1261,6 +1314,11 @@ impl<C: Clone> Engine<C> {
             RoleState::PreCandidate(_) | RoleState::Candidate(_) => false,
         };
         let granted = log_ok && !leader_recent && request.term > self.state.current_term;
+        if granted {
+            self.metrics.pre_votes_granted += 1;
+        } else {
+            self.metrics.pre_votes_denied += 1;
+        }
 
         let reply = PreVoteResponse {
             term: self.state.current_term,
@@ -1319,6 +1377,7 @@ impl<C: Clone> Engine<C> {
     )]
     #[allow(clippy::too_many_lines)]
     fn on_append_entries_request(&mut self, request: RequestAppendEntries<C>) -> Vec<Action<C>> {
+        self.metrics.append_entries_received += 1;
         let prior_term = self.state.current_term;
         let prior_voted_for = self.state.voted_for;
 
@@ -1426,7 +1485,10 @@ impl<C: Clone> Engine<C> {
             .map_or(LogIndex::ZERO, |l| l.index);
 
         if request.leader_commit > self.state.commit_index {
-            self.state.commit_index = request.leader_commit.min(last_appended);
+            let new_commit = request.leader_commit.min(last_appended);
+            self.metrics.entries_committed +=
+                new_commit.get().saturating_sub(self.state.commit_index.get());
+            self.state.commit_index = new_commit;
         }
 
         let mut out = std::mem::take(&mut stepdown);
@@ -1434,6 +1496,7 @@ impl<C: Clone> Engine<C> {
             out.push(self.persist_hard_state());
         }
         if !newly_persisted.is_empty() {
+            self.metrics.entries_appended += newly_persisted.len() as u64;
             out.push(Action::PersistLogEntries(newly_persisted));
         }
         out.extend(self.drain_apply());
@@ -1687,6 +1750,7 @@ impl<C: Clone> Engine<C> {
         let Some(pending) = self.state.pending_snapshot_install.take() else {
             return out;
         };
+        self.metrics.snapshots_installed += 1;
 
         // Install the snapshot floor. Log::install_snapshot keeps
         // post-floor entries iff our log already had a matching
@@ -1824,6 +1888,7 @@ impl<C: Clone> Engine<C> {
         if n > self.state.commit_index && self.state.log.term_at(n) == Some(self.state.current_term)
         {
             let prior_commit = self.state.commit_index;
+            self.metrics.entries_committed += n.get().saturating_sub(prior_commit.get());
             self.state.commit_index = n;
             if self.committed_self_removal(prior_commit, n) {
                 let prior_term = self.state.current_term;
@@ -1864,6 +1929,7 @@ impl<C: Clone> Engine<C> {
         // Always advance last_applied to the commit boundary, even when
         // every entry in the range was filtered out — Noop/ConfigChange
         // entries are "applied" the moment they commit, just invisibly.
+        self.metrics.entries_applied += to.get().saturating_sub(self.state.last_applied.get());
         self.state.last_applied = to;
         if entries.is_empty() {
             return vec![];
@@ -1901,6 +1967,7 @@ impl<C: Clone> Engine<C> {
     /// On non-leaders we fall back to `nextIndex = 1`; in practice
     /// this is only called from leader paths.
     fn append_entries_to(&mut self, peer: NodeId) -> Action<C> {
+        self.metrics.append_entries_sent += 1;
         let next = match &self.state.role {
             RoleState::Leader(l) => l.progress.next_for(peer).unwrap_or(LogIndex::new(1)),
             _ => LogIndex::new(1),
@@ -1950,6 +2017,7 @@ impl<C: Clone> Engine<C> {
     /// `nextIndex[peer] ≤ snapshot_last_index` and that we have
     /// snapshot bytes in memory.
     fn install_snapshot_to(&mut self, peer: NodeId) -> Action<C> {
+        self.metrics.snapshots_sent += 1;
         let last_included = self.state.log.snapshot_last();
         let offset = match &mut self.state.role {
             RoleState::Leader(leader) => {
@@ -1996,7 +2064,8 @@ impl<C: Clone> Engine<C> {
 
     /// Build an `AppendEntries` Conflict response. Helper for the rejection
     /// paths in [`Engine::on_append_entries_request`].
-    fn conflict(&self, leader_id: NodeId, hint: LogIndex) -> Action<C> {
+    fn conflict(&mut self, leader_id: NodeId, hint: LogIndex) -> Action<C> {
+        self.metrics.append_entries_rejected += 1;
         Action::Send {
             to: leader_id,
             message: AppendEntriesResponse(AppendEntriesResponse {
@@ -2095,9 +2164,11 @@ impl<C: Clone> Engine<C> {
                 let reason = f.leader_id.map_or(ReadFailure::NotReady, |leader_hint| {
                     ReadFailure::NotLeader { leader_hint }
                 });
+                self.metrics.reads_failed += 1;
                 return vec![Action::ReadFailed { id, reason }];
             }
             RoleState::PreCandidate(_) | RoleState::Candidate(_) => {
+                self.metrics.reads_failed += 1;
                 return vec![Action::ReadFailed {
                     id,
                     reason: ReadFailure::NotReady,
@@ -2111,12 +2182,14 @@ impl<C: Clone> Engine<C> {
         // The §5.4.2 no-op appended in become_leader fills this gap as
         // soon as it commits.
         if self.state.log.term_at(self.state.commit_index) != Some(self.state.current_term) {
+            self.metrics.reads_failed += 1;
             return vec![Action::ReadFailed {
                 id,
                 reason: ReadFailure::NotReady,
             }];
         }
 
+        self.metrics.read_index_started += 1;
         let read_index = self.state.commit_index;
         let RoleState::Leader(leader) = &mut self.state.role else {
             unreachable!("matched above");
@@ -2190,6 +2263,7 @@ impl<C: Clone> Engine<C> {
                 true
             }
         });
+        self.metrics.reads_completed += out.len() as u64;
         out
     }
 
@@ -2201,6 +2275,7 @@ impl<C: Clone> Engine<C> {
             return vec![];
         };
         let drained: Vec<PendingRead> = std::mem::take(&mut leader.pending_reads);
+        self.metrics.reads_failed += drained.len() as u64;
         drained
             .into_iter()
             .map(|r| Action::ReadFailed {
@@ -2241,6 +2316,9 @@ impl<C: Clone> Engine<C> {
     /// explicitly after this returns.
     fn become_follower(&mut self, term: Term) -> Vec<Action<C>> {
         let from_term = self.state.current_term;
+        if term > from_term {
+            self.metrics.higher_term_stepdowns += 1;
+        }
         // If we were leader, every pending ReadIndex dies with the
         // role. Collect ReadFailed{SteppedDown} before the role flip.
         let out = self.fail_pending_reads();
@@ -2290,6 +2368,7 @@ impl<C: Clone> Engine<C> {
     /// term; the no-op guarantees there is always such an entry available
     /// without waiting for a client proposal.
     fn become_leader(&mut self) -> Vec<Action<C>> {
+        self.metrics.leader_elections_won += 1;
         let next_index = self
             .log()
             .last_log_id()

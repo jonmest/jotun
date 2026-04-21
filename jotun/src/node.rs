@@ -739,6 +739,33 @@ impl<S: StateMachine> Node<S> {
         }
     }
 
+    /// Pull a snapshot of the engine's observability counters and
+    /// gauges. Counters (`*_sent`, `*_received`, `*_granted`, …) only
+    /// move forward over the lifetime of the node; gauges
+    /// (`current_term`, `commit_index`, …) reflect the current value.
+    ///
+    /// The snapshot is a point-in-time read — by the time the caller
+    /// inspects it, the node may have processed more events.
+    ///
+    /// Returns an error if the driver has shut down.
+    pub async fn metrics(
+        &self,
+    ) -> Result<jotun_core::engine::metrics::EngineMetrics, ProposeError> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .inputs
+            .send(DriverInput::Metrics { reply: tx })
+            .await
+            .is_err()
+        {
+            return Err(ProposeError::Shutdown);
+        }
+        match rx.await {
+            Ok(m) => Ok(m),
+            Err(_) => Err(ProposeError::DriverDead),
+        }
+    }
+
     /// Initiate a graceful shutdown. Returns once the driver has
     /// drained any in-flight work, the transport has stopped its own
     /// background tasks, and the runtime's ticker/driver tasks have
@@ -928,6 +955,9 @@ enum DriverInput<S: StateMachine> {
     Status {
         reply: oneshot::Sender<NodeStatus>,
     },
+    Metrics {
+        reply: oneshot::Sender<jotun_core::engine::metrics::EngineMetrics>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -963,6 +993,10 @@ where
                     }
                     DriverInput::Status { reply } => {
                         let _ = reply.send(build_status(&d));
+                        Ok(())
+                    }
+                    DriverInput::Metrics { reply } => {
+                        let _ = reply.send(d.engine.metrics());
                         Ok(())
                     }
                     DriverInput::Shutdown { reply } => {

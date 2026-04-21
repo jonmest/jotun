@@ -7,6 +7,7 @@ mod fixtures;
 mod invariants;
 mod leadership_transfer;
 mod membership;
+mod metrics;
 mod persistence;
 mod pre_vote;
 mod read_index;
