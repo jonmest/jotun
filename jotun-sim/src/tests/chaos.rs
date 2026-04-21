@@ -61,6 +61,30 @@ proptest! {
         }
         prop_assert!(cluster.history_len() == 2000);
     }
+
+    /// Same chaos shape as the 3-node test, but with §9.6 pre-vote on.
+    /// Pre-vote adds a new protocol round (`PreVoteRequest` /
+    /// `PreVoteResponse`) and a new role (`PreCandidate`) to the
+    /// state space. Safety must still hold.
+    #[test]
+    fn chaos_schedule_preserves_safety_with_pre_vote(seed in any::<u64>()) {
+        let mut cluster: Cluster<u64> = Cluster::with_pre_vote(seed, 3);
+        cluster.set_policy(Policy::chaos(Some(1)));
+        for _ in 0..1500 {
+            cluster.step();
+        }
+        prop_assert!(cluster.history_len() == 1500);
+    }
+
+    #[test]
+    fn chaos_schedule_five_nodes_preserves_safety_with_pre_vote(seed in any::<u64>()) {
+        let mut cluster: Cluster<u64> = Cluster::with_pre_vote(seed, 5);
+        cluster.set_policy(Policy::chaos(Some(1)));
+        for _ in 0..1500 {
+            cluster.step();
+        }
+        prop_assert!(cluster.history_len() == 1500);
+    }
 }
 
 /// Sanity check: the recover path actually works end-to-end — a
@@ -104,6 +128,23 @@ fn crash_and_recover_preserves_liveness() {
         steps < 3000,
         "commit didn't advance past {start_commit} after crash+recover",
     );
+}
+
+/// Known-failing repro for a latent safety bug in the 3-node chaos
+/// path: this seed panics with `LeaderMissingCommitted { leader: 2,
+/// leader_term: 6, committed_term: 1, index: 1 }` — a node that
+/// never acked entry 1 still gets elected leader at a later term
+/// (§5.4.1 violation). The bug reproduces on `main` as well; it's
+/// not a regression of any recent change, just one proptest happens
+/// to find the schedule. `#[ignore]`d until fixed.
+#[test]
+#[ignore = "pre-existing latent safety bug in sim chaos path"]
+fn chaos_leader_missing_committed_repro() {
+    let mut cluster: Cluster<u64> = Cluster::new(2_988_569_338_452_412_884, 3);
+    cluster.set_policy(Policy::chaos(Some(1)));
+    for _ in 0..1500 {
+        cluster.step();
+    }
 }
 
 /// Fixed-seed smoke run: chaos-mode 3-node cluster for a long run.

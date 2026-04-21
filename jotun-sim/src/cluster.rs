@@ -34,6 +34,9 @@ pub struct Cluster<C: Clone + PartialEq + 'static> {
     history: Vec<HistoryEntry<C>>,
     /// Knobs that gate which event classes the scheduler will pick.
     policy: Policy<C>,
+    /// Whether this cluster's engines run with §9.6 pre-vote on.
+    /// Threaded through `add_node` so nodes added mid-run match.
+    pre_vote: bool,
 }
 
 impl<C: Clone + PartialEq + std::fmt::Debug + 'static> std::fmt::Debug for Cluster<C> {
@@ -106,8 +109,22 @@ impl<C: Clone> Policy<C> {
 impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
     /// Build a cluster of `n_nodes` nodes (ids 1..=n_nodes) with the
     /// same heartbeat interval and a single RNG seeded from `seed`.
+    /// Pre-vote is off; use [`Cluster::with_pre_vote`] to exercise
+    /// the §9.6 path.
     #[must_use]
     pub fn new(seed: u64, n_nodes: u64) -> Self {
+        Self::build(seed, n_nodes, false)
+    }
+
+    /// Build a cluster with §9.6 pre-vote enabled on every node.
+    /// Chaos tests exercise both paths so that disruption-avoidance
+    /// doesn't regress on adversarial schedules.
+    #[must_use]
+    pub fn with_pre_vote(seed: u64, n_nodes: u64) -> Self {
+        Self::build(seed, n_nodes, true)
+    }
+
+    fn build(seed: u64, n_nodes: u64, pre_vote: bool) -> Self {
         assert!(n_nodes >= 1, "cluster must have at least one node");
         let heartbeat = 3_u64;
         let rng: SharedRng = Arc::new(Mutex::new(StdRng::seed_from_u64(seed)));
@@ -119,7 +136,10 @@ impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
         let mut nodes = BTreeMap::new();
         for &id in &ids {
             let peers: Vec<NodeId> = ids.iter().copied().filter(|p| *p != id).collect();
-            nodes.insert(id, NodeHarness::new(id, peers, heartbeat, Arc::clone(&rng)));
+            nodes.insert(
+                id,
+                NodeHarness::with_pre_vote(id, peers, heartbeat, Arc::clone(&rng), pre_vote),
+            );
         }
 
         Self {
@@ -130,6 +150,7 @@ impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
             clock: 0,
             history: Vec::new(),
             policy: Policy::<C>::happy(None),
+            pre_vote,
         }
     }
 
@@ -239,7 +260,13 @@ impl<C: Clone + PartialEq + std::fmt::Debug + 'static> Cluster<C> {
         }
         let peers: Vec<NodeId> = self.nodes.keys().copied().collect();
         let heartbeat = 3_u64;
-        let harness = NodeHarness::new(id, peers, heartbeat, Arc::clone(&self.rng));
+        let harness = NodeHarness::with_pre_vote(
+            id,
+            peers,
+            heartbeat,
+            Arc::clone(&self.rng),
+            self.pre_vote,
+        );
         self.nodes.insert(id, harness);
     }
 

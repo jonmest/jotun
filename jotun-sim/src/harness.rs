@@ -82,6 +82,10 @@ pub(crate) struct NodeHarness<C> {
     pub(crate) pending: Vec<PendingWrite<C>>,
     pub(crate) applied: Vec<LogEntry<C>>,
     pub(crate) heartbeat_interval_ticks: u64,
+    /// Whether this harness's engines (both initial and post-recover)
+    /// run with §9.6 pre-vote enabled. Stored so `recover` rebuilds
+    /// the engine with the same setting.
+    pub(crate) pre_vote: bool,
     /// Every log-entry id the engine has ever asked to persist, across
     /// every step. A `Send` carrying entries must reference ids in this
     /// set — otherwise the engine violated §5.1 action ordering. Carries
@@ -95,19 +99,28 @@ pub(crate) struct NodeHarness<C> {
 }
 
 impl<C: Clone> NodeHarness<C> {
+    /// Default constructor, pre-vote off. Kept for call sites that
+    /// don't care about the pre-vote path (unit-level invariant
+    /// tests).
+    #[cfg(test)]
     pub(crate) fn new(
         id: NodeId,
         peers: Vec<NodeId>,
         heartbeat_interval_ticks: u64,
         rng: SharedRng,
     ) -> Self {
+        Self::with_pre_vote(id, peers, heartbeat_interval_ticks, rng, false)
+    }
+
+    pub(crate) fn with_pre_vote(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        heartbeat_interval_ticks: u64,
+        rng: SharedRng,
+        pre_vote: bool,
+    ) -> Self {
         let env = Box::new(SimEnv::new(rng));
-        // Sim proptests predate pre-vote and encode classical
-        // §5.2/§5.4 election semantics. The pre-vote extension gets
-        // its own dedicated engine-level tests; construct the engine
-        // with pre_vote off so the sim's schedule alphabet stays
-        // minimal.
-        let cfg = jotun_core::EngineConfig::default().with_pre_vote(false);
+        let cfg = jotun_core::EngineConfig::default().with_pre_vote(pre_vote);
         let engine = Engine::with_config(
             id,
             peers.iter().copied(),
@@ -125,6 +138,7 @@ impl<C: Clone> NodeHarness<C> {
             pending: Vec::new(),
             applied: Vec::new(),
             heartbeat_interval_ticks,
+            pre_vote,
             ever_persisted: BTreeSet::new(),
             ever_persisted_terms,
         }
@@ -226,7 +240,7 @@ impl<C: Clone> NodeHarness<C> {
             return;
         }
         let env = Box::new(SimEnv::new(rng));
-        let cfg = jotun_core::EngineConfig::default().with_pre_vote(false);
+        let cfg = jotun_core::EngineConfig::default().with_pre_vote(self.pre_vote);
         let mut engine = Engine::with_config(
             self.id,
             self.peers.iter().copied(),

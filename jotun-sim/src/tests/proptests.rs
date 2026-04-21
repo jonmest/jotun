@@ -86,4 +86,27 @@ proptest! {
         prop_assert_eq!(a.max_commit_index(), b.max_commit_index());
         prop_assert_eq!(a.history_len(), b.history_len());
     }
+
+    /// Same liveness assertion as above, but with §9.6 pre-vote on.
+    /// Pre-vote adds a round-trip to every election, so elections
+    /// take slightly longer; the step bound accommodates that.
+    #[test]
+    fn three_node_pre_vote_schedules_commit_on_majority(seed in any::<u64>()) {
+        let mut cluster: Cluster<u64> = Cluster::with_pre_vote(seed, 3);
+        cluster.set_policy(Policy::happy(Some(1)));
+
+        let mut committed = false;
+        for _ in 0..4_000 {
+            cluster.step();
+            if cluster.applied_majority(1) >= 2 {
+                committed = true;
+                break;
+            }
+        }
+        prop_assert!(
+            committed,
+            "no majority apply at index 1 within 4000 steps for pre-vote seed {seed}; max commit = {}",
+            cluster.max_commit_index(),
+        );
+    }
 }
