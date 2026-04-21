@@ -2,7 +2,7 @@
 
 A Raft library in Rust. Four crates: a pure protocol engine, a deterministic simulator, a tokio runtime, and an example KV service.
 
-[Guide](https://joncm.github.io/logos/guide/) &middot; [API docs](https://joncm.github.io/logos/api/jotun/)
+[Guide](https://jonmest.github.io/jotun/guide/) &middot; [API docs](https://jonmest.github.io/jotun/api/jotun/)
 
 ```rust
 use jotun::{Config, Node, DiskStorage, TcpTransport};
@@ -37,7 +37,7 @@ The split exists so the engine is usable without the runtime, and so the simulat
 - Segmented on-disk log with atomic file writes
 - State machine apply on its own task; slow `apply()` does not stall heartbeats
 - Opt-in proposal batching on the leader
-- Structured `tracing` spans and events with stable field names. OpenTelemetry wiring is a few lines in your `main`; see the [observability guide](https://joncm.github.io/logos/guide/runtime/observability.html).
+- Structured `tracing` spans and events with stable field names. OpenTelemetry wiring is a few lines in your `main`; see the [observability guide](https://jonmest.github.io/jotun/guide/runtime/observability.html).
 
 ## Quick start
 
