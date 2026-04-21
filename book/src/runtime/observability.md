@@ -1,24 +1,24 @@
 # Observability
 
-Jotun emits structured `tracing` events and spans throughout the engine and runtime. We use stable targets and field names so you can filter and index reliably.
+The engine and runtime emit structured `tracing` events and spans with stable targets and field names.
 
-## Stable targets
+## Targets
 
 | Target | What emits |
 |---|---|
-| `jotun::engine` | Role changes, term advances, vote decisions, AE accept/reject, commit advances. |
+| `jotun::engine` | Role changes, term advances, vote decisions, AppendEntries accept/reject, commit advances. |
 | `jotun::node` | Driver-level events: apply failures, transport errors, shutdown. |
 
-## Stable fields
+## Fields
 
-- `node_id` — always the emitting node's id
+- `node_id` — the emitting node
 - `term` / `from_term` / `to_term` — term transitions
 - `role` — `"follower" | "candidate" | "leader"`
 - `decision` — on vote handling, `"granted" | "rejected"`
 
 ## OpenTelemetry
 
-Jotun doesn't pull in the `opentelemetry` crates itself. Instead, wire your own subscriber in your service's `main`:
+The library doesn't depend on `opentelemetry` directly. The OTel crates churn fast, and pinning them in a library creates version conflicts for users. Wire your subscriber in your service's `main`:
 
 ```rust
 use tracing_subscriber::prelude::*;
@@ -35,12 +35,12 @@ tracing_subscriber::registry()
     .init();
 ```
 
-Every `jotun::engine` span now flows to your OTLP collector.
+`jotun::engine` spans and events flow to the collector.
 
 ## Log filters
 
-Quick-start filters for `RUST_LOG`:
+Quick-start `RUST_LOG` values:
 
-- `RUST_LOG=jotun=debug` — everything jotun emits at debug or above
-- `RUST_LOG=jotun::engine=info` — just protocol decisions
-- `RUST_LOG=jotun::node=debug,jotun::engine=info` — runtime detail, protocol overview
+- `jotun=debug` — everything jotun emits at debug or above
+- `jotun::engine=info` — just protocol decisions
+- `jotun::node=debug,jotun::engine=info` — runtime detail, protocol overview

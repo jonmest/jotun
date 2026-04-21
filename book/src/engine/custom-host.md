@@ -1,6 +1,6 @@
 # Writing a custom host
 
-The batteries-included `jotun` runtime assumes tokio, a tcp transport, and disk storage. If those don't fit — maybe you're embedding Raft into an existing async runtime, or replicating over QUIC, or persisting into an existing storage engine — you can drive `jotun-core` yourself.
+The default `jotun` runtime assumes tokio, TCP, and disk. If those don't fit — you already have an async runtime, you want to replicate over QUIC, or you need to persist into an existing storage engine — you can drive `jotun-core` yourself.
 
 A minimal host loop:
 
@@ -10,7 +10,7 @@ use jotun_core::{Engine, Event, Action};
 let mut engine: Engine<MyCmd> = Engine::new(my_id, peers, env, heartbeat_ticks);
 
 loop {
-    let event = next_event().await?;  // your ticker / your transport / your app
+    let event = next_event().await?;  // your ticker, transport, app
     let actions = engine.step(event);
 
     for action in actions {
@@ -39,10 +39,10 @@ loop {
 }
 ```
 
-## Rules to follow
+## Rules
 
-1. **Respect action order.** See [Events and actions](./events-and-actions.md). Fsync `Persist*` before any subsequent `Send`.
-2. **Feed `Tick` at a steady cadence.** The engine's election and heartbeat timers are tick-based. Pick whatever wall-clock duration makes sense for your latency budget; the default runtime uses 50ms.
-3. **Hydrate the engine on restart.** Read your persisted hard state, snapshot (if any), and post-snapshot log, then call `Engine::recover_from(RecoveredHardState { .. })`. Do this BEFORE feeding any real events.
+1. Respect action order. See [Events and actions](./events-and-actions.md). Fsync `Persist*` before any subsequent `Send`.
+2. Feed `Tick` at a steady cadence. The engine's election and heartbeat timers are tick-based. The default runtime uses 50ms per tick.
+3. Hydrate the engine on restart. Read persisted hard state, snapshot (if any), and post-snapshot log, then call `Engine::recover_from(RecoveredHardState { .. })` before feeding any real events.
 
-See the source of `jotun/src/node.rs` and `jotun-sim/src/harness.rs` for two working reference hosts.
+`jotun/src/node.rs` and `jotun-sim/src/harness.rs` are two working reference hosts.

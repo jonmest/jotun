@@ -1,6 +1,6 @@
 # Writing a state machine
 
-Your `StateMachine` is the application-level thing Raft replicates. You implement three required methods and (optionally) two more for snapshots.
+Your `StateMachine` is the application-level thing Raft replicates. Three required methods, two optional ones for snapshots.
 
 ```rust
 use jotun::{DecodeError, StateMachine};
@@ -37,13 +37,13 @@ impl StateMachine for Counter {
 
 ## Rules
 
-1. **`apply` must be deterministic.** The same `Command` on any node MUST produce the same `Response` and the same state mutation. Otherwise the cluster diverges.
-2. **`encode_command` and `decode_command` must round-trip.** Jotun stores the bytes in the log and on the wire; your decoder must accept its own encoder's output.
-3. **`apply` runs on its own tokio task.** Slow work won't stall heartbeats, but it does apply backpressure on replication if the driver → apply channel fills up (see [Configuration](../runtime/config.md)).
+- `apply` must be deterministic. The same command on any node must produce the same response and the same state mutation. If it doesn't, the cluster diverges.
+- `encode_command` and `decode_command` must round-trip. The library stores the bytes in the log and on the wire; the decoder has to accept its own encoder's output.
+- `apply` runs on its own tokio task. Slow work doesn't stall heartbeats, but the driver blocks on send when the apply channel fills. See [Configuration](../runtime/config.md).
 
 ## Snapshots
 
-Override `snapshot` and `restore` if your state machine has state that would take a long time to replay from the log:
+Override `snapshot` and `restore` if your state takes too long to replay from the log:
 
 ```rust
 fn snapshot(&self) -> Vec<u8> {
@@ -55,4 +55,4 @@ fn restore(&mut self, bytes: Vec<u8>) {
 }
 ```
 
-Compression is your call — compress inside `snapshot`, decompress inside `restore`. Jotun treats snapshot bytes as opaque through the engine, disk, and wire.
+Compression is your decision. Compress inside `snapshot`, decompress inside `restore`. The library treats the bytes as opaque through the engine, disk, and wire.

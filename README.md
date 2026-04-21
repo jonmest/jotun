@@ -1,8 +1,8 @@
 # jotun
 
-A Rust Raft library with a pure protocol engine, a deterministic simulator, and a tokio runtime.
+A Raft library in Rust. Four crates: a pure protocol engine, a deterministic simulator, a tokio runtime, and an example KV service.
 
-[📖 Guide](https://joncm.github.io/logos/guide/) · [🔧 API docs](https://joncm.github.io/logos/api/jotun/) · [💬 Discussions](https://github.com/joncm/logos/discussions)
+[Guide](https://joncm.github.io/logos/guide/) &middot; [API docs](https://joncm.github.io/logos/api/jotun/)
 
 ```rust
 use jotun::{Config, Node, DiskStorage, TcpTransport};
@@ -12,71 +12,62 @@ let storage   = DiskStorage::open(&data_dir).await?;
 let transport = TcpTransport::start(my_id, listen_addr, peer_addrs).await?;
 let node      = Node::start(config, MyStateMachine::default(), storage, transport).await?;
 
-// Replicate a command and wait for it to commit and apply.
+// Replicate a command. Returns when it has committed and applied.
 let response = node.propose(MyCmd::Inc(5)).await?;
 
-// Linearizable read (§8 ReadIndex) — no log append, no fsync.
+// Linearizable read (ReadIndex). No log append, no fsync.
 let value = node.read_linearizable(|sm: &MyStateMachine| sm.value).await?;
 ```
 
-## Why
+## Crates
 
-Most Rust Raft libraries bundle consensus, transport, and storage into one crate. That makes them hard to test against adversarial schedules, hard to embed into a runtime you already have, and hard to audit because the protocol is tangled with I/O.
+- `jotun-core` is the protocol. One type, `Engine<C>`, one method: `step(Event<C>) -> Vec<Action<C>>`. No sockets, no disk, no async.
+- `jotun-sim` is a deterministic cluster simulator. It drives drops, reorderings, partitions, crashes, and partial fsync against the engine and checks safety invariants after every step.
+- `jotun` is the tokio runtime. It provides `Node`, `DiskStorage`, `TcpTransport`, and a length-prefixed protobuf wire format.
+- `jotun-examples` has a three-node replicated KV service.
 
-**jotun splits those apart:**
+The split exists so the engine is usable without the runtime, and so the simulator can run the engine deterministically without tokio or real I/O.
 
-- [`jotun-core`](./jotun-core) — the pure Raft protocol. One type, `Engine<C>`, one method: `step(Event<C>) -> Vec<Action<C>>`. No sockets, no disk, no async. Deterministic, testable at memory speed.
-- [`jotun-sim`](./jotun-sim) — a deterministic cluster simulator that drives drops, reorderings, partitions, crashes, and partial fsync against the engine, with safety invariants checked after every step. Finds bugs you can't find by running real nodes on localhost.
-- [`jotun`](./jotun) — batteries-included tokio runtime. `Node`, `DiskStorage`, `TcpTransport`, length-prefixed protobuf wire format. This is what most users want.
-- [`jotun-examples`](./jotun-examples) — a three-node replicated KV service, handy for poking at.
+## What's implemented
 
-## What's in the box
-
-- Leader election, log replication, membership changes (§4.3 single-server)
-- Linearizable reads via [ReadIndex](https://joncm.github.io/logos/guide/runtime/read-index.html) (§8)
+- Leader election, log replication, single-server membership changes (§4.3)
+- Linearizable reads via ReadIndex (§8)
 - Leadership transfer via `TimeoutNow`
-- Snapshotting with chunked `InstallSnapshot` and auto-compaction hints
-- Segmented on-disk log with crash-safe atomic file writes
-- Async state machine apply — slow `apply()` doesn't stall heartbeats
-- Opt-in leader proposal batching
-- Structured `tracing` spans and events with stable field names (easy OTel wiring; see the [Observability guide](https://joncm.github.io/logos/guide/runtime/observability.html))
+- Snapshotting, including chunked `InstallSnapshot` and auto-compaction hints
+- Segmented on-disk log with atomic file writes
+- State machine apply on its own task; slow `apply()` does not stall heartbeats
+- Opt-in proposal batching on the leader
+- Structured `tracing` spans and events with stable field names. OpenTelemetry wiring is a few lines in your `main`; see the [observability guide](https://joncm.github.io/logos/guide/runtime/observability.html).
 
 ## Quick start
 
-Prerequisites: Rust 1.85+, `protoc` installed.
+Requires Rust 1.85+ and `protoc`.
 
 ```bash
-# Run the three-node KV demo:
+# Three-node KV demo.
 ./jotun-examples/run-three-node.sh
 
-# Or just run the test suite:
-just test          # nextest + doc tests, full workspace
-just clippy        # strict: -D warnings
-just coverage      # llvm-cov, all-targets
-just fuzz-check    # compile every fuzz target (stable)
+# Workspace checks.
+just test
+just clippy
+just coverage
+just fuzz-check
 ```
 
-## Correctness
+## Testing
 
-Jotun is tested at four layers:
+The library is tested in four layers.
 
-1. **Unit tests** — 280+ pure-engine tests covering every `Event`/`Action` path.
-2. **Property tests** — 1024-case proptests on engine invariants (term monotonicity, commit monotonicity, single leader per term, ...). Mapping codec tests fuzz arbitrary bytes through the wire decoder.
-3. **Sim chaos** — 128 cases × 1500 steps for 3-, 5-, and 7-node clusters under drops + reorder + partitions + crashes + partial fsync. Safety invariants (Election Safety, Log Matching, Leader Completeness, State Machine Safety) checked after every step.
-4. **Runtime chaos** — real `Node` instances with driver, apply task, and storage, connected through an in-process chaos transport. Asserts the same invariants at the full-stack level.
+1. Unit tests. Pure-engine tests covering every `Event`/`Action` path.
+2. Property tests. 1024-case proptests on term and commit monotonicity, vote uniqueness, and recover idempotence. Wire-format decoders are fuzzed through `Message::try_from` for arbitrary bytes.
+3. Sim chaos. 128 seeds, 1500 steps, on 3-, 5-, and 7-node clusters, under drops, reorderings, partitions, crashes, and partial fsync. Election Safety, Log Matching, Leader Completeness, and State Machine Safety are checked after every step.
+4. Runtime chaos. Real `Node` instances (driver task, apply task, storage) connected through an in-process chaos transport. The same safety invariants are asserted at the full-stack level.
 
-Plus: [cargo-mutants](https://github.com/sourcefrog/cargo-mutants) sweeps on the correctness-critical modules, [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the wire codec, the engine, and disk recovery.
+There are also `cargo-mutants` sweeps on the correctness-critical modules and `cargo-fuzz` targets for the wire codec, the engine, and disk recovery.
 
-**Status.** Pre-1.0. Public API is stable enough to build on but may still change. Real-world feedback welcome via [discussions](https://github.com/joncm/logos/discussions) or issues.
+## Status
 
-## Docs
-
-- [Introduction & crate layout](https://joncm.github.io/logos/guide/introduction.html)
-- [Writing a state machine](https://joncm.github.io/logos/guide/getting-started/state-machine.html)
-- [The `Node` API](https://joncm.github.io/logos/guide/runtime/node.html)
-- [Writing a custom host](https://joncm.github.io/logos/guide/engine/custom-host.html) (use `jotun-core` without the runtime)
-- [Safety invariants the sim checks](https://joncm.github.io/logos/guide/sim/invariants.html)
-- [Design decisions](https://joncm.github.io/logos/guide/reference/design.html)
+Pre-1.0. The public API is stable enough to build on, but expect changes.
 
 ## License
 
