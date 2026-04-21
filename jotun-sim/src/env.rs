@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rand::Rng;
+use rand::RngExt;
 use rand::rngs::StdRng;
 
 /// Shared RNG handle. Single source of nondeterminism for the whole

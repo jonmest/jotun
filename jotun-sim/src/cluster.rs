@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use jotun_core::{Action, ConfigChange, Engine, Event as CoreEvent, Incoming, NodeId};
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::env::SharedRng;
 use crate::harness::{NodeHarness, PersistOrderingError};
