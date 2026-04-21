@@ -96,9 +96,9 @@ impl StateMachine for SnapshottingCounter {
         }
     }
 
-    fn snapshot(&self) -> Vec<u8> {
+    fn snapshot(&self) -> Result<Vec<u8>, jotun::SnapshotError> {
         self.snapshots_taken.fetch_add(1, Ordering::Relaxed);
-        self.value.to_le_bytes().to_vec()
+        Ok(self.value.to_le_bytes().to_vec())
     }
 
     fn restore(&mut self, bytes: Vec<u8>) {

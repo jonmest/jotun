@@ -68,8 +68,14 @@ pub trait StateMachine: Send + 'static {
     /// here and decompress inside [`Self::restore`] — jotun does not
     /// compress for you and does not assume any particular format. zstd
     /// is a common choice for Raft snapshots; lz4 when CPU is precious.
-    fn snapshot(&self) -> Vec<u8> {
-        Vec::new()
+    ///
+    /// Returning `Err` signals the runtime to skip this snapshot attempt
+    /// — useful for transient disk-space failures, backpressure, or
+    /// ENOSPC on serialization-backed state. The engine re-emits
+    /// snapshot hints as the log grows, so a later attempt will be
+    /// tried automatically.
+    fn snapshot(&self) -> Result<Vec<u8>, SnapshotError> {
+        Ok(Vec::new())
     }
 
     /// Rebuild state from a previously-emitted snapshot. Default panics
@@ -112,3 +118,28 @@ impl std::fmt::Display for DecodeError {
 }
 
 impl std::error::Error for DecodeError {}
+
+/// Returned from [`StateMachine::snapshot`] when the state machine
+/// can't produce a snapshot right now. The runtime reacts by skipping
+/// this hint and waiting for the next one — subsequent threshold
+/// crossings will re-trigger snapshot attempts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotError {
+    pub reason: String,
+}
+
+impl SnapshotError {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "snapshot error: {}", self.reason)
+    }
+}
+
+impl std::error::Error for SnapshotError {}

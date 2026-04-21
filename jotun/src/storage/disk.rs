@@ -112,6 +112,11 @@ impl DiskStorage {
         let data_dir = data_dir.into();
         tokio::fs::create_dir_all(&data_dir).await?;
         tokio::fs::create_dir_all(data_dir.join(LOG_DIR)).await?;
+        // Sweep `.tmp` files left in the data-dir root by a prior
+        // crash mid-atomic-rename. Segment-dir tmp cleanup happens in
+        // `rescan_segments` on recover(); this covers the root-level
+        // snapshot.bin.tmp / snapshot_meta.bin.tmp files.
+        Self::sweep_root_tmp(&data_dir).await?;
         Ok(Self {
             data_dir,
             segments: Vec::new(),
@@ -119,6 +124,20 @@ impl DiskStorage {
             snapshot_floor: LogIndex::ZERO,
             segment_target_bytes: segment_target_bytes.max(1),
         })
+    }
+
+    async fn sweep_root_tmp(data_dir: &Path) -> std::io::Result<()> {
+        let mut read = tokio::fs::read_dir(data_dir).await?;
+        while let Some(entry) = read.next_entry().await? {
+            let path = entry.path();
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "tmp") {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+        Ok(())
     }
 
     fn path(&self, name: &str) -> PathBuf {

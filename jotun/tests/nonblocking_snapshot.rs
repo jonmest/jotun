@@ -69,7 +69,7 @@ impl StateMachine for SlowSnapCounter {
         self.value
     }
 
-    fn snapshot(&self) -> Vec<u8> {
+    fn snapshot(&self) -> Result<Vec<u8>, jotun::SnapshotError> {
         self.snapshot_started.fetch_add(1, Ordering::SeqCst);
         // Synchronous sleep — simulates a big serialize step. A real
         // state machine can't `await` here; the whole point of this
@@ -77,7 +77,7 @@ impl StateMachine for SlowSnapCounter {
         // that.
         std::thread::sleep(self.snapshot_delay);
         self.snapshot_completed.fetch_add(1, Ordering::SeqCst);
-        self.value.to_le_bytes().to_vec()
+        Ok(self.value.to_le_bytes().to_vec())
     }
 
     fn restore(&mut self, bytes: Vec<u8>) {

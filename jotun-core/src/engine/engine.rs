@@ -92,6 +92,11 @@ pub(crate) struct RaftState<C> {
     /// Compared against the number of applied entries past the
     /// current snapshot floor.
     pub(crate) snapshot_hint_band: u64,
+    /// `true` once the live-log guardrail has fired for the current
+    /// (above-threshold) live-log window. Reset to `false` when the
+    /// snapshot floor advances (which shrinks the live log back below
+    /// threshold).
+    pub(crate) max_log_hint_armed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +174,9 @@ pub struct Engine<C> {
     snapshot_chunk_size_bytes: usize,
     /// Applied-entry threshold for emitting `Action::SnapshotHint`.
     snapshot_hint_threshold_entries: u64,
+    /// Live-log guardrail: max entries above the snapshot floor before
+    /// we force a `SnapshotHint`, even if apply is lagging.
+    max_log_entries: u64,
     /// §9.6 pre-vote enabled. When on, election-timer expiry enters
     /// `PreCandidate` instead of bumping the term directly.
     pre_vote: bool,
@@ -191,6 +199,17 @@ pub struct EngineConfig {
     /// past the current floor crosses this threshold. `0` disables the
     /// hint.
     pub snapshot_hint_threshold_entries: u64,
+    /// Emit `Action::SnapshotHint` whenever the number of live log
+    /// entries (entries above the current snapshot floor) crosses this
+    /// threshold — independent of how many are applied. `0` disables
+    /// the guardrail.
+    ///
+    /// This exists so a stuck follower whose apply path is slow but
+    /// whose log keeps growing doesn't run the node out of disk. The
+    /// `snapshot_hint_threshold_entries` path is about "compact once
+    /// we've applied enough to reclaim space"; this one is about
+    /// "compact before the log itself gets out of hand."
+    pub max_log_entries: u64,
     /// Enable the §9.6 pre-vote extension. When on, a follower whose
     /// election timer fires first enters `RoleState::PreCandidate`
     /// and asks peers whether they would vote for it. The term is
@@ -207,6 +226,7 @@ impl Default for EngineConfig {
         Self {
             snapshot_chunk_size_bytes: 64 * 1024,
             snapshot_hint_threshold_entries: 0,
+            max_log_entries: 0,
             pre_vote: true,
         }
     }
@@ -218,6 +238,7 @@ impl EngineConfig {
         Self {
             snapshot_chunk_size_bytes,
             snapshot_hint_threshold_entries,
+            max_log_entries: 0,
             pre_vote: true,
         }
     }
@@ -229,6 +250,14 @@ impl EngineConfig {
     #[must_use]
     pub fn with_pre_vote(mut self, pre_vote: bool) -> Self {
         self.pre_vote = pre_vote;
+        self
+    }
+
+    /// Builder-style override for `max_log_entries`. `0` disables the
+    /// live-log guardrail.
+    #[must_use]
+    pub fn with_max_log_entries(mut self, max: u64) -> Self {
+        self.max_log_entries = max;
         self
     }
 }
@@ -279,6 +308,7 @@ impl<C: Clone> Engine<C> {
             heartbeat_interval_ticks,
             snapshot_chunk_size_bytes: config.snapshot_chunk_size_bytes.max(1),
             snapshot_hint_threshold_entries: config.snapshot_hint_threshold_entries,
+            max_log_entries: config.max_log_entries,
             pre_vote: config.pre_vote,
             metrics: crate::engine::metrics::MetricsCounters::default(),
             state: RaftState {
@@ -297,6 +327,7 @@ impl<C: Clone> Engine<C> {
                 snapshot_peers: None,
                 pending_snapshot_install: None,
                 snapshot_hint_band: 0,
+                max_log_hint_armed: false,
             },
         }
     }
@@ -363,6 +394,7 @@ impl<C: Clone> Engine<C> {
         self.state.heartbeat_elapsed = 0;
         self.state.pending_snapshot_install = None;
         self.state.snapshot_hint_band = 0;
+        self.state.max_log_hint_armed = false;
     }
 
     // =========================================================================
@@ -591,13 +623,38 @@ impl<C: Clone> Engine<C> {
     /// real Raft actions so hosts observe a state machine that has
     /// already applied everything through `last_included_index`.
     fn maybe_emit_snapshot_hint(&mut self, actions: &mut Vec<Action<C>>) {
+        let floor = self.state.log.snapshot_last().index;
+        let applied_past_floor = self.state.last_applied.get().saturating_sub(floor.get());
+        let last_log_index = self
+            .state
+            .log
+            .last_log_id()
+            .map_or(0, |id| id.index.get());
+        let live_log_entries = last_log_index.saturating_sub(floor.get());
+
+        // Live-log guardrail (`max_log_entries`): fire once as the live
+        // log crosses the threshold from below, re-arm once the floor
+        // advances past the threshold again (i.e. live log shrinks
+        // back under it).
+        let max_log = self.max_log_entries;
+        if max_log > 0 {
+            if live_log_entries > max_log {
+                if !self.state.max_log_hint_armed && self.state.last_applied > floor {
+                    actions.push(Action::SnapshotHint {
+                        last_included_index: self.state.last_applied,
+                    });
+                    self.state.max_log_hint_armed = true;
+                }
+            } else {
+                self.state.max_log_hint_armed = false;
+            }
+        }
+
+        // Applied-entries threshold: band edges.
         let threshold = self.snapshot_hint_threshold_entries;
         if threshold == 0 {
             return;
         }
-
-        let floor = self.state.log.snapshot_last().index;
-        let applied_past_floor = self.state.last_applied.get().saturating_sub(floor.get());
         let band = applied_past_floor / threshold;
         if band < self.state.snapshot_hint_band {
             self.state.snapshot_hint_band = band;

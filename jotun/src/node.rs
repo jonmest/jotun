@@ -165,6 +165,12 @@ pub struct Config {
     /// disables host-initiated snapshotting in the runtime; incoming
     /// leader snapshots still install normally.
     pub snapshot_hint_threshold_entries: u64,
+    /// Disk-guard threshold on the live log. When the number of log
+    /// entries above the current snapshot floor exceeds this, the
+    /// engine emits a `SnapshotHint` regardless of
+    /// `snapshot_hint_threshold_entries` — protects against runaway
+    /// log growth when apply is lagging. `0` disables the guardrail.
+    pub max_log_entries: u64,
     /// Maximum size of one outbound `InstallSnapshot` chunk in bytes.
     pub snapshot_chunk_size_bytes: usize,
     /// Enable §9.6 pre-vote. With pre-vote on (default `true`), a
@@ -261,6 +267,7 @@ impl Config {
             max_batch_delay_ticks: 0,
             max_batch_entries: 64,
             snapshot_hint_threshold_entries: 1024,
+            max_log_entries: 0,
             snapshot_chunk_size_bytes: 64 * 1024,
             pre_vote: true,
         }
@@ -529,7 +536,8 @@ impl<S: StateMachine> Node<S> {
             config.snapshot_chunk_size_bytes,
             config.snapshot_hint_threshold_entries,
         )
-        .with_pre_vote(config.pre_vote);
+        .with_pre_vote(config.pre_vote)
+        .with_max_log_entries(config.max_log_entries);
         let engine: Engine<Vec<u8>> = Engine::with_config(
             config.node_id,
             initial_peers.iter().copied(),
@@ -907,10 +915,15 @@ enum ApplyRequest<S: StateMachine> {
     Read { reader: Box<dyn FnOnce(&S) + Send> },
     /// Restore the state machine from snapshot bytes just installed.
     Restore { bytes: Vec<u8> },
-    /// Produce a snapshot of current state. Reply carries the bytes.
+    /// Produce a snapshot of current state. Reply carries the bytes,
+    /// or a `SnapshotError` if the state machine declined this attempt
+    /// (e.g. ENOSPC, transient backpressure). The driver logs the
+    /// error and drops the attempt — subsequent hints retry.
     /// Ordered behind any preceding `Command` so the snapshot observes
     /// every applied entry up to this request.
-    TakeSnapshot { reply: oneshot::Sender<Vec<u8>> },
+    TakeSnapshot {
+        reply: oneshot::Sender<Result<Vec<u8>, crate::state_machine::SnapshotError>>,
+    },
 }
 
 /// The apply task: owns the state machine, processes `ApplyRequest`s
@@ -935,8 +948,8 @@ async fn apply_loop<S: StateMachine>(
                 state_machine.restore(bytes);
             }
             ApplyRequest::TakeSnapshot { reply } => {
-                let bytes = state_machine.snapshot();
-                let _ = reply.send(bytes);
+                let result = state_machine.snapshot();
+                let _ = reply.send(result);
             }
         }
     }
@@ -1546,7 +1559,19 @@ where
                 d.snapshot_in_flight = true;
                 let inputs_tx = d.inputs_tx.clone();
                 tokio::spawn(async move {
-                    let bytes = reply_rx.await.ok();
+                    let bytes = match reply_rx.await {
+                        Ok(Ok(bytes)) => Some(bytes),
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                target = "jotun::node",
+                                error = %err,
+                                "state machine declined to produce a snapshot; \
+                                 dropping this hint, engine will re-hint later",
+                            );
+                            None
+                        }
+                        Err(_) => None,
+                    };
                     let _ = inputs_tx
                         .send(DriverInput::SnapshotReady {
                             last_included_index,

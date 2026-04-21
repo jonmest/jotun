@@ -31,6 +31,7 @@ fn classic_config() -> crate::engine::engine::EngineConfig {
     crate::engine::engine::EngineConfig {
         snapshot_chunk_size_bytes: 64 * 1024,
         snapshot_hint_threshold_entries: 0,
+        max_log_entries: 0,
         pre_vote: false,
     }
 }

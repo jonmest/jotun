@@ -126,7 +126,7 @@ fn state_machine_apply_returns_previous_value_for_set() {
 #[test]
 fn default_snapshot_returns_empty_bytes() {
     let kv = Kv::default();
-    assert!(kv.snapshot().is_empty());
+    assert!(kv.snapshot().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +356,7 @@ fn default_restore_panics_with_documented_message() {
 #[test]
 fn default_snapshot_for_custom_impl_is_empty() {
     let sm = NoSnapshotKv;
-    assert!(sm.snapshot().is_empty());
+    assert!(sm.snapshot().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------

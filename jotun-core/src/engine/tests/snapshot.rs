@@ -199,6 +199,7 @@ fn snapshot_hint_fires_once_per_applied_threshold_band_and_rearms_after_snapshot
         EngineConfig {
             snapshot_chunk_size_bytes: 16,
             snapshot_hint_threshold_entries: 2,
+            max_log_entries: 0,
             pre_vote: false,
         },
     );
@@ -223,6 +224,102 @@ fn snapshot_hint_fires_once_per_applied_threshold_band_and_rearms_after_snapshot
         append_entries_request(1, 2, engine.log().last_log_id(), vec![], 4),
     ));
     assert_eq!(collect_snapshot_hints(&second), vec![LogIndex::new(4)]);
+}
+
+// ---------------------------------------------------------------------------
+// max_log_entries guardrail — forces a snapshot hint once the live log
+// grows past the threshold, independent of the applied-entries band.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn max_log_entries_emits_snapshot_hint_when_exceeded() {
+    let mut engine = Engine::with_config(
+        node(1),
+        [node(2), node(3)],
+        Box::new(StaticEnv(10)),
+        1,
+        EngineConfig {
+            snapshot_chunk_size_bytes: 16,
+            snapshot_hint_threshold_entries: 0, // applied-band path off
+            max_log_entries: 3,
+            pre_vote: false,
+        },
+    );
+    // Seed 4 entries and commit them all. Live log (4) > threshold (3).
+    seed_log(&mut engine, &[1, 1, 1, 1]);
+    let actions = engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, engine.log().last_log_id(), vec![], 4),
+    ));
+    assert_eq!(collect_snapshot_hints(&actions), vec![LogIndex::new(4)]);
+}
+
+#[test]
+fn max_log_entries_zero_disables_the_guardrail() {
+    let mut engine = Engine::with_config(
+        node(1),
+        [node(2), node(3)],
+        Box::new(StaticEnv(10)),
+        1,
+        EngineConfig {
+            snapshot_chunk_size_bytes: 16,
+            snapshot_hint_threshold_entries: 0,
+            max_log_entries: 0,
+            pre_vote: false,
+        },
+    );
+    seed_log(&mut engine, &[1, 1, 1, 1, 1, 1, 1, 1]);
+    let actions = engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, engine.log().last_log_id(), vec![], 8),
+    ));
+    assert!(
+        collect_snapshot_hints(&actions).is_empty(),
+        "threshold=0 must not emit any snapshot hints",
+    );
+}
+
+#[test]
+fn max_log_entries_fires_once_per_crossing_and_rearms_after_snapshot() {
+    let mut engine = Engine::with_config(
+        node(1),
+        [node(2), node(3)],
+        Box::new(StaticEnv(10)),
+        1,
+        EngineConfig {
+            snapshot_chunk_size_bytes: 16,
+            snapshot_hint_threshold_entries: 0,
+            max_log_entries: 2,
+            pre_vote: false,
+        },
+    );
+    seed_log(&mut engine, &[1, 1, 1]);
+    let first = engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, engine.log().last_log_id(), vec![], 3),
+    ));
+    assert_eq!(collect_snapshot_hints(&first), vec![LogIndex::new(3)]);
+
+    // Ticking again with unchanged log/floor must not re-hint.
+    let no_repeat = engine.step(Event::Tick);
+    assert!(
+        collect_snapshot_hints(&no_repeat).is_empty(),
+        "same crossing must not re-hint",
+    );
+
+    // Take the snapshot; floor advances past the threshold, live log
+    // shrinks back under. Then grow past again via AE — new hint
+    // expected.
+    engine.step(snapshot_taken(3, b"snap@3".to_vec()));
+    // Now floor=3, live log has 0 entries. Append 3 more entries
+    // (indices 4,5,6) via a leader AE so it crosses the threshold
+    // again.
+    let more = crate::engine::tests::fixtures::log_entries(&[(4, 1), (5, 1), (6, 1)]);
+    let second = engine.step(append_entries_from(
+        2,
+        append_entries_request(1, 2, engine.log().last_log_id(), more, 6),
+    ));
+    assert_eq!(collect_snapshot_hints(&second), vec![LogIndex::new(6)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +348,7 @@ fn leader_with_snapshot() -> Engine<Vec<u8>> {
     leader_with_snapshot_config(EngineConfig {
         snapshot_chunk_size_bytes: 64 * 1024,
         snapshot_hint_threshold_entries: 0,
+        max_log_entries: 0,
         pre_vote: false,
     })
 }
@@ -347,6 +445,7 @@ fn leader_streams_snapshot_one_chunk_per_broadcast_and_resumes_on_ack() {
     let mut engine = leader_with_snapshot_config(EngineConfig {
         snapshot_chunk_size_bytes: 3,
         snapshot_hint_threshold_entries: 0,
+        max_log_entries: 0,
         pre_vote: false,
     });
     engine.state_mut().snapshot_bytes = Some(b"abcdefg".to_vec());
@@ -399,6 +498,7 @@ fn leader_restarts_snapshot_transfer_when_floor_moves() {
     let mut engine = leader_with_snapshot_config(EngineConfig {
         snapshot_chunk_size_bytes: 3,
         snapshot_hint_threshold_entries: 0,
+        max_log_entries: 0,
         pre_vote: false,
     });
     if let RoleState::Leader(ls) = &mut engine.state_mut().role {

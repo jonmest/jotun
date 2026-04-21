@@ -720,3 +720,45 @@ async fn recover_ignores_torn_tail_frame() {
         .unwrap();
     assert_eq!(recovered.log, vec![entry(1, 1, b"a"), entry(2, 1, b"b")]);
 }
+
+// ---------------------------------------------------------------------------
+// Orphaned-file sweep on open(): stale `.tmp` files in the data dir
+// root (from a crash mid-atomic-rename) get removed so they don't
+// accumulate on disk.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn open_removes_root_tmp_files_from_prior_crash() {
+    let tmp = TmpDir::new();
+    // Pre-create the data dir so we can drop a stray tmp before open.
+    std::fs::create_dir_all(&tmp.0).unwrap();
+    let stale_snapshot_tmp = tmp.0.join("snapshot.bin.tmp");
+    let stale_meta_tmp = tmp.0.join("snapshot_meta.bin.tmp");
+    std::fs::write(&stale_snapshot_tmp, b"partial snapshot bytes").unwrap();
+    std::fs::write(&stale_meta_tmp, b"partial meta").unwrap();
+    assert!(stale_snapshot_tmp.exists());
+    assert!(stale_meta_tmp.exists());
+
+    let _s: DiskStorage = DiskStorage::open(&tmp.0).await.unwrap();
+
+    assert!(
+        !stale_snapshot_tmp.exists(),
+        "open() must sweep orphaned snapshot.bin.tmp",
+    );
+    assert!(
+        !stale_meta_tmp.exists(),
+        "open() must sweep orphaned snapshot_meta.bin.tmp",
+    );
+}
+
+#[tokio::test]
+async fn open_leaves_real_files_untouched() {
+    let tmp = TmpDir::new();
+    std::fs::create_dir_all(&tmp.0).unwrap();
+    let real_snapshot = tmp.0.join("snapshot.bin");
+    std::fs::write(&real_snapshot, b"real snapshot").unwrap();
+
+    let _s: DiskStorage = DiskStorage::open(&tmp.0).await.unwrap();
+
+    assert!(real_snapshot.exists(), "real files must survive open()");
+}

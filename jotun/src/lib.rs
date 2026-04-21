@@ -33,7 +33,7 @@ pub use node::{
     Bootstrap, Config, ConfigError, Node, NodeStartError, NodeStatus, ProposeError, ReadError,
     Role, TransferLeadershipError,
 };
-pub use state_machine::{DecodeError, StateMachine};
+pub use state_machine::{DecodeError, SnapshotError, StateMachine};
 pub use storage::{DiskStorage, DiskStorageError, Storage, StoredHardState, StoredSnapshot};
 pub use transport::{TcpTransport, TcpTransportError, Transport};
 
