@@ -154,7 +154,13 @@ jobs:
       - name: Install protoc + mold linker
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       - name: Run diff-scoped mutant smoke
-        run: cargo mutants -p yggr-core -p yggr --in-diff "origin/${{ github.base_ref }}...HEAD" --baseline skip --timeout 120 --output target/mutants/smoke # zizmor: ignore[template-injection]
+        # `--in-diff` takes a diff file, not a revspec. Materialise the
+        # PR's changes to a patch file and point cargo-mutants at it.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff "origin/${BASE_REF}...HEAD" > /tmp/pr.diff
+          cargo mutants -p yggr-core -p yggr --in-diff /tmp/pr.diff --baseline skip --timeout 120 --output target/mutants/smoke
       - name: Upload cargo-mutants smoke report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
