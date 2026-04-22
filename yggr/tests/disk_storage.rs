@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use yggr::{DiskStorage, NodeId, Storage, StoredHardState, StoredSnapshot};
+use yggr::{DiskStorage, Membership, NodeId, Storage, StoredHardState, StoredSnapshot};
 use yggr_core::types::log::LogId;
 use yggr_core::{LogEntry, LogIndex, LogPayload, Term};
 
@@ -226,7 +226,7 @@ async fn snapshot_replaces_log_prefix() {
         StoredSnapshot {
             last_included_index: LogIndex::new(2),
             last_included_term: Term::new(1),
-            peers: std::collections::BTreeSet::new(),
+            membership: Membership::default(),
             bytes: b"snapshot-bytes".to_vec(),
         },
     )
@@ -263,7 +263,7 @@ async fn appends_after_snapshot_use_correct_indices() {
         StoredSnapshot {
             last_included_index: LogIndex::new(2),
             last_included_term: Term::new(1),
-            peers: std::collections::BTreeSet::new(),
+            membership: Membership::default(),
             bytes: b"snap".to_vec(),
         },
     )
@@ -368,7 +368,7 @@ async fn snapshot_drops_whole_segment_files() {
         StoredSnapshot {
             last_included_index: LogIndex::new(3),
             last_included_term: Term::new(1),
-            peers: std::collections::BTreeSet::new(),
+            membership: Membership::default(),
             bytes: b"snap".to_vec(),
         },
     )
@@ -461,7 +461,7 @@ async fn snapshot_tolerates_externally_deleted_segment_files() {
         StoredSnapshot {
             last_included_index: LogIndex::new(3),
             last_included_term: Term::new(1),
-            peers: std::collections::BTreeSet::new(),
+            membership: Membership::default(),
             bytes: b"snap".to_vec(),
         },
     )
@@ -489,7 +489,7 @@ async fn snapshot_straddle_rewrites_to_new_start_index() {
         StoredSnapshot {
             last_included_index: LogIndex::new(2),
             last_included_term: Term::new(1),
-            peers: std::collections::BTreeSet::new(),
+            membership: Membership::default(),
             bytes: b"snap".to_vec(),
         },
     )
@@ -521,7 +521,7 @@ async fn snapshot_with_peers_round_trips() {
         StoredSnapshot {
             last_included_index: LogIndex::new(5),
             last_included_term: Term::new(2),
-            peers: peers.clone(),
+            membership: Membership::with_voters(peers.clone()),
             bytes: b"snapped".to_vec(),
         },
     )
@@ -534,7 +534,7 @@ async fn snapshot_with_peers_round_trips() {
         .await
         .unwrap();
     let snap = r.snapshot.expect("snapshot present");
-    assert_eq!(snap.peers, peers);
+    assert_eq!(snap.membership, Membership::with_voters(peers));
     assert_eq!(snap.bytes, b"snapped");
 }
 
@@ -556,7 +556,7 @@ async fn snapshot_covers_only_segment_leaves_empty_tail() {
         StoredSnapshot {
             last_included_index: LogIndex::new(2),
             last_included_term: Term::new(1),
-            peers: std::collections::BTreeSet::new(),
+            membership: Membership::default(),
             bytes: b"snap".to_vec(),
         },
     )

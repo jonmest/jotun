@@ -1,5 +1,6 @@
 use super::strategies;
 use crate::records::install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot};
+use crate::records::membership::Membership;
 use crate::transport::mapping::ConvertError;
 use crate::transport::protobuf as proto;
 use proptest::prelude::*;
@@ -118,6 +119,7 @@ fn request_install_snapshot_zero_peer_id_rejected() {
         done: true,
         leader_commit: 1,
         peers: vec![proto::NodeIdRef { id: 3 }, proto::NodeIdRef { id: 0 }],
+        learners: vec![],
     };
     let err = RequestInstallSnapshot::try_from(p).unwrap_err();
     assert_eq!(err, ConvertError::ZeroNodeId);
@@ -141,11 +143,11 @@ fn request_install_snapshot_with_populated_peers_roundtrips() {
         offset: 0,
         done: true,
         leader_commit: crate::types::index::LogIndex::new(10),
-        peers: peers.clone(),
+        membership: Membership::with_voters(peers.clone()),
     };
     let round: RequestInstallSnapshot = proto::RequestInstallSnapshot::from(r.clone())
         .try_into()
         .unwrap();
     assert_eq!(r, round);
-    assert_eq!(round.peers, peers);
+    assert_eq!(round.membership, Membership::with_voters(peers));
 }

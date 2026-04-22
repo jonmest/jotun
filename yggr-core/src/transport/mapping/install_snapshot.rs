@@ -1,4 +1,5 @@
 use crate::records::install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot};
+use crate::records::membership::Membership;
 use crate::types::{index::LogIndex, node::NodeId, term::Term};
 
 use super::super::protobuf as proto;
@@ -15,8 +16,15 @@ impl From<RequestInstallSnapshot> for proto::RequestInstallSnapshot {
             done: v.done,
             leader_commit: v.leader_commit.get(),
             peers: v
-                .peers
-                .into_iter()
+                .membership
+                .voters()
+                .iter()
+                .map(|id| proto::NodeIdRef { id: id.get() })
+                .collect(),
+            learners: v
+                .membership
+                .learners()
+                .iter()
                 .map(|id| proto::NodeIdRef { id: id.get() })
                 .collect(),
         }
@@ -31,6 +39,10 @@ impl TryFrom<proto::RequestInstallSnapshot> for RequestInstallSnapshot {
         for p in v.peers {
             peers.insert(NodeId::new(p.id).ok_or(ConvertError::ZeroNodeId)?);
         }
+        let mut learners = std::collections::BTreeSet::new();
+        for l in v.learners {
+            learners.insert(NodeId::new(l.id).ok_or(ConvertError::ZeroNodeId)?);
+        }
         Ok(Self {
             term: Term::new(v.term),
             leader_id: NodeId::new(v.leader_id).ok_or(ConvertError::ZeroNodeId)?,
@@ -44,7 +56,7 @@ impl TryFrom<proto::RequestInstallSnapshot> for RequestInstallSnapshot {
             offset: v.offset,
             done: v.done,
             leader_commit: LogIndex::new(v.leader_commit),
-            peers,
+            membership: Membership::new(peers, learners),
         })
     }
 }

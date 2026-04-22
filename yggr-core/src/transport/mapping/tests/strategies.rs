@@ -5,6 +5,7 @@ use crate::records::{
     append_entries::{AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries},
     install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot},
     log_entry::{ConfigChange, LogEntry, LogPayload},
+    membership::Membership,
     message::Message,
     pre_vote::{PreVoteResponse, RequestPreVote},
     timeout_now::TimeoutNow,
@@ -128,7 +129,7 @@ pub(super) fn request_install_snapshot() -> impl Strategy<Value = RequestInstall
                     offset,
                     done,
                     leader_commit,
-                    peers,
+                    membership: Membership::with_voters(peers),
                 }
             },
         )

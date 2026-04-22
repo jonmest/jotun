@@ -18,9 +18,7 @@ pub use disk::{DiskStorage, DiskStorageError};
 
 use std::future::Future;
 
-use std::collections::BTreeSet;
-
-use yggr_core::{LogEntry, LogIndex, NodeId, Term};
+use yggr_core::{LogEntry, LogIndex, Membership, NodeId, Term};
 
 /// The §5.1 hard state persisted across crashes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,15 +29,15 @@ pub struct StoredHardState {
 
 /// A snapshot persisted on disk.
 ///
-/// `peers` is the cluster membership as of `last_included_index` —
-/// snapshot compaction drops the committed `ConfigChange` entries
-/// that established the current config, so carrying the set here is
-/// how membership survives restart.
+/// `membership` is the cluster membership as of `last_included_index`.
+/// Snapshot compaction drops the committed membership entries that
+/// established the current config, so carrying it here is how
+/// membership survives restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSnapshot {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
-    pub peers: BTreeSet<NodeId>,
+    pub membership: Membership,
     pub bytes: Vec<u8>,
 }
 

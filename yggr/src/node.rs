@@ -1258,7 +1258,7 @@ where
         snapshot: snapshot.map(|s| RecoveredSnapshot {
             last_included_index: s.last_included_index,
             last_included_term: s.last_included_term,
-            peers: s.peers,
+            membership: s.membership,
             bytes: s.bytes,
         }),
         post_snapshot_log: log,
@@ -1658,7 +1658,7 @@ where
             Action::PersistSnapshot {
                 last_included_index,
                 last_included_term,
-                peers,
+                membership,
                 bytes,
             } => {
                 if let Err(e) = d
@@ -1666,7 +1666,7 @@ where
                     .persist_snapshot(StoredSnapshot {
                         last_included_index,
                         last_included_term,
-                        peers,
+                        membership,
                         bytes,
                     })
                     .await

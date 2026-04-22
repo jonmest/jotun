@@ -102,6 +102,8 @@ message RequestInstallSnapshot {
   // config; carrying the set here is how the follower restores the
   // right config on install.
   repeated NodeIdRef peers = 8;
+  // Non-voting members as of last_included.
+  repeated NodeIdRef learners = 9;
 }
 
 message InstallSnapshotResponse {

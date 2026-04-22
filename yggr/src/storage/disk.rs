@@ -43,7 +43,7 @@ use prost::Message as _;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use yggr_core::transport::protobuf as proto;
-use yggr_core::{LogEntry, LogIndex, NodeId, Term};
+use yggr_core::{LogEntry, LogIndex, Membership, NodeId, Term};
 
 use crate::storage::{RecoveredState, Storage, StoredHardState, StoredSnapshot};
 
@@ -531,16 +531,34 @@ where
 
     async fn persist_snapshot(&mut self, snap: StoredSnapshot) -> Result<(), Self::Error> {
         // Snapshot meta:
-        //   [u64 LE index][u64 LE term][u32 LE peer_count][u64 LE peer_id × peer_count]
-        // Peers are the committed cluster membership at
-        // `last_included_index`; recovery reconstructs them from here.
-        let peer_count = u32::try_from(snap.peers.len())
-            .map_err(|_| DiskStorageError::Malformed("snapshot peer count exceeds 4B"))?;
-        let mut meta = Vec::with_capacity(16 + 4 + (snap.peers.len() * 8));
+        // Old format:
+        //   [u64 LE index][u64 LE term][u32 LE voter_count][u64 LE voter_id × voter_count]
+        // New format:
+        //   [u64 LE index][u64 LE term][u32 LE voter_count]
+        //   [u64 LE voter_id × voter_count][u32 LE learner_count]
+        //   [u64 LE learner_id × learner_count]
+        //
+        // The old format remains parseable because its total length is
+        // exactly `20 + voter_count * 8`; any longer payload is treated as
+        // the new format.
+        let voter_count = u32::try_from(snap.membership.voters().len())
+            .map_err(|_| DiskStorageError::Malformed("snapshot voter count exceeds 4B"))?;
+        let learner_count = u32::try_from(snap.membership.learners().len())
+            .map_err(|_| DiskStorageError::Malformed("snapshot learner count exceeds 4B"))?;
+        let mut meta = Vec::with_capacity(
+            16 + 4
+                + (snap.membership.voters().len() * 8)
+                + 4
+                + (snap.membership.learners().len() * 8),
+        );
         meta.extend_from_slice(&snap.last_included_index.get().to_le_bytes());
         meta.extend_from_slice(&snap.last_included_term.get().to_le_bytes());
-        meta.extend_from_slice(&peer_count.to_le_bytes());
-        for id in &snap.peers {
+        meta.extend_from_slice(&voter_count.to_le_bytes());
+        for id in snap.membership.voters() {
+            meta.extend_from_slice(&id.get().to_le_bytes());
+        }
+        meta.extend_from_slice(&learner_count.to_le_bytes());
+        for id in snap.membership.learners() {
             meta.extend_from_slice(&id.get().to_le_bytes());
         }
 
@@ -729,27 +747,57 @@ async fn read_snapshot(
     let count_bytes: [u8; 4] = meta[16..20].try_into().expect("4 bytes");
     let last_included_index = LogIndex::new(u64::from_le_bytes(idx_bytes));
     let last_included_term = Term::new(u64::from_le_bytes(term_bytes));
-    let peer_count = u32::from_le_bytes(count_bytes) as usize;
-    let expected_len = 20 + peer_count * 8;
-    if meta.len() != expected_len {
+    let voter_count = u32::from_le_bytes(count_bytes) as usize;
+    let legacy_len = 20 + voter_count * 8;
+    if meta.len() < legacy_len {
         return Err(DiskStorageError::Malformed(
             "snapshot_meta.bin size mismatch",
         ));
     }
-    let mut peers = std::collections::BTreeSet::new();
-    for i in 0..peer_count {
+    let mut voters = std::collections::BTreeSet::new();
+    for i in 0..voter_count {
         let off = 20 + i * 8;
         let raw: [u8; 8] = meta[off..off + 8].try_into().expect("8 bytes");
         let peer = NodeId::new(u64::from_le_bytes(raw)).ok_or(DiskStorageError::Malformed(
             "snapshot_meta.bin peer id is zero",
         ))?;
-        peers.insert(peer);
+        voters.insert(peer);
     }
+    let learners = if meta.len() == legacy_len {
+        std::collections::BTreeSet::new()
+    } else {
+        if meta.len() < legacy_len + 4 {
+            return Err(DiskStorageError::Malformed(
+                "snapshot_meta.bin size mismatch",
+            ));
+        }
+        let learner_count_off = legacy_len;
+        let learner_count_bytes: [u8; 4] = meta[learner_count_off..learner_count_off + 4]
+            .try_into()
+            .expect("4 bytes");
+        let learner_count = u32::from_le_bytes(learner_count_bytes) as usize;
+        let expected_len = legacy_len + 4 + learner_count * 8;
+        if meta.len() != expected_len {
+            return Err(DiskStorageError::Malformed(
+                "snapshot_meta.bin size mismatch",
+            ));
+        }
+        let mut learners = std::collections::BTreeSet::new();
+        for i in 0..learner_count {
+            let off = legacy_len + 4 + i * 8;
+            let raw: [u8; 8] = meta[off..off + 8].try_into().expect("8 bytes");
+            let learner = NodeId::new(u64::from_le_bytes(raw)).ok_or(
+                DiskStorageError::Malformed("snapshot_meta.bin learner id is zero"),
+            )?;
+            learners.insert(learner);
+        }
+        learners
+    };
     let bytes = tokio::fs::read(bytes_path).await?;
     Ok(Some(StoredSnapshot {
         last_included_index,
         last_included_term,
-        peers,
+        membership: Membership::new(voters, learners),
         bytes,
     }))
 }

@@ -149,7 +149,7 @@ pub struct RecoveredHardState<C> {
 pub struct RecoveredSnapshot {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
-    pub peers: BTreeSet<NodeId>,
+    pub membership: Membership,
     pub bytes: Vec<u8>,
 }
 
@@ -389,16 +389,13 @@ impl<C: Clone> Engine<C> {
         // `last_included_index`. Restore it before replaying any
         // post-snapshot CCs so `apply_config_change` deltas land
         // on the right base.
-        let restored_membership = recovered
-            .snapshot
-            .as_ref()
-            .map(|s| Membership::with_voters(s.peers.clone()));
+        let restored_membership = recovered.snapshot.as_ref().map(|s| s.membership.clone());
         if let Some(snap) = recovered.snapshot {
             self.state
                 .log
                 .install_snapshot(snap.last_included_index, snap.last_included_term);
             self.state.snapshot_bytes = Some(snap.bytes);
-            self.state.snapshot_membership = Some(Membership::with_voters(snap.peers));
+            self.state.snapshot_membership = Some(snap.membership);
             self.state.commit_index = snap.last_included_index;
             self.state.last_applied = snap.last_included_index;
         }
@@ -1011,7 +1008,7 @@ impl<C: Clone> Engine<C> {
         }
         vec![Action::PersistSnapshot {
             last_included_index,
-            peers: membership_at_floor.voters().clone(),
+            membership: membership_at_floor,
             last_included_term,
             bytes,
         }]
@@ -1752,10 +1749,9 @@ impl<C: Clone> Engine<C> {
             offset,
             done,
             leader_commit,
-            peers,
+            membership,
             ..
         } = request;
-        let membership = Membership::with_voters(peers);
 
         // Record the leader for client redirects.
         if let RoleState::Follower(f) = &mut self.state.role {
@@ -1909,7 +1905,7 @@ impl<C: Clone> Engine<C> {
         out.push(Action::PersistSnapshot {
             last_included_index: pending.last_included.index,
             last_included_term: pending.last_included.term,
-            peers: pending.membership.voters().clone(),
+            membership: pending.membership.clone(),
             bytes: pending.bytes.clone(),
         });
         out.push(Action::ApplySnapshot {
@@ -2160,11 +2156,6 @@ impl<C: Clone> Engine<C> {
             _ => 0,
         };
         let bytes = self.state.snapshot_bytes.as_deref().unwrap_or(&[]);
-        let peers = self
-            .state
-            .snapshot_membership
-            .as_ref()
-            .map_or_else(BTreeSet::default, |membership| membership.voters().clone());
         let start = usize::try_from(offset)
             .unwrap_or(bytes.len())
             .min(bytes.len());
@@ -2182,7 +2173,7 @@ impl<C: Clone> Engine<C> {
                 offset,
                 done: end == bytes.len(),
                 leader_commit: self.state.commit_index,
-                peers,
+                membership: self.state.snapshot_membership.clone().unwrap_or_default(),
             }),
         }
     }

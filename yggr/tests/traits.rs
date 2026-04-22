@@ -15,7 +15,8 @@ use std::convert::Infallible;
 
 use std::error::Error as _;
 use yggr::{
-    DecodeError, NodeId, StateMachine, Storage, StoredHardState, StoredSnapshot, Transport,
+    DecodeError, Membership, NodeId, StateMachine, Storage, StoredHardState, StoredSnapshot,
+    Transport,
 };
 use yggr_core::{Incoming, LogEntry, LogIndex, Message, Term};
 
@@ -238,7 +239,7 @@ async fn memory_storage_round_trips_log_with_snapshot_floor() {
     s.persist_snapshot(StoredSnapshot {
         last_included_index: LogIndex::new(3),
         last_included_term: Term::new(1),
-        peers: std::collections::BTreeSet::new(),
+        membership: Membership::default(),
         bytes: b"snap".to_vec(),
     })
     .await

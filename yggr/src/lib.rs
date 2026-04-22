@@ -49,4 +49,4 @@ pub use transport::{TcpTransport, TcpTransportError, Transport};
 // Convenience re-exports from yggr-core. Saves users from having to
 // `use yggr_core::...` for the basics; the engine itself stays
 // addressable via that crate for power-user integrations.
-pub use yggr_core::{ConfigChange, LogIndex, NodeId, Term};
+pub use yggr_core::{ConfigChange, LogIndex, Membership, NodeId, Term};

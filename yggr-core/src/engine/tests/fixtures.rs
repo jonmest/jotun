@@ -10,6 +10,7 @@ use crate::records::append_entries::{
     AppendEntriesResponse, AppendEntriesResult, RequestAppendEntries,
 };
 use crate::records::log_entry::{LogEntry, LogPayload};
+use crate::records::membership::Membership;
 use crate::records::message::Message;
 use crate::records::timeout_now::TimeoutNow;
 use crate::records::vote::{RequestVote, VoteResponse};
@@ -330,7 +331,7 @@ pub(super) fn install_snapshot_from(
             offset,
             done,
             leader_commit: LogIndex::new(leader_commit),
-            peers: std::collections::BTreeSet::new(),
+            membership: Membership::default(),
         }),
     })
 }

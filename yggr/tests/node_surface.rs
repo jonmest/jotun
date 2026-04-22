@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use yggr::{
-    Bootstrap, Config, ConfigError, DecodeError, Node, NodeId, NodeStartError, NodeStatus,
-    ProposeError, ReadError, StateMachine, Storage, StoredHardState, StoredSnapshot,
+    Bootstrap, Config, ConfigError, DecodeError, Membership, Node, NodeId, NodeStartError,
+    NodeStatus, ProposeError, ReadError, StateMachine, Storage, StoredHardState, StoredSnapshot,
     TransferLeadershipError, Transport,
 };
 use yggr_core::{
@@ -724,7 +724,7 @@ async fn bootstrap_recover_prefers_persisted_peers_when_snapshot_exists() {
         snapshot: Some(StoredSnapshot {
             last_included_index: LogIndex::new(7),
             last_included_term: Term::new(3),
-            peers: BTreeSet::from([nid(2)]),
+            membership: Membership::with_voters(BTreeSet::from([nid(2)])),
             bytes: b"snapshot".to_vec(),
         }),
         ..MemoryStorage::default()
