@@ -248,6 +248,7 @@ impl<C> Log<C> {
     }
 
     #[cfg(not(debug_assertions))]
+    #[allow(dead_code)]
     pub(crate) fn check_invariants(&self) {}
 }
 

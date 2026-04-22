@@ -1037,7 +1037,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yggr",
- "yggr-core",
 ]
 
 [[package]]

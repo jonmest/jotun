@@ -154,7 +154,7 @@ impl TestNode {
     ) -> Self {
         let (sm, snap) = ObservableKv::new();
         let storage = DiskStorage::open(&data_dir.0).await.unwrap();
-        let transport: TcpTransport<Vec<u8>> = TcpTransport::start(id, addr, peers).await.unwrap();
+        let transport: TcpTransport<Vec<u8>> = start_transport_with_retry(id, addr, peers).await;
 
         let mut config = Config::new(id, sm_peer_ids(&transport_peer_set_for(id)));
         // Tuned for test speed. Heartbeat every tick; election within
@@ -191,6 +191,27 @@ impl TestNode {
     #[allow(dead_code)]
     fn applied(&self) -> u64 {
         self.snap.lock().unwrap().applied
+    }
+}
+
+async fn start_transport_with_retry(
+    id: NodeId,
+    addr: SocketAddr,
+    peers: BTreeMap<NodeId, SocketAddr>,
+) -> TcpTransport<Vec<u8>> {
+    let start = tokio::time::Instant::now();
+    loop {
+        match TcpTransport::start(id, addr, peers.clone()).await {
+            Ok(transport) => return transport,
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "port {addr} stayed busy while starting node {id}: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => panic!("failed to start transport for node {id} on {addr}: {err}"),
+        }
     }
 }
 
@@ -503,7 +524,7 @@ async fn cluster_survives_full_restart_from_disk() {
     ) -> (Node<ObservableKv>, Arc<Mutex<KvSnapshot>>) {
         let (sm, snap) = ObservableKv::new();
         let storage = DiskStorage::open(&dir).await.unwrap();
-        let transport: TcpTransport<Vec<u8>> = TcpTransport::start(id, addr, peers).await.unwrap();
+        let transport: TcpTransport<Vec<u8>> = start_transport_with_retry(id, addr, peers).await;
         let mut config = Config::new(id, ids_other_than(id).into_iter().collect::<Vec<_>>());
         config.election_timeout_min_ticks = 5;
         config.election_timeout_max_ticks = 15;

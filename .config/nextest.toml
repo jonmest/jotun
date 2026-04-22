@@ -6,6 +6,13 @@
 [profile.default]
 # Run everything. No filter.
 
+[test-groups]
+serial-network = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(multi_node)'
+test-group = 'serial-network'
+
 [profile.mutants]
 # Used by cargo-mutants (see .cargo/mutants.toml). The filter excludes
 # full-stack integration harnesses (runtime chaos, multi-node TCP,

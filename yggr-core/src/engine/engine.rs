@@ -582,6 +582,7 @@ impl<C: Clone> Engine<C> {
     }
 
     #[cfg(not(debug_assertions))]
+    #[allow(dead_code)]
     fn check_invariants(&self) {}
 
     // =========================================================================
