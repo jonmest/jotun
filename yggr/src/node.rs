@@ -1804,11 +1804,11 @@ where
         RoleState::Candidate(_) => (Role::Candidate, None),
         RoleState::Leader(_) => (Role::Leader, None),
     };
-    let peers: Vec<NodeId> = d.engine.peers().iter().copied().collect();
     let membership = MembershipView {
-        voters: peers.clone(),
-        learners: Vec::new(),
+        voters: d.engine.membership().voters().iter().copied().collect(),
+        learners: d.engine.membership().learners().iter().copied().collect(),
     };
+    let peers = membership.voters.clone();
     let last_log_index = d
         .engine
         .log()

@@ -9,6 +9,7 @@ use crate::records::append_entries::{
 };
 use crate::records::install_snapshot::{InstallSnapshotResponse, RequestInstallSnapshot};
 use crate::records::log_entry::{ConfigChange, LogEntry, LogPayload};
+use crate::records::membership::Membership;
 #[allow(clippy::enum_glob_use)] // match-heavy file; variants are used unqualified throughout
 use crate::records::message::Message::*;
 use crate::records::pre_vote::{PreVoteResponse, RequestPreVote};
@@ -67,15 +68,13 @@ pub(crate) struct RaftState<C> {
     pub(crate) election_elapsed: u64,
     /// Ticks elapsed since the leader last broadcast `AppendEntries`.
     pub(crate) heartbeat_elapsed: u64,
-    /// Other nodes in the cluster (self excluded). Mutated by every
-    /// [`crate::records::log_entry::ConfigChange`] entry the moment it
-    /// hits our log, committed or not — that's the §4.3 single-server
-    /// rule that keeps old-and-new majorities overlapping.
-    pub(crate) peers: BTreeSet<NodeId>,
-    /// The peer set the engine was constructed with. Snapshotted so we
+    /// Other nodes in the cluster (self excluded), split into voter and
+    /// learner roles. Today only voters are populated.
+    pub(crate) membership: Membership,
+    /// The membership the engine was constructed with. Snapshotted so we
     /// can recompute the active config from scratch after a log truncation
     /// rolls back uncommitted `ConfigChange` entries.
-    pub(crate) initial_peers: BTreeSet<NodeId>,
+    pub(crate) initial_membership: Membership,
     /// Bytes of the most recent snapshot, if any. Held in memory so a
     /// leader can include them in `InstallSnapshot` RPCs without going
     /// back to the host.
@@ -84,7 +83,7 @@ pub(crate) struct RaftState<C> {
     /// Shipped alongside `snapshot_bytes` in outbound
     /// `InstallSnapshot` RPCs so receivers can restore the right
     /// config on install.
-    pub(crate) snapshot_peers: Option<BTreeSet<NodeId>>,
+    pub(crate) snapshot_membership: Option<Membership>,
     /// Follower-side partial snapshot assembly, if we're in the
     /// middle of a chunked `InstallSnapshot` transfer.
     pub(crate) pending_snapshot_install: Option<PendingSnapshotInstall>,
@@ -108,7 +107,7 @@ pub(crate) struct RaftState<C> {
 pub(crate) struct PendingSnapshotInstall {
     pub(crate) last_included: LogId,
     pub(crate) leader_commit: LogIndex,
-    pub(crate) peers: BTreeSet<NodeId>,
+    pub(crate) membership: Membership,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -326,8 +325,9 @@ impl<C: Clone> Engine<C> {
         heartbeat_interval_ticks: u64,
         config: EngineConfig,
     ) -> Self {
-        let peers: BTreeSet<NodeId> = peers.into_iter().filter(|p| *p != id).collect();
-        let initial_peers = peers.clone();
+        let voters: BTreeSet<NodeId> = peers.into_iter().filter(|p| *p != id).collect();
+        let membership = Membership::with_voters(voters);
+        let initial_membership = membership.clone();
         let election_timeout_ticks = env.next_election_timeout();
 
         Self {
@@ -350,10 +350,10 @@ impl<C: Clone> Engine<C> {
                 election_elapsed: 0,
                 heartbeat_elapsed: 0,
                 election_timeout_ticks,
-                peers,
-                initial_peers,
+                membership,
+                initial_membership,
                 snapshot_bytes: None,
-                snapshot_peers: None,
+                snapshot_membership: None,
                 pending_snapshot_install: None,
                 snapshot_hint_band: 0,
                 max_log_hint_armed: false,
@@ -389,19 +389,22 @@ impl<C: Clone> Engine<C> {
         // `last_included_index`. Restore it before replaying any
         // post-snapshot CCs so `apply_config_change` deltas land
         // on the right base.
-        let restored_peers = recovered.snapshot.as_ref().map(|s| s.peers.clone());
+        let restored_membership = recovered
+            .snapshot
+            .as_ref()
+            .map(|s| Membership::with_voters(s.peers.clone()));
         if let Some(snap) = recovered.snapshot {
             self.state
                 .log
                 .install_snapshot(snap.last_included_index, snap.last_included_term);
             self.state.snapshot_bytes = Some(snap.bytes);
-            self.state.snapshot_peers = Some(snap.peers);
+            self.state.snapshot_membership = Some(Membership::with_voters(snap.peers));
             self.state.commit_index = snap.last_included_index;
             self.state.last_applied = snap.last_included_index;
         }
-        if let Some(mut peers) = restored_peers {
-            peers.remove(&self.id); // self is implicit
-            self.state.peers = peers;
+        if let Some(mut membership) = restored_membership {
+            membership.remove_voter(self.id); // self is implicit
+            self.state.membership = membership;
         }
 
         // Replay post-snapshot CCs against the restored config so the
@@ -438,7 +441,12 @@ impl<C: Clone> Engine<C> {
 
     #[must_use]
     pub fn peers(&self) -> &BTreeSet<NodeId> {
-        &self.state.peers
+        self.state.membership.voters()
+    }
+
+    #[must_use]
+    pub fn membership(&self) -> &Membership {
+        &self.state.membership
     }
 
     pub fn current_term(&self) -> Term {
@@ -527,7 +535,7 @@ impl<C: Clone> Engine<C> {
     /// `cluster_size = peers + self`; majority = `cluster_size / 2 + 1`.
     #[must_use]
     pub fn cluster_majority(&self) -> usize {
-        self.state.peers.len().div_ceil(2) + 1
+        self.state.membership.voter_count().div_ceil(2) + 1
     }
 
     // =========================================================================
@@ -734,7 +742,7 @@ impl<C: Clone> Engine<C> {
     /// truth, body fields are advisory.
     #[instrument(target = "yggr::engine", skip_all)]
     fn on_incoming(&mut self, incoming: Incoming<C>) -> Vec<Action<C>> {
-        if !self.state.peers.contains(&incoming.from) {
+        if !self.state.membership.contains_voter(&incoming.from) {
             return vec![];
         }
         match incoming.message {
@@ -930,7 +938,7 @@ impl<C: Clone> Engine<C> {
             RoleState::PreCandidate(_) | RoleState::Candidate(_) => return vec![],
         }
 
-        if !self.state.peers.contains(&target) {
+        if !self.state.membership.contains_voter(&target) {
             return vec![];
         }
         if let RoleState::Leader(leader) = &mut self.state.role {
@@ -982,13 +990,13 @@ impl<C: Clone> Engine<C> {
         // of `last_included_index` — initial_peers plus every CC with
         // index ≤ last_included_index. We compute this BEFORE moving
         // the floor (install_snapshot drops those entries).
-        let mut peers_at_floor = self.state.initial_peers.clone();
+        let mut membership_at_floor = self.state.initial_membership.clone();
         let first = self.state.log.first_index().get();
         for i in first..=last_included_index.get() {
             if let Some(e) = self.state.log.entry_at(LogIndex::new(i))
                 && let LogPayload::ConfigChange(change) = &e.payload
             {
-                apply_config_to_set(&mut peers_at_floor, *change, self.id);
+                apply_config_to_membership(&mut membership_at_floor, *change, self.id);
             }
         }
 
@@ -996,14 +1004,14 @@ impl<C: Clone> Engine<C> {
             .log
             .install_snapshot(last_included_index, last_included_term);
         self.state.snapshot_bytes = Some(bytes.clone());
-        self.state.snapshot_peers = Some(peers_at_floor.clone());
+        self.state.snapshot_membership = Some(membership_at_floor.clone());
         self.state.pending_snapshot_install = None;
         if let RoleState::Leader(leader) = &mut self.state.role {
             leader.snapshot_transfers.clear();
         }
         vec![Action::PersistSnapshot {
             last_included_index,
-            peers: peers_at_floor,
+            peers: membership_at_floor.voters().clone(),
             last_included_term,
             bytes,
         }]
@@ -1034,8 +1042,10 @@ impl<C: Clone> Engine<C> {
     /// Self-add / self-remove are evaluated against the engine's own id.
     fn is_config_change_noop(&self, change: ConfigChange) -> bool {
         match change {
-            ConfigChange::AddPeer(id) => id == self.id || self.state.peers.contains(&id),
-            ConfigChange::RemovePeer(id) => id != self.id && !self.state.peers.contains(&id),
+            ConfigChange::AddPeer(id) => id == self.id || self.state.membership.contains_voter(&id),
+            ConfigChange::RemovePeer(id) => {
+                id != self.id && !self.state.membership.contains_voter(&id)
+            }
         }
     }
 
@@ -1056,7 +1066,7 @@ impl<C: Clone> Engine<C> {
         match change {
             ConfigChange::AddPeer(id) => {
                 if id != self.id {
-                    self.state.peers.insert(id);
+                    self.state.membership.add_voter(id);
                     if let RoleState::Leader(l) = &mut self.state.role {
                         let leader_last = self
                             .state
@@ -1069,7 +1079,7 @@ impl<C: Clone> Engine<C> {
             }
             ConfigChange::RemovePeer(id) => {
                 if id != self.id {
-                    self.state.peers.remove(&id);
+                    self.state.membership.remove_voter(id);
                     if let RoleState::Leader(l) = &mut self.state.role {
                         l.progress.remove_peer(id);
                         l.snapshot_transfers.remove(&id);
@@ -1116,7 +1126,7 @@ impl<C: Clone> Engine<C> {
         // the old "walk from index 1" approach missed them.
         let snapshot_floor = self.state.log.snapshot_last().index;
         let mut base = if snapshot_floor == LogIndex::ZERO {
-            self.state.initial_peers.clone()
+            self.state.initial_membership.clone()
         } else {
             // The snapshot's peer set was restored into self.state.peers
             // when the snapshot landed (via recover_from or
@@ -1128,7 +1138,7 @@ impl<C: Clone> Engine<C> {
             // for state.peers to reflect only the snapshot's baseline
             // before calling. See the post-truncation caller in
             // on_append_entries_request.
-            self.state.peers.clone()
+            self.state.membership.clone()
         };
         let first = self.state.log.first_index().get();
         let last = self.state.log.last_log_id().map_or(0, |l| l.index.get());
@@ -1136,10 +1146,10 @@ impl<C: Clone> Engine<C> {
             if let Some(entry) = self.state.log.entry_at(LogIndex::new(i))
                 && let LogPayload::ConfigChange(change) = &entry.payload
             {
-                apply_config_to_set(&mut base, *change, self.id);
+                apply_config_to_membership(&mut base, *change, self.id);
             }
         }
-        self.state.peers = base;
+        self.state.membership = base;
 
         // Also rebuild leader progress if we're leader — add peers we
         // newly track, drop ones we no longer do.
@@ -1150,10 +1160,10 @@ impl<C: Clone> Engine<C> {
                 .last_log_id()
                 .map_or(LogIndex::ZERO, |l| l.index);
             let tracked: BTreeSet<NodeId> = l.progress.peers().collect();
-            for id in self.state.peers.difference(&tracked).copied() {
+            for id in self.state.membership.voters().difference(&tracked).copied() {
                 l.progress.add_peer(id, leader_last);
             }
-            for id in tracked.difference(&self.state.peers).copied() {
+            for id in tracked.difference(self.state.membership.voters()).copied() {
                 l.progress.remove_peer(id);
                 l.snapshot_transfers.remove(&id);
                 if l.transfer_target == Some(id) {
@@ -1299,10 +1309,16 @@ impl<C: Clone> Engine<C> {
             last_log_id: self.state.log.last_log_id(),
         };
 
-        out.extend(self.state.peers.iter().map(|&peer| Action::Send {
-            to: peer,
-            message: VoteRequest(request),
-        }));
+        out.extend(
+            self.state
+                .membership
+                .voters()
+                .iter()
+                .map(|&peer| Action::Send {
+                    to: peer,
+                    message: VoteRequest(request),
+                }),
+        );
         out
     }
 
@@ -1333,7 +1349,8 @@ impl<C: Clone> Engine<C> {
         };
 
         self.state
-            .peers
+            .membership
+            .voters()
             .iter()
             .map(|&peer| Action::Send {
                 to: peer,
@@ -1738,6 +1755,7 @@ impl<C: Clone> Engine<C> {
             peers,
             ..
         } = request;
+        let membership = Membership::with_voters(peers);
 
         // Record the leader for client redirects.
         if let RoleState::Follower(f) = &mut self.state.role {
@@ -1788,7 +1806,7 @@ impl<C: Clone> Engine<C> {
             self.state.pending_snapshot_install = Some(PendingSnapshotInstall {
                 last_included,
                 leader_commit,
-                peers: peers.clone(),
+                membership: membership.clone(),
                 bytes: Vec::new(),
             });
         }
@@ -1797,7 +1815,7 @@ impl<C: Clone> Engine<C> {
             unreachable!("pending snapshot install initialized above");
         };
 
-        let incompatible_metadata = pending.peers != peers && offset != 0;
+        let incompatible_metadata = pending.membership != membership && offset != 0;
         if incompatible_metadata {
             self.state.pending_snapshot_install = None;
             out.push(snapshot_ack(last_included, 0, false));
@@ -1822,7 +1840,7 @@ impl<C: Clone> Engine<C> {
         if overlap_len > 0 && !overlap_matches {
             if offset == 0 {
                 pending.bytes.clear();
-                pending.peers.clone_from(&peers);
+                pending.membership.clone_from(&membership);
             } else {
                 self.state.pending_snapshot_install = None;
                 out.push(snapshot_ack(last_included, 0, false));
@@ -1839,7 +1857,7 @@ impl<C: Clone> Engine<C> {
             .bytes
             .extend_from_slice(data.get(append_from..).unwrap_or(&[]));
         pending.leader_commit = pending.leader_commit.max(leader_commit);
-        pending.peers.clone_from(&peers);
+        pending.membership.clone_from(&membership);
 
         if !done {
             out.push(snapshot_ack(
@@ -1862,7 +1880,7 @@ impl<C: Clone> Engine<C> {
             .log
             .install_snapshot(pending.last_included.index, pending.last_included.term);
         self.state.snapshot_bytes = Some(pending.bytes.clone());
-        self.state.snapshot_peers = Some(pending.peers.clone());
+        self.state.snapshot_membership = Some(pending.membership.clone());
 
         // Advance commit / applied past the snapshot. The snapshot
         // captures everything up to `last_included.index`, so we treat
@@ -1882,16 +1900,16 @@ impl<C: Clone> Engine<C> {
                 .map_or(LogIndex::ZERO, |l| l.index);
             self.state.commit_index = pending.leader_commit.min(last_log);
         }
-        let mut peers = pending.peers.clone();
-        peers.remove(&self.id);
-        self.state.peers = peers;
+        let mut membership = pending.membership.clone();
+        membership.remove_voter(self.id);
+        self.state.membership = membership;
         self.recompute_active_config();
 
         let final_offset = u64::try_from(pending.bytes.len()).unwrap_or(u64::MAX);
         out.push(Action::PersistSnapshot {
             last_included_index: pending.last_included.index,
             last_included_term: pending.last_included.term,
-            peers: pending.peers.clone(),
+            peers: pending.membership.voters().clone(),
             bytes: pending.bytes.clone(),
         });
         out.push(Action::ApplySnapshot {
@@ -2055,7 +2073,7 @@ impl<C: Clone> Engine<C> {
         if let RoleState::Leader(leader) = &mut self.state.role {
             leader.heartbeat_seq = leader.heartbeat_seq.wrapping_add(1);
         }
-        let peers: Vec<NodeId> = self.state.peers.iter().copied().collect();
+        let peers: Vec<NodeId> = self.state.membership.voters().iter().copied().collect();
         peers
             .into_iter()
             .map(|peer| self.append_entries_to(peer))
@@ -2142,7 +2160,11 @@ impl<C: Clone> Engine<C> {
             _ => 0,
         };
         let bytes = self.state.snapshot_bytes.as_deref().unwrap_or(&[]);
-        let peers = self.state.snapshot_peers.clone().unwrap_or_default();
+        let peers = self
+            .state
+            .snapshot_membership
+            .as_ref()
+            .map_or_else(BTreeSet::default, |membership| membership.voters().clone());
         let start = usize::try_from(offset)
             .unwrap_or(bytes.len())
             .min(bytes.len());
@@ -2344,7 +2366,8 @@ impl<C: Clone> Engine<C> {
         // cluster (peers + self).
         let mut seqs: Vec<u64> = self
             .state
-            .peers
+            .membership
+            .voters()
             .iter()
             .map(|p| leader.peer_acked_seq.get(p).copied().unwrap_or(0))
             .collect();
@@ -2502,7 +2525,10 @@ impl<C: Clone> Engine<C> {
 
         let last_log_index = self.log().last_log_id().map_or(LogIndex::ZERO, |l| l.index);
 
-        let progress = PeerProgress::new(self.state.peers.iter().copied(), last_log_index);
+        let progress = PeerProgress::new(
+            self.state.membership.voters().iter().copied(),
+            last_log_index,
+        );
         self.state.role = RoleState::Leader(LeaderState {
             progress,
             snapshot_transfers: std::collections::BTreeMap::default(),
@@ -2536,18 +2562,18 @@ impl<C: Clone> Engine<C> {
     }
 }
 
-/// Apply `change` to a peer set under the perspective of `self_id`
-/// (self is always implicit in the set, so self-adds and self-removes
-/// are no-ops for the set itself). Free function so snapshot-building
-/// code can run it against a temporary `BTreeSet<NodeId>` without
-/// owning an `Engine`.
-fn apply_config_to_set(peers: &mut BTreeSet<NodeId>, change: ConfigChange, self_id: NodeId) {
+/// Apply `change` to a membership set under the perspective of `self_id`
+/// (self is always implicit in the voter set, so self-adds and
+/// self-removes are no-ops for the stored membership itself). Free
+/// function so snapshot-building code can run it against a temporary
+/// [`Membership`] without owning an [`Engine`].
+fn apply_config_to_membership(membership: &mut Membership, change: ConfigChange, self_id: NodeId) {
     match change {
         ConfigChange::AddPeer(id) if id != self_id => {
-            peers.insert(id);
+            membership.add_voter(id);
         }
         ConfigChange::RemovePeer(id) if id != self_id => {
-            peers.remove(&id);
+            membership.remove_voter(id);
         }
         _ => {}
     }
