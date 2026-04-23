@@ -551,6 +551,68 @@ impl std::fmt::Display for StatusError {
 
 impl std::error::Error for StatusError {}
 
+/// Errors returned by the membership operations on [`AdminHandle`]
+/// (`add_peer`, `remove_peer`, `add_learner`, `promote_learner`).
+///
+/// Maps distinct "why did this fail?" answers to distinct variants
+/// so callers can act on each precisely — retry vs redirect vs give
+/// up vs fix their input.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum MembershipError {
+    /// A follower that knows who the leader is. Retry there.
+    NotLeader { leader_hint: NodeId },
+    /// A follower / candidate without a current-term leader. Back
+    /// off and retry.
+    NoLeader,
+    /// The runtime's proposal queue is full. Back off and retry.
+    Busy,
+    /// Another membership change is already pending commit. §4.3
+    /// allows at most one uncommitted config change at a time.
+    /// Wait for it to commit, then retry.
+    ChangeInProgress,
+    /// `remove_peer(id)` asked to remove a node that isn't a
+    /// member of the current config.
+    UnknownNode(NodeId),
+    /// `add_peer(id)` asked to add a node that's already a voter.
+    AlreadyVoter(NodeId),
+    /// `add_learner(id)` asked to add a node that's already a
+    /// learner (or already a voter).
+    AlreadyLearner(NodeId),
+    /// `promote_learner(id)` asked to promote a node that isn't a
+    /// learner in the current config.
+    NotLearner(NodeId),
+    /// The runtime is shutting down.
+    Shutdown,
+    /// The driver task has exited.
+    DriverDead,
+    /// Non-recoverable runtime error; the driver has failed every
+    /// in-flight proposal and is exiting.
+    Fatal { reason: &'static str },
+}
+
+impl std::fmt::Display for MembershipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader { leader_hint } => write!(f, "not leader; try {leader_hint}"),
+            Self::NoLeader => write!(f, "no leader known yet"),
+            Self::Busy => write!(f, "too many in-flight proposals; retry later"),
+            Self::ChangeInProgress => {
+                write!(f, "another membership change is already pending commit")
+            }
+            Self::UnknownNode(id) => write!(f, "node {id} is not a current member"),
+            Self::AlreadyVoter(id) => write!(f, "node {id} is already a voter"),
+            Self::AlreadyLearner(id) => write!(f, "node {id} is already a learner"),
+            Self::NotLearner(id) => write!(f, "node {id} is not a learner"),
+            Self::Shutdown => write!(f, "node is shutting down"),
+            Self::DriverDead => write!(f, "node driver task died"),
+            Self::Fatal { reason } => write!(f, "fatal runtime error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for MembershipError {}
+
 /// Errors `propose` / `add_peer` / `remove_peer` can return.
 #[non_exhaustive]
 #[derive(Debug)]
@@ -953,6 +1015,22 @@ impl<S: StateMachine> Node<S> {
         }
     }
 
+    async fn membership_change(&self, change: ConfigChange) -> Result<(), MembershipError> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .inputs
+            .send(DriverInput::MembershipChange { change, reply: tx })
+            .await
+            .is_err()
+        {
+            return Err(MembershipError::Shutdown);
+        }
+        match rx.await {
+            Ok(r) => r,
+            Err(_) => Err(MembershipError::DriverDead),
+        }
+    }
+
     async fn config_change(&self, change: ConfigChange) -> Result<(), ProposeError> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -1115,16 +1193,18 @@ impl<S: StateMachine> Node<S> {
 impl<S: StateMachine> AdminHandle<S> {
     /// Add a peer to the cluster as a voter (§4.3 single-server
     /// change). Returns once the change commits.
-    pub async fn add_peer(&self, peer: NodeId) -> Result<(), ProposeError> {
-        self.node.config_change(ConfigChange::AddPeer(peer)).await
+    pub async fn add_peer(&self, peer: NodeId) -> Result<(), MembershipError> {
+        self.node
+            .membership_change(ConfigChange::AddPeer(peer))
+            .await
     }
 
     /// Remove a peer from the cluster (§4.3 single-server change).
     /// Works for both voters and learners. Returns once the change
     /// commits.
-    pub async fn remove_peer(&self, peer: NodeId) -> Result<(), ProposeError> {
+    pub async fn remove_peer(&self, peer: NodeId) -> Result<(), MembershipError> {
         self.node
-            .config_change(ConfigChange::RemovePeer(peer))
+            .membership_change(ConfigChange::RemovePeer(peer))
             .await
     }
 
@@ -1132,17 +1212,17 @@ impl<S: StateMachine> AdminHandle<S> {
     /// receives replication and snapshots immediately but does not
     /// count toward quorum and never campaigns. Returns once the
     /// change commits.
-    pub async fn add_learner(&self, peer: NodeId) -> Result<(), ProposeError> {
+    pub async fn add_learner(&self, peer: NodeId) -> Result<(), MembershipError> {
         self.node
-            .config_change(ConfigChange::AddLearner(peer))
+            .membership_change(ConfigChange::AddLearner(peer))
             .await
     }
 
     /// Promote `peer` from learner to voter. Returns once the change
-    /// commits. No-op if `peer` is already a voter.
-    pub async fn promote_learner(&self, peer: NodeId) -> Result<(), ProposeError> {
+    /// commits.
+    pub async fn promote_learner(&self, peer: NodeId) -> Result<(), MembershipError> {
         self.node
-            .config_change(ConfigChange::PromoteLearner(peer))
+            .membership_change(ConfigChange::PromoteLearner(peer))
             .await
     }
 
@@ -1331,6 +1411,14 @@ enum DriverInput<S: StateMachine> {
     Followers {
         reply: oneshot::Sender<std::collections::BTreeMap<NodeId, FollowerProgress>>,
     },
+    /// Admin-handle membership change with rich error classification.
+    /// Drives the same engine path as `ConfigChange` but returns
+    /// `MembershipError` variants matched to the specific reason
+    /// the engine accepted or rejected the proposal.
+    MembershipChange {
+        change: ConfigChange,
+        reply: oneshot::Sender<Result<(), MembershipError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -1375,6 +1463,9 @@ where
                     }
                     DriverInput::ConfigChange { change, reply } => {
                         handle_config_change(&mut d, change, reply).await
+                    }
+                    DriverInput::MembershipChange { change, reply } => {
+                        handle_membership_change(&mut d, change, reply).await
                     }
                     DriverInput::Read { reader, on_failure } => {
                         handle_read(&mut d, reader, on_failure).await
@@ -1614,6 +1705,121 @@ where
         }
     }
 
+    dispatch_actions(d, actions).await
+}
+
+async fn handle_membership_change<S, St, Tr>(
+    d: &mut Driver<S, St, Tr>,
+    change: ConfigChange,
+    reply: oneshot::Sender<Result<(), MembershipError>>,
+) -> Result<(), Fatal>
+where
+    S: StateMachine,
+    St: Storage<Vec<u8>>,
+    Tr: Transport<Vec<u8>>,
+{
+    // Classify in priority order: role → capacity → already-pending
+    // CC → kind-specific noop. Anything that survives classification
+    // drives the engine path and registers a commit waiter.
+    match d.engine.role() {
+        RoleState::Leader(_) => {}
+        RoleState::Follower(f) => {
+            let err = f
+                .leader_id()
+                .map_or(MembershipError::NoLeader, |leader_hint| {
+                    MembershipError::NotLeader { leader_hint }
+                });
+            let _ = reply.send(Err(err));
+            return Ok(());
+        }
+        RoleState::PreCandidate(_) | RoleState::Candidate(_) => {
+            let _ = reply.send(Err(MembershipError::NoLeader));
+            return Ok(());
+        }
+    }
+    if d.pending_proposals.len() + d.pending_config_changes.len() >= d.max_pending_proposals {
+        let _ = reply.send(Err(MembershipError::Busy));
+        return Ok(());
+    }
+    if d.engine.has_uncommitted_config_change() {
+        let _ = reply.send(Err(MembershipError::ChangeInProgress));
+        return Ok(());
+    }
+    let membership = d.engine.membership();
+    match change {
+        ConfigChange::AddPeer(id) => {
+            if id == d.engine.id() || membership.contains_voter(&id) {
+                let _ = reply.send(Err(MembershipError::AlreadyVoter(id)));
+                return Ok(());
+            }
+        }
+        ConfigChange::RemovePeer(id) => {
+            if id != d.engine.id()
+                && !membership.contains_voter(&id)
+                && !membership.contains_learner(&id)
+            {
+                let _ = reply.send(Err(MembershipError::UnknownNode(id)));
+                return Ok(());
+            }
+        }
+        ConfigChange::AddLearner(id) => {
+            if id == d.engine.id()
+                || membership.contains_voter(&id)
+                || membership.contains_learner(&id)
+            {
+                let _ = reply.send(Err(MembershipError::AlreadyLearner(id)));
+                return Ok(());
+            }
+        }
+        ConfigChange::PromoteLearner(id) => {
+            if id == d.engine.id() || !membership.contains_learner(&id) {
+                let _ = reply.send(Err(MembershipError::NotLearner(id)));
+                return Ok(());
+            }
+        }
+    }
+
+    // Drive the engine. At this point the engine must accept and
+    // append the entry; if not, something is out of sync between
+    // our classification and the engine's internal state.
+    let last_before = d
+        .engine
+        .log()
+        .last_log_id()
+        .map_or(LogIndex::ZERO, |l| l.index);
+    let actions = d.engine.step(Event::ProposeConfigChange(change));
+    let last_after = d
+        .engine
+        .log()
+        .last_log_id()
+        .map_or(LogIndex::ZERO, |l| l.index);
+    if last_after > last_before {
+        // Convert the commit-waiter oneshot: when the CC commits,
+        // the driver fires the ProposeError-shaped waiter; we
+        // adapt to MembershipError for this caller.
+        let (cc_tx, cc_rx) = oneshot::channel::<Result<(), ProposeError>>();
+        d.pending_config_changes.insert(last_after, cc_tx);
+        tokio::spawn(async move {
+            let mapped = match cc_rx.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(ProposeError::Shutdown)) => Err(MembershipError::Shutdown),
+                Ok(Err(ProposeError::DriverDead)) | Err(_) => Err(MembershipError::DriverDead),
+                Ok(Err(ProposeError::Fatal { reason })) => Err(MembershipError::Fatal { reason }),
+                Ok(Err(ProposeError::NotLeader { leader_hint })) => {
+                    Err(MembershipError::NotLeader { leader_hint })
+                }
+                Ok(Err(ProposeError::NoLeader)) => Err(MembershipError::NoLeader),
+                Ok(Err(ProposeError::Busy)) => Err(MembershipError::Busy),
+            };
+            let _ = reply.send(mapped);
+        });
+    } else {
+        // Engine rejected despite our pre-checks. Should be rare;
+        // surface as a generic NoLeader since by this point the
+        // known causes (not leader, CC in flight, kind-specific
+        // noop) are already filtered above.
+        let _ = reply.send(Err(MembershipError::NoLeader));
+    }
     dispatch_actions(d, actions).await
 }
 

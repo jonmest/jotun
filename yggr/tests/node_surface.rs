@@ -1427,19 +1427,28 @@ async fn admin_handle_forwards_membership_and_transfer_operations() {
 
     let err = admin.add_peer(nid(9)).await.unwrap_err();
     assert!(
-        matches!(err, ProposeError::NoLeader | ProposeError::NotLeader { .. }),
+        matches!(
+            err,
+            yggr::MembershipError::NoLeader | yggr::MembershipError::NotLeader { .. }
+        ),
         "got {err:?}"
     );
 
     let err = admin.add_learner(nid(9)).await.unwrap_err();
     assert!(
-        matches!(err, ProposeError::NoLeader | ProposeError::NotLeader { .. }),
+        matches!(
+            err,
+            yggr::MembershipError::NoLeader | yggr::MembershipError::NotLeader { .. }
+        ),
         "got {err:?}"
     );
 
     let err = admin.promote_learner(nid(9)).await.unwrap_err();
     assert!(
-        matches!(err, ProposeError::NoLeader | ProposeError::NotLeader { .. }),
+        matches!(
+            err,
+            yggr::MembershipError::NoLeader | yggr::MembershipError::NotLeader { .. }
+        ),
         "got {err:?}"
     );
 
@@ -1521,6 +1530,58 @@ async fn node_metrics_wrap_raw_engine_metrics_with_runtime_context() {
     assert_eq!(wrapped.engine.entries_applied, raw.entries_applied);
 
     node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_membership_errors_discriminate_alreadys_and_unknowns() {
+    use yggr::MembershipError;
+    let (transport, _handle) = TestTransport::new();
+    let node = Node::start(
+        fast_single_node_config(),
+        Counter::default(),
+        MemoryStorage::<Vec<u8>>::default(),
+        transport,
+    )
+    .await
+    .unwrap();
+    let admin = node.admin();
+    let _ = wait_for_status(&node, Duration::from_secs(1), |status| {
+        status.role.to_string() == "leader" && status.commit_index >= LogIndex::new(1)
+    })
+    .await;
+
+    // add_learner(2) succeeds; adding again surfaces AlreadyLearner.
+    admin.add_learner(nid(2)).await.unwrap();
+    let err = admin.add_learner(nid(2)).await.unwrap_err();
+    assert!(
+        matches!(err, MembershipError::AlreadyLearner(id) if id == nid(2)),
+        "got {err:?}"
+    );
+
+    // promote_learner on an unknown node → NotLearner.
+    let err = admin.promote_learner(nid(99)).await.unwrap_err();
+    assert!(
+        matches!(err, MembershipError::NotLearner(id) if id == nid(99)),
+        "got {err:?}"
+    );
+
+    // remove_peer on an unknown node → UnknownNode.
+    let err = admin.remove_peer(nid(99)).await.unwrap_err();
+    assert!(
+        matches!(err, MembershipError::UnknownNode(id) if id == nid(99)),
+        "got {err:?}"
+    );
+
+    // add_peer(2) — 2 is a learner, not a voter; should succeed
+    // the single-server way? Actually the flow is PromoteLearner
+    // for that. add_peer(self) → AlreadyVoter.
+    let err = admin.add_peer(nid(1)).await.unwrap_err();
+    assert!(
+        matches!(err, MembershipError::AlreadyVoter(id) if id == nid(1)),
+        "got {err:?}"
+    );
+
+    admin.shutdown().await.unwrap();
 }
 
 #[tokio::test]

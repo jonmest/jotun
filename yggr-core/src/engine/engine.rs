@@ -1020,8 +1020,10 @@ impl<C: Clone> Engine<C> {
 
     /// True iff any entry past `commit_index` is a `ConfigChange`. A leader
     /// uses this to enforce "at most one in flight" before accepting a new
-    /// membership proposal.
-    fn has_uncommitted_config_change(&self) -> bool {
+    /// membership proposal. Runtime admin paths also consult this to
+    /// surface `MembershipError::ChangeInProgress` with no guessing.
+    #[must_use]
+    pub fn has_uncommitted_config_change(&self) -> bool {
         let from = self.state.commit_index.get() + 1;
         let last = self.state.log.last_log_id().map_or(0, |l| l.index.get());
         for i in from..=last {
