@@ -1524,6 +1524,44 @@ async fn node_metrics_wrap_raw_engine_metrics_with_runtime_context() {
 }
 
 #[tokio::test]
+async fn node_metrics_expose_per_peer_follower_progress_on_leader() {
+    use yggr::ReplicationState;
+    let (node, _handle) = start_three_node_leader(16).await;
+
+    let metrics = node.node_metrics().await.unwrap();
+    assert_eq!(metrics.followers.len(), 2);
+    for peer in [nid(2), nid(3)] {
+        let fp = metrics
+            .followers
+            .get(&peer)
+            .unwrap_or_else(|| panic!("{peer} missing from followers"));
+        assert!(!fp.is_learner);
+        // Neither peer has acked yet — matched=0 → Probe.
+        assert_eq!(fp.state, ReplicationState::Probe);
+    }
+
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn node_metrics_followers_empty_on_non_leader() {
+    let (transport, _handle) = TestTransport::new();
+    let node = Node::start(
+        fast_three_node_config(16),
+        Counter::default(),
+        MemoryStorage::<Vec<u8>>::default(),
+        transport,
+    )
+    .await
+    .unwrap();
+
+    let metrics = node.node_metrics().await.unwrap();
+    assert!(metrics.followers.is_empty());
+
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn status_health_reports_running() {
     use yggr::NodeHealth;
     let (transport, _handle) = TestTransport::new();

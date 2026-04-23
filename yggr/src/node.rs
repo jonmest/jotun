@@ -489,8 +489,39 @@ pub struct NodeMetrics {
     pub last_log_index: LogIndex,
     /// Membership view used by the runtime.
     pub membership: MembershipView,
+    /// Per-peer replication progress. Empty when this node is not
+    /// leader. Use this to decide when a learner is caught up enough
+    /// to promote: compare `matched` against `last_log_index`.
+    pub followers: std::collections::BTreeMap<NodeId, FollowerProgress>,
     /// Raw engine counters and gauges.
     pub engine: yggr_core::engine::metrics::EngineMetrics,
+}
+
+/// Per-peer replication progress from the leader's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowerProgress {
+    /// Highest log index this peer is known to have persisted.
+    pub matched: LogIndex,
+    /// Next log index the leader will send to this peer.
+    pub next_index: LogIndex,
+    /// What the leader is currently doing with this peer.
+    pub state: ReplicationState,
+    /// True if this peer is a non-voting learner.
+    pub is_learner: bool,
+}
+
+/// Which of the three §5.3 / §7 peer pipelines a leader is currently
+/// driving for a given peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationState {
+    /// `matched == 0` — the leader hasn't confirmed anything yet and
+    /// is feeling out the peer's log via conflict-hint rewinds.
+    Probe,
+    /// Normal steady-state replication: `matched > 0`, sending
+    /// `AppendEntries` tails.
+    Replicate,
+    /// An `InstallSnapshot` transfer is in flight to this peer.
+    Snapshot,
 }
 
 /// Errors [`Node::status`] and the metrics accessors can return.
@@ -997,13 +1028,33 @@ impl<S: StateMachine> Node<S> {
     pub async fn node_metrics(&self) -> Result<NodeMetrics, StatusError> {
         let status = self.status().await?;
         let engine = self.metrics().await?;
+        let followers = self.followers_inner().await?;
         Ok(NodeMetrics {
             role: status.role,
             leader: status.leader,
             last_log_index: status.last_log_index,
             membership: status.membership,
+            followers,
             engine,
         })
+    }
+
+    async fn followers_inner(
+        &self,
+    ) -> Result<std::collections::BTreeMap<NodeId, FollowerProgress>, StatusError> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .inputs
+            .send(DriverInput::Followers { reply: tx })
+            .await
+            .is_err()
+        {
+            return Err(StatusError::Shutdown);
+        }
+        match rx.await {
+            Ok(f) => Ok(f),
+            Err(_) => Err(StatusError::DriverDead),
+        }
     }
 
     /// Initiate a graceful shutdown. Returns once the driver has
@@ -1275,6 +1326,11 @@ enum DriverInput<S: StateMachine> {
     Metrics {
         reply: oneshot::Sender<yggr_core::engine::metrics::EngineMetrics>,
     },
+    /// Per-peer replication progress from the leader's point of
+    /// view. Empty when this node isn't leader.
+    Followers {
+        reply: oneshot::Sender<std::collections::BTreeMap<NodeId, FollowerProgress>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -1332,6 +1388,10 @@ where
                     }
                     DriverInput::Metrics { reply } => {
                         let _ = reply.send(d.engine.metrics());
+                        Ok(())
+                    }
+                    DriverInput::Followers { reply } => {
+                        let _ = reply.send(build_followers(&d));
                         Ok(())
                     }
                     DriverInput::SnapshotReady { last_included_index, bytes } => {
@@ -2007,6 +2067,44 @@ where
         peers,
         health: d.health,
     }
+}
+
+fn build_followers<S, St, Tr>(
+    d: &Driver<S, St, Tr>,
+) -> std::collections::BTreeMap<NodeId, FollowerProgress>
+where
+    S: StateMachine,
+    St: Storage<Vec<u8>>,
+    Tr: Transport<Vec<u8>>,
+{
+    let RoleState::Leader(leader) = d.engine.role() else {
+        return std::collections::BTreeMap::new();
+    };
+    let learners = d.engine.membership().learners().clone();
+    let progress = leader.progress();
+    let mut out = std::collections::BTreeMap::new();
+    for peer in progress.peers() {
+        let matched = progress.match_for(peer).unwrap_or(LogIndex::ZERO);
+        let next_index = progress.next_for(peer).unwrap_or(LogIndex::new(1));
+        let state = if leader.is_installing_snapshot(peer) {
+            ReplicationState::Snapshot
+        } else if matched == LogIndex::ZERO {
+            ReplicationState::Probe
+        } else {
+            ReplicationState::Replicate
+        };
+        let is_learner = learners.contains(&peer);
+        out.insert(
+            peer,
+            FollowerProgress {
+                matched,
+                next_index,
+                state,
+                is_learner,
+            },
+        );
+    }
+    out
 }
 
 async fn apply_entries<S, St, Tr>(

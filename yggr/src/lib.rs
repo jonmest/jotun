@@ -39,9 +39,9 @@ pub mod storage;
 pub mod transport;
 
 pub use node::{
-    AdminHandle, Bootstrap, Config, ConfigError, MembershipView, Node, NodeHealth, NodeMetrics,
-    NodeStartError, NodeStatus, ProposeError, ReadError, Role, StatusError,
-    TransferLeadershipError, WriteError,
+    AdminHandle, Bootstrap, Config, ConfigError, FollowerProgress, MembershipView, Node,
+    NodeHealth, NodeMetrics, NodeStartError, NodeStatus, ProposeError, ReadError, ReplicationState,
+    Role, StatusError, TransferLeadershipError, WriteError,
 };
 pub use state_machine::{DecodeError, SnapshotError, StateMachine};
 pub use storage::{DiskStorage, DiskStorageError, Storage, StoredHardState, StoredSnapshot};

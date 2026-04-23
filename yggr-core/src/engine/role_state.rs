@@ -138,6 +138,14 @@ impl LeaderState {
     pub fn progress(&self) -> &PeerProgress {
         &self.progress
     }
+
+    /// True iff there is an in-flight `InstallSnapshot` transfer to
+    /// `peer`. Observability signal for runtime consumers building
+    /// per-peer replication progress views.
+    #[must_use]
+    pub fn is_installing_snapshot(&self, peer: NodeId) -> bool {
+        self.snapshot_transfers.contains_key(&peer)
+    }
 }
 
 /// Leader-side progress for one chunked snapshot install.
