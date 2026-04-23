@@ -448,6 +448,22 @@ pub struct MembershipView {
     pub learners: Vec<NodeId>,
 }
 
+/// Outcome of a committed membership-change operation.
+///
+/// Returned by [`AdminHandle::add_peer`] / `remove_peer` /
+/// `add_learner` / `promote_learner` once the change has committed.
+/// Gives callers an audit handle for logging and a snapshot of the
+/// new configuration they can show to an operator without a
+/// follow-up `status()` round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipChangeReceipt {
+    /// The log id (index, term) of the `ConfigChange` entry that
+    /// carried this change.
+    pub log_id: yggr_core::LogId,
+    /// The membership view that resulted from applying this change.
+    pub resulting_membership: MembershipView,
+}
+
 /// High-level liveness signal for a [`Node`].
 ///
 /// `Running` is the steady state. `ShuttingDown` is set once the
@@ -1015,7 +1031,10 @@ impl<S: StateMachine> Node<S> {
         }
     }
 
-    async fn membership_change(&self, change: ConfigChange) -> Result<(), MembershipError> {
+    async fn membership_change(
+        &self,
+        change: ConfigChange,
+    ) -> Result<MembershipChangeReceipt, MembershipError> {
         let (tx, rx) = oneshot::channel();
         if self
             .inputs
@@ -1192,17 +1211,20 @@ impl<S: StateMachine> Node<S> {
 
 impl<S: StateMachine> AdminHandle<S> {
     /// Add a peer to the cluster as a voter (§4.3 single-server
-    /// change). Returns once the change commits.
-    pub async fn add_peer(&self, peer: NodeId) -> Result<(), MembershipError> {
+    /// change). Returns the receipt once the change commits.
+    pub async fn add_peer(&self, peer: NodeId) -> Result<MembershipChangeReceipt, MembershipError> {
         self.node
             .membership_change(ConfigChange::AddPeer(peer))
             .await
     }
 
     /// Remove a peer from the cluster (§4.3 single-server change).
-    /// Works for both voters and learners. Returns once the change
-    /// commits.
-    pub async fn remove_peer(&self, peer: NodeId) -> Result<(), MembershipError> {
+    /// Works for both voters and learners. Returns the receipt once
+    /// the change commits.
+    pub async fn remove_peer(
+        &self,
+        peer: NodeId,
+    ) -> Result<MembershipChangeReceipt, MembershipError> {
         self.node
             .membership_change(ConfigChange::RemovePeer(peer))
             .await
@@ -1210,17 +1232,23 @@ impl<S: StateMachine> AdminHandle<S> {
 
     /// Add `peer` as a non-voting learner (§4.2.1). The learner
     /// receives replication and snapshots immediately but does not
-    /// count toward quorum and never campaigns. Returns once the
-    /// change commits.
-    pub async fn add_learner(&self, peer: NodeId) -> Result<(), MembershipError> {
+    /// count toward quorum and never campaigns. Returns the receipt
+    /// once the change commits.
+    pub async fn add_learner(
+        &self,
+        peer: NodeId,
+    ) -> Result<MembershipChangeReceipt, MembershipError> {
         self.node
             .membership_change(ConfigChange::AddLearner(peer))
             .await
     }
 
-    /// Promote `peer` from learner to voter. Returns once the change
-    /// commits.
-    pub async fn promote_learner(&self, peer: NodeId) -> Result<(), MembershipError> {
+    /// Promote `peer` from learner to voter. Returns the receipt
+    /// once the change commits.
+    pub async fn promote_learner(
+        &self,
+        peer: NodeId,
+    ) -> Result<MembershipChangeReceipt, MembershipError> {
         self.node
             .membership_change(ConfigChange::PromoteLearner(peer))
             .await
@@ -1417,7 +1445,7 @@ enum DriverInput<S: StateMachine> {
     /// the engine accepted or rejected the proposal.
     MembershipChange {
         change: ConfigChange,
-        reply: oneshot::Sender<Result<(), MembershipError>>,
+        reply: oneshot::Sender<Result<MembershipChangeReceipt, MembershipError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -1708,10 +1736,13 @@ where
     dispatch_actions(d, actions).await
 }
 
+// Membership classification + commit-waiter setup is one logical
+// sequence; splitting it just fragments the match ladder.
+#[allow(clippy::too_many_lines)]
 async fn handle_membership_change<S, St, Tr>(
     d: &mut Driver<S, St, Tr>,
     change: ConfigChange,
-    reply: oneshot::Sender<Result<(), MembershipError>>,
+    reply: oneshot::Sender<Result<MembershipChangeReceipt, MembershipError>>,
 ) -> Result<(), Fatal>
 where
     S: StateMachine,
@@ -1794,14 +1825,37 @@ where
         .last_log_id()
         .map_or(LogIndex::ZERO, |l| l.index);
     if last_after > last_before {
+        // §4.3 applies the config on append. Capture the resulting
+        // membership now so the receipt reflects exactly what this
+        // change produced, independent of later CCs queued after
+        // the commit.
+        // `step(ProposeConfigChange)` just appended; `last_log_id`
+        // must be Some at this point. Fall through to a synthetic
+        // ZERO id if the engine somehow disagrees — it's only used
+        // for the receipt and the richer MembershipError variants
+        // above would have fired before we got here.
+        let log_id = d.engine.log().last_log_id().unwrap_or(yggr_core::LogId {
+            index: LogIndex::ZERO,
+            term: d.engine.current_term(),
+        });
+        let resulting_membership = MembershipView {
+            voters: d.engine.membership().voters().iter().copied().collect(),
+            learners: d.engine.membership().learners().iter().copied().collect(),
+        };
+        let receipt = MembershipChangeReceipt {
+            log_id,
+            resulting_membership,
+        };
+
         // Convert the commit-waiter oneshot: when the CC commits,
         // the driver fires the ProposeError-shaped waiter; we
-        // adapt to MembershipError for this caller.
+        // adapt to MembershipError for this caller and pair it
+        // with the receipt we captured above.
         let (cc_tx, cc_rx) = oneshot::channel::<Result<(), ProposeError>>();
         d.pending_config_changes.insert(last_after, cc_tx);
         tokio::spawn(async move {
             let mapped = match cc_rx.await {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(())) => Ok(receipt),
                 Ok(Err(ProposeError::Shutdown)) => Err(MembershipError::Shutdown),
                 Ok(Err(ProposeError::DriverDead)) | Err(_) => Err(MembershipError::DriverDead),
                 Ok(Err(ProposeError::Fatal { reason })) => Err(MembershipError::Fatal { reason }),

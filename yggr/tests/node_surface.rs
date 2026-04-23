@@ -1533,6 +1533,31 @@ async fn node_metrics_wrap_raw_engine_metrics_with_runtime_context() {
 }
 
 #[tokio::test]
+async fn admin_add_learner_returns_receipt_with_new_membership() {
+    let (transport, _handle) = TestTransport::new();
+    let node = Node::start(
+        fast_single_node_config(),
+        Counter::default(),
+        MemoryStorage::<Vec<u8>>::default(),
+        transport,
+    )
+    .await
+    .unwrap();
+    let admin = node.admin();
+    let _ = wait_for_status(&node, Duration::from_secs(1), |status| {
+        status.role.to_string() == "leader" && status.commit_index >= LogIndex::new(1)
+    })
+    .await;
+
+    let receipt = admin.add_learner(nid(2)).await.unwrap();
+    assert!(receipt.resulting_membership.learners.contains(&nid(2)));
+    assert!(!receipt.resulting_membership.voters.contains(&nid(2)));
+    assert!(receipt.log_id.index.get() >= 2);
+
+    admin.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn admin_membership_errors_discriminate_alreadys_and_unknowns() {
     use yggr::MembershipError;
     let (transport, _handle) = TestTransport::new();
