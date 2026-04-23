@@ -145,7 +145,7 @@ impl StateMachine for KvStateMachine {
         }
     }
 
-    fn apply(&mut self, cmd: KvCmd) -> KvResponse {
+    fn apply(&mut self, cmd: KvCmd, _ctx: yggr::ApplyContext) -> KvResponse {
         let mut state = self.inner.lock().unwrap();
         match cmd {
             KvCmd::Set { key, value } => {

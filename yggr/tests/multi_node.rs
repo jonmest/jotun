@@ -95,7 +95,7 @@ impl StateMachine for ObservableKv {
             other => Err(DecodeError::new(format!("unknown tag: {other}"))),
         }
     }
-    fn apply(&mut self, cmd: KvCmd) -> Option<String> {
+    fn apply(&mut self, cmd: KvCmd, _ctx: yggr::ApplyContext) -> Option<String> {
         let mut snap = self.snap.lock().unwrap();
         snap.applied += 1;
         match cmd {

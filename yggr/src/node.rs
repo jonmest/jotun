@@ -1357,6 +1357,7 @@ enum ApplyRequest<S: StateMachine> {
     /// runs and (optionally) replies to the originating `propose`.
     Command {
         command: S::Command,
+        ctx: crate::state_machine::ApplyContext,
         reply: Option<oneshot::Sender<Result<S::Response, ProposeError>>>,
     },
     /// A linearizable read confirmed by the engine. Runs against the
@@ -1384,8 +1385,12 @@ async fn apply_loop<S: StateMachine>(
 ) {
     while let Some(req) = rx.recv().await {
         match req {
-            ApplyRequest::Command { command, reply } => {
-                let response = state_machine.apply(command);
+            ApplyRequest::Command {
+                command,
+                ctx,
+                reply,
+            } => {
+                let response = state_machine.apply(command, ctx);
                 if let Some(reply) = reply {
                     let _ = reply.send(Ok(response));
                 }
@@ -2397,9 +2402,14 @@ where
                 }
             };
             let reply = d.pending_proposals.remove(&entry.id.index);
+            let ctx = crate::state_machine::ApplyContext {
+                log_index: entry.id.index,
+                term: entry.id.term,
+            };
             if d.apply_tx
                 .send(ApplyRequest::Command {
                     command: cmd,
+                    ctx,
                     reply,
                 })
                 .await

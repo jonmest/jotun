@@ -263,7 +263,7 @@ impl StateMachine for TrackedCounter {
             .map_err(|_| DecodeError::new("CountCmd needs 8 bytes"))?;
         Ok(CountCmd(u64::from_le_bytes(arr)))
     }
-    fn apply(&mut self, cmd: CountCmd) -> u64 {
+    fn apply(&mut self, cmd: CountCmd, _ctx: yggr::ApplyContext) -> u64 {
         self.value = self.value.wrapping_add(cmd.0);
         let command_ordinal = self.applied_commands.fetch_add(1, Ordering::Relaxed) + 1;
         self.observed.lock().unwrap().push(AppliedObservation {

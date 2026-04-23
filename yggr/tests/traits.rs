@@ -75,7 +75,7 @@ impl StateMachine for Kv {
         }
     }
 
-    fn apply(&mut self, cmd: KvCmd) -> Option<String> {
+    fn apply(&mut self, cmd: KvCmd, _ctx: yggr::ApplyContext) -> Option<String> {
         match cmd {
             KvCmd::Set { key, value } => self.map.insert(key, value),
             KvCmd::Delete { key } => self.map.remove(&key),
@@ -102,26 +102,36 @@ fn state_machine_decode_error_is_propagated() {
 
 #[test]
 fn state_machine_apply_returns_previous_value_for_set() {
+    let ctx = yggr::ApplyContext {
+        log_index: LogIndex::new(1),
+        term: Term::ZERO,
+    };
     let mut kv = Kv::default();
     assert_eq!(
-        kv.apply(KvCmd::Set {
-            key: "k".into(),
-            value: "v1".into()
-        }),
+        kv.apply(
+            KvCmd::Set {
+                key: "k".into(),
+                value: "v1".into()
+            },
+            ctx,
+        ),
         None
     );
     assert_eq!(
-        kv.apply(KvCmd::Set {
-            key: "k".into(),
-            value: "v2".into()
-        }),
+        kv.apply(
+            KvCmd::Set {
+                key: "k".into(),
+                value: "v2".into()
+            },
+            ctx,
+        ),
         Some("v1".into()),
     );
     assert_eq!(
-        kv.apply(KvCmd::Delete { key: "k".into() }),
+        kv.apply(KvCmd::Delete { key: "k".into() }, ctx),
         Some("v2".into())
     );
-    assert_eq!(kv.apply(KvCmd::Delete { key: "k".into() }), None);
+    assert_eq!(kv.apply(KvCmd::Delete { key: "k".into() }, ctx), None);
 }
 
 #[test]
@@ -344,7 +354,7 @@ impl StateMachine for NoSnapshotKv {
     fn decode_command(bytes: &[u8]) -> Result<Self::Command, DecodeError> {
         Ok(bytes.to_vec())
     }
-    fn apply(&mut self, _: Self::Command) -> Self::Response {}
+    fn apply(&mut self, _: Self::Command, _ctx: yggr::ApplyContext) -> Self::Response {}
 }
 
 #[test]

@@ -52,7 +52,7 @@ impl StateMachine for Counter {
             .map_err(|_| DecodeError::new("expected 8 bytes"))?;
         Ok(CountCmd::Inc(u64::from_le_bytes(arr)))
     }
-    fn apply(&mut self, cmd: CountCmd) -> u64 {
+    fn apply(&mut self, cmd: CountCmd, _ctx: yggr::ApplyContext) -> u64 {
         match cmd {
             CountCmd::Inc(n) => {
                 self.value += n;
@@ -336,7 +336,7 @@ impl StateMachine for BrokenSm {
         Err(DecodeError::new("intentional test-only decode failure"))
     }
 
-    fn apply(&mut self, _: BrokenCmd) {}
+    fn apply(&mut self, _: BrokenCmd, _ctx: yggr::ApplyContext) {}
 }
 
 #[tokio::test]
@@ -494,7 +494,7 @@ impl StateMachine for SlowCounter {
     fn decode_command(bytes: &[u8]) -> Result<CountCmd, DecodeError> {
         Counter::decode_command(bytes)
     }
-    fn apply(&mut self, cmd: CountCmd) -> u64 {
+    fn apply(&mut self, cmd: CountCmd, _ctx: yggr::ApplyContext) -> u64 {
         // Slow enough to starve the driver if apply were still
         // running inline. Multiple commits' worth of 50ms each
         // would blow past the election timeout set below and the

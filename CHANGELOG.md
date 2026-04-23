@@ -4,6 +4,14 @@ All notable changes to this project will be documented here.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [yggr 0.2.0] — 2026-04-24
+
+Breaking change to the runtime `StateMachine` trait.
+
+- `StateMachine::apply` now takes an `ApplyContext` parameter carrying the Raft log position (`log_index`, `term`) of the command. State machines that need a globally-monotonic id (event-log offsets, tx ids, external dedup) can reuse `ctx.log_index` directly instead of keeping their own counter. Migration: add `_ctx: yggr::ApplyContext` as a third parameter to every `fn apply` impl.
+- `ApplyContext` re-exported at crate root as `yggr::ApplyContext`.
+- `yggr-core` unchanged (still 0.1.x on crates.io).
+
 ## [0.1.0] — 2026-04-21
 
 Initial public release of `yggr` (Raft runtime) and `yggr-core` (protocol engine).

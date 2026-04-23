@@ -25,6 +25,27 @@
 //! store), do it after the apply returns. The runtime has already
 //! committed; durability is the engine's problem, not yours.
 
+use yggr_core::{LogIndex, Term};
+
+/// Context passed to [`StateMachine::apply`] describing the Raft log
+/// position the command is being applied at.
+///
+/// `log_index` is monotonically increasing across apply calls on a
+/// single node and identical across all nodes for the same command —
+/// making it a safe globally-unique id for the command. State
+/// machines that need a monotonic sequence (event-log offsets,
+/// transaction ids, etc.) can reuse it directly instead of keeping
+/// their own counter.
+///
+/// `term` is the Raft term in which the command was proposed. Useful
+/// for leadership-sensitive bookkeeping but rarely needed by
+/// application state machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApplyContext {
+    pub log_index: LogIndex,
+    pub term: Term,
+}
+
 /// The application logic the runtime feeds committed entries to.
 ///
 /// `Command` is what callers submit via [`crate::Node::propose`]. The
@@ -54,10 +75,19 @@ pub trait StateMachine: Send + 'static {
     /// log entries are not supposed to fail to decode.
     fn decode_command(bytes: &[u8]) -> Result<Self::Command, DecodeError>;
 
-    /// Run a committed command against state. Same `command` on every
-    /// node MUST produce the same `Response` and the same state
-    /// mutation; otherwise the cluster diverges.
-    fn apply(&mut self, command: Self::Command) -> Self::Response;
+    /// Run a committed command against state.
+    ///
+    /// Same `command` + same `ctx` on every node MUST produce the
+    /// same `Response` and the same state mutation; otherwise the
+    /// cluster diverges. The engine guarantees that `ctx.log_index`
+    /// is strictly increasing across calls on one node.
+    ///
+    /// `ctx` exposes the Raft log position this command is being
+    /// applied at. Useful if the state machine wants to assign a
+    /// globally-monotonic id to the command (e.g. an event-log
+    /// offset), reference the position in an index, or de-duplicate
+    /// based on it.
+    fn apply(&mut self, command: Self::Command, ctx: ApplyContext) -> Self::Response;
 
     /// Serialize the entire state into bytes. Default: empty bytes,
     /// signalling "no snapshot". Override this if you want the runtime

@@ -69,7 +69,7 @@ impl StateMachine for SlowSnapCounter {
         Ok(IncCmd(u64::from_le_bytes(arr)))
     }
 
-    fn apply(&mut self, cmd: IncCmd) -> u64 {
+    fn apply(&mut self, cmd: IncCmd, _ctx: yggr::ApplyContext) -> u64 {
         self.value += cmd.0;
         self.value
     }

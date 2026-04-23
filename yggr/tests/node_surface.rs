@@ -53,7 +53,7 @@ impl StateMachine for Counter {
         Ok(CountCmd::Inc(u64::from_le_bytes(arr)))
     }
 
-    fn apply(&mut self, cmd: CountCmd) -> u64 {
+    fn apply(&mut self, cmd: CountCmd, _ctx: yggr::ApplyContext) -> u64 {
         match cmd {
             CountCmd::Inc(n) => {
                 self.value += n;
@@ -92,7 +92,7 @@ impl StateMachine for SnapshottingCounter {
         Counter::decode_command(bytes)
     }
 
-    fn apply(&mut self, cmd: CountCmd) -> u64 {
+    fn apply(&mut self, cmd: CountCmd, _ctx: yggr::ApplyContext) -> u64 {
         match cmd {
             CountCmd::Inc(n) => {
                 self.value += n;

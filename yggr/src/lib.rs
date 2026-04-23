@@ -44,7 +44,7 @@ pub use node::{
     ProposeError, ReadError, ReplicationState, Role, StatusError, TransferLeadershipError,
     WriteError,
 };
-pub use state_machine::{DecodeError, SnapshotError, StateMachine};
+pub use state_machine::{ApplyContext, DecodeError, SnapshotError, StateMachine};
 pub use storage::{DiskStorage, DiskStorageError, Storage, StoredHardState, StoredSnapshot};
 pub use transport::{TcpTransport, TcpTransportError, Transport};
 
