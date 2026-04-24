@@ -2663,10 +2663,8 @@ fn apply_config_to_membership(membership: &mut Membership, change: ConfigChange,
         ConfigChange::AddLearner(id) => {
             membership.add_learner(id);
         }
-        ConfigChange::PromoteLearner(id) => {
-            if membership.contains_learner(&id) {
-                membership.add_voter(id);
-            }
+        ConfigChange::PromoteLearner(id) if membership.contains_learner(&id) => {
+            membership.add_voter(id);
         }
         _ => {}
     }

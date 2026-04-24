@@ -18,5 +18,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 
+[package.metadata.cargo-udeps.ignore]
+development = ["cargo-husky"]
+
 [lints]
 workspace = true
