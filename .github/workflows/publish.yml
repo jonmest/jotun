@@ -33,8 +33,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc + mold linker
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       # No build cache on the publish path: a PR-poisoned cache that
       # got used here could taint a published binary. Tag-triggered
       # runs are rare enough that the cold-compile cost doesn't matter.
@@ -56,8 +56,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc + mold linker
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       - name: Mint crates.io token (trusted publishing)
         uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
         id: auth
@@ -87,8 +87,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc + mold linker
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       - name: Wait for yggr-core to appear in the index
         run: |
           # Give the sparse index up to ~2 minutes to propagate the new
